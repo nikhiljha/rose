@@ -12,7 +12,7 @@ repository = "https://github.com/nikhiljha/rose"
 keywords = ["ssh", "mosh"]
 categories = ["command-line-utilities"]
 edition = "2024"
-license = "MIT"
+license = "GPL-3.0-or-later"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
