@@ -13,6 +13,7 @@ use crossterm::terminal;
 use rose::config::{self, RosePaths};
 use rose::protocol::{ClientSession, ControlMessage, ServerSession};
 use rose::pty::PtySession;
+use rose::scrollback::{self, ScrollbackLine, ScrollbackReceiver, ScrollbackSender};
 use rose::session::{DetachedSession, SessionStore};
 use rose::ssp::{
     DATAGRAM_KEYSTROKE, DATAGRAM_SSP_ACK, ScreenState, SspFrame, SspReceiver, SspSender,
@@ -223,11 +224,12 @@ async fn handle_server_session(conn: quinn::Connection, store: SessionStore) -> 
                                     break;
                                 }
                             } else {
-                                // Oversized frame: send via reliable uni stream
+                                // Oversized frame: send via reliable uni stream with type prefix
                                 let stream_data = frame.encode_for_stream();
                                 let conn = session_conn.clone();
                                 tokio::spawn(async move {
                                     if let Ok(mut stream) = conn.open_uni().await {
+                                        let _ = stream.write_all(&[scrollback::stream_type::SSP_FRAME]).await;
                                         let _ = stream.write_all(&stream_data).await;
                                         let _ = stream.finish();
                                     }
@@ -269,6 +271,49 @@ async fn handle_server_session(conn: quinn::Connection, store: SessionStore) -> 
         }
     });
 
+    // Task: scrollback sync — periodically sends new scrollback lines via uni stream
+    let scrollback_conn = session.connection().clone();
+    let terminal_sb = Arc::clone(&terminal);
+    let scrollback_task = tokio::spawn(async move {
+        let mut sb_sender = ScrollbackSender::new();
+        let mut interval = tokio::time::interval(Duration::from_millis(200));
+        let mut stream: Option<quinn::SendStream> = None;
+        loop {
+            interval.tick().await;
+            let new_lines = {
+                let term = terminal_sb.lock().expect("terminal lock poisoned");
+                sb_sender.collect_new_lines(&term)
+            };
+            if new_lines.is_empty() {
+                continue;
+            }
+            // Open a scrollback stream if we haven't yet
+            let s = match &mut stream {
+                Some(s) => s,
+                None => match scrollback_conn.open_uni().await {
+                    Ok(mut s) => {
+                        if s.write_all(&[scrollback::stream_type::SCROLLBACK])
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        stream = Some(s);
+                        stream.as_mut().expect("just assigned")
+                    }
+                    Err(_) => break,
+                },
+            };
+            // Write each line to the stream
+            for line in &new_lines {
+                let encoded = line.encode();
+                if s.write_all(&encoded).await.is_err() {
+                    return;
+                }
+            }
+        }
+    });
+
     // Task: control messages (resize, goodbye) — returns PTY for detaching
     let terminal_ctrl = Arc::clone(&terminal);
     let control_task = tokio::spawn(async move {
@@ -299,6 +344,7 @@ async fn handle_server_session(conn: quinn::Connection, store: SessionStore) -> 
     tokio::select! {
         _ = output_task => {}
         _ = input_task => {}
+        _ = scrollback_task => {}
         pty_result = control_task => {
             // Control task finished — detach session with PTY
             if let Ok(pty) = pty_result {
@@ -480,24 +526,70 @@ async fn client_session_loop(
             }
         });
 
-        // Task: receive oversized SSP frames via uni streams
+        // Task: receive uni streams (oversized SSP frames and scrollback)
         let stream_conn = session.connection().clone();
         let recv_stream = Arc::clone(&receiver);
         let prev_stream = Arc::clone(&prev_state);
+        let scrollback_rx = Arc::new(Mutex::new(ScrollbackReceiver::new()));
         let stream_task = tokio::spawn(async move {
             while let Ok(mut uni) = stream_conn.accept_uni().await {
-                let mut len_buf = [0u8; 4];
-                if uni.read_exact(&mut len_buf).await.is_err() {
+                // Read type prefix byte
+                let mut type_buf = [0u8; 1];
+                if uni.read_exact(&mut type_buf).await.is_err() {
                     continue;
                 }
-                let len = u32::from_be_bytes(len_buf) as usize;
-                match uni.read_to_end(len).await {
-                    Ok(data) => {
-                        if let Ok(frame) = SspFrame::decode(&data) {
-                            process_ssp_frame(&frame, &recv_stream, &prev_stream, &stream_conn);
+                match type_buf[0] {
+                    scrollback::stream_type::SSP_FRAME => {
+                        // Oversized SSP frame: read length-prefixed frame
+                        let mut len_buf = [0u8; 4];
+                        if uni.read_exact(&mut len_buf).await.is_err() {
+                            continue;
+                        }
+                        let len = u32::from_be_bytes(len_buf) as usize;
+                        match uni.read_to_end(len).await {
+                            Ok(data) => {
+                                if let Ok(frame) = SspFrame::decode(&data) {
+                                    process_ssp_frame(
+                                        &frame,
+                                        &recv_stream,
+                                        &prev_stream,
+                                        &stream_conn,
+                                    );
+                                }
+                            }
+                            Err(_) => continue,
                         }
                     }
-                    Err(_) => continue,
+                    scrollback::stream_type::SCROLLBACK => {
+                        // Scrollback stream: read lines continuously
+                        let sb_rx = Arc::clone(&scrollback_rx);
+                        let mut buf = Vec::new();
+                        loop {
+                            let mut chunk = vec![0u8; 4096];
+                            match uni.read(&mut chunk).await {
+                                Ok(Some(n)) => {
+                                    buf.extend_from_slice(&chunk[..n]);
+                                    // Decode as many complete lines as possible
+                                    while buf.len() >= 12 {
+                                        match ScrollbackLine::decode(&buf) {
+                                            Ok((line, consumed)) => {
+                                                sb_rx
+                                                    .lock()
+                                                    .expect("scrollback lock poisoned")
+                                                    .add_line(line);
+                                                buf.drain(..consumed);
+                                            }
+                                            Err(_) => break,
+                                        }
+                                    }
+                                }
+                                _ => break,
+                            }
+                        }
+                    }
+                    _ => {
+                        tracing::warn!(type_byte = type_buf[0], "unknown uni stream type");
+                    }
                 }
             }
         });

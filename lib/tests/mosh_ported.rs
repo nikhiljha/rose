@@ -796,14 +796,93 @@ async fn session_persists_across_network_disruption() {
 // scrollback history is synchronized over the dedicated QUIC stream.
 // ---------------------------------------------------------------------------
 
-#[test]
-#[ignore = "requires scrollback sync"]
-fn scrollback_sync_over_reliable_stream() {
-    // TODO: Establish a session. Generate enough output to fill the
-    // scrollback buffer. Verify the client can scroll back and see
-    // the history, and that it was delivered over the reliable QUIC
-    // stream (not datagrams).
-    unimplemented!("scrollback sync test");
+#[tokio::test]
+async fn scrollback_sync_over_reliable_stream() {
+    use rose::protocol::{ClientSession, ServerSession};
+    use rose::scrollback::{self, ScrollbackLine, ScrollbackSender};
+    use rose::terminal::RoseTerminal;
+    use rose::transport::{QuicClient, QuicServer};
+    use std::time::Duration;
+
+    let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = server.local_addr().unwrap();
+    let cert = server.server_cert_der().clone();
+
+    // Server: accept, feed terminal with enough output to generate scrollback,
+    // then send scrollback lines over a uni stream.
+    let server_task = tokio::spawn(async move {
+        let conn = server.accept().await.unwrap().unwrap();
+        let (session, _, _) = ServerSession::accept(conn).await.unwrap();
+
+        let mut term = RoseTerminal::new(4, 80);
+        let mut sb_sender = ScrollbackSender::new();
+
+        // Generate scrollback by writing more lines than terminal height
+        for i in 0..20 {
+            term.advance(format!("scrollback line {i}\r\n").as_bytes());
+        }
+
+        let new_lines = sb_sender.collect_new_lines(&term);
+        assert!(!new_lines.is_empty(), "should have scrollback lines");
+
+        // Open a scrollback uni stream
+        let conn = session.connection().clone();
+        let mut stream = conn.open_uni().await.unwrap();
+        stream
+            .write_all(&[scrollback::stream_type::SCROLLBACK])
+            .await
+            .unwrap();
+        for line in &new_lines {
+            stream.write_all(&line.encode()).await.unwrap();
+        }
+        stream.finish().unwrap();
+
+        // Keep alive for client to read
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        (session, server, new_lines.len())
+    });
+
+    // Client: connect, accept scrollback uni stream, decode lines
+    let client = QuicClient::new().unwrap();
+    let client_conn = client.connect(addr, "localhost", &cert).await.unwrap();
+    let _client_session = ClientSession::connect(client_conn.clone(), 4, 80)
+        .await
+        .unwrap();
+
+    let mut uni = tokio::time::timeout(Duration::from_secs(5), client_conn.accept_uni())
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Read type prefix
+    let mut type_buf = [0u8; 1];
+    uni.read_exact(&mut type_buf).await.unwrap();
+    assert_eq!(type_buf[0], scrollback::stream_type::SCROLLBACK);
+
+    // Read all scrollback data
+    let data = uni.read_to_end(1024 * 1024).await.unwrap();
+    let mut lines = Vec::new();
+    let mut offset = 0;
+    while offset < data.len() {
+        let (line, consumed) = ScrollbackLine::decode(&data[offset..]).unwrap();
+        lines.push(line);
+        offset += consumed;
+    }
+
+    assert!(!lines.is_empty(), "should have received scrollback lines");
+    // Verify the first scrollback line contains expected content
+    assert!(
+        lines[0].text.contains("scrollback line"),
+        "first scrollback line should contain 'scrollback line', got: {:?}",
+        lines[0].text
+    );
+
+    let (_, _, server_line_count) = server_task.await.unwrap();
+    assert_eq!(
+        lines.len(),
+        server_line_count,
+        "client should receive same number of lines as server sent"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -107,6 +107,30 @@ impl RoseTerminal {
         (s.rows, s.cols)
     }
 
+    /// Returns scrollback lines (lines above the visible viewport).
+    ///
+    /// Each entry is `(stable_row_index, text)`. Only lines that have scrolled
+    /// off the top of the visible area are included.
+    #[must_use]
+    pub fn scrollback_lines(&self) -> Vec<(isize, String)> {
+        let screen = self.inner.screen();
+        let total = screen.scrollback_rows();
+        let visible = self.inner.get_size().rows;
+        let scrollback_count = total.saturating_sub(visible);
+        if scrollback_count == 0 {
+            return vec![];
+        }
+        let lines = screen.lines_in_phys_range(0..scrollback_count);
+        lines
+            .iter()
+            .enumerate()
+            .map(|(i, line)| {
+                let stable = screen.phys_to_stable_row_index(i);
+                (stable, line.as_str().to_string())
+            })
+            .collect()
+    }
+
     /// Captures the current visible screen state as a [`ScreenState`].
     ///
     /// Each row has trailing whitespace trimmed.

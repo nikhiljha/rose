@@ -305,6 +305,7 @@ async fn e2e_echo_command() {
 #[tokio::test]
 async fn ssp_oversized_frame_via_stream() {
     use rose::protocol::{ClientSession, ServerSession};
+    use rose::scrollback;
     use rose::ssp::{ScreenState, SspFrame, SspReceiver, SspSender};
     use rose::transport::{QuicClient, QuicServer};
 
@@ -331,9 +332,13 @@ async fn ssp_oversized_frame_via_stream() {
         let frame = sender.generate_frame().unwrap();
         let stream_data = frame.encode_for_stream();
 
-        // Send via uni stream (simulating the oversized fallback)
+        // Send via uni stream with type prefix (simulating the oversized fallback)
         let conn = session.connection().clone();
         let mut stream = conn.open_uni().await.unwrap();
+        stream
+            .write_all(&[scrollback::stream_type::SSP_FRAME])
+            .await
+            .unwrap();
         stream.write_all(&stream_data).await.unwrap();
         stream.finish().unwrap();
 
@@ -354,6 +359,11 @@ async fn ssp_oversized_frame_via_stream() {
         .await
         .unwrap()
         .unwrap();
+
+    // Read type prefix byte
+    let mut type_buf = [0u8; 1];
+    uni.read_exact(&mut type_buf).await.unwrap();
+    assert_eq!(type_buf[0], scrollback::stream_type::SSP_FRAME);
 
     // Read length prefix
     let mut len_buf = [0u8; 4];
