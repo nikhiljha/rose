@@ -1,0 +1,74 @@
+use std::net::SocketAddr;
+use std::path::PathBuf;
+
+use clap::{CommandFactory, Parser, Subcommand};
+
+/// `RoSE` — Remote Shell Environment.
+#[derive(Parser)]
+#[command(name = "rose", version, about)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+/// Available subcommands.
+#[derive(Subcommand)]
+enum Commands {
+    /// Connect to a remote host.
+    Connect {
+        /// The host to connect to (hostname or IP).
+        host: String,
+
+        /// Port to connect to.
+        #[arg(long, default_value = "4433")]
+        port: u16,
+
+        /// Path to the server's certificate (DER format).
+        #[arg(long)]
+        cert: Option<PathBuf>,
+
+        /// Use SSH bootstrap mode instead of native mode.
+        #[arg(long)]
+        ssh: bool,
+    },
+    /// Run the `RoSE` server daemon.
+    Server {
+        /// Address to listen on.
+        #[arg(long, default_value = "0.0.0.0:4433")]
+        listen: SocketAddr,
+
+        /// Bootstrap mode: print connection info to stdout, exit when stdin closes.
+        #[arg(long)]
+        bootstrap: bool,
+
+        /// Ephemeral mode: exit when all sessions disconnect (used with `--bootstrap`).
+        #[arg(long)]
+        ephemeral: bool,
+    },
+    /// Generate X.509 client certificates for authentication.
+    Keygen,
+}
+
+fn main() -> std::io::Result<()> {
+    let Some(out_dir) = std::env::var_os("OUT_DIR") else {
+        return Ok(());
+    };
+    let out_dir = std::path::PathBuf::from(out_dir);
+
+    let cmd = Cli::command();
+    let man = clap_mangen::Man::new(cmd.clone());
+    let mut buffer = Vec::new();
+    man.render(&mut buffer)?;
+    std::fs::write(out_dir.join("rose.1"), buffer)?;
+
+    // Generate subcommand man pages
+    for sub in cmd.get_subcommands() {
+        let man = clap_mangen::Man::new(sub.clone());
+        let mut buffer = Vec::new();
+        man.render(&mut buffer)?;
+        let name = format!("rose-{}.1", sub.get_name());
+        std::fs::write(out_dir.join(name), buffer)?;
+    }
+
+    Ok(())
+}
