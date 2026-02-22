@@ -8,6 +8,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+bytes = "1.11.1"
 portable-pty = "0.9.0"
 quinn = "0.11.9"
 rcgen = "0.14.7"
