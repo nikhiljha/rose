@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cargo fmt --all
+cargo clippy --workspace --all-targets --fix --allow-dirty >/dev/null 2>&1 || true
+cargo clippy --workspace --all-targets
+cargo nextest run --all --no-fail-fast
+cargo +nightly llvm-cov-easy nextest --workspace --branch --fail-under-lines 90 --fail-under-regions 90 --fail-under-functions 90
+cargo deny check
+polydup scan . -t 75 -s 0.9 -q

@@ -1,0 +1,18 @@
+[package]
+name = "rose-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap = { version = "4.5.60", features = ["derive"] }
+rose = { version = "0.1.0", path = "../lib" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]

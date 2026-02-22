@@ -1,0 +1,24 @@
+[package]
+name = "rose"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+portable-pty = "0.9.0"
+quinn = "0.11.9"
+rcgen = "0.14.7"
+rustls = "0.23.36"
+termwiz = "0.23.3"
+thiserror.workspace = true
+tokio = { workspace = true, features = ["full"] }
+tracing.workspace = true
+wezterm-term = { git = "https://github.com/wezterm/wezterm", branch = "main", version = "0.1.0" }
+
+[dev-dependencies]
+criterion.workspace = true
+insta.workspace = true
+
