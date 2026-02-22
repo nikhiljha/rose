@@ -14,14 +14,128 @@
 // running in the PTY redraws correctly.
 // ---------------------------------------------------------------------------
 
-#[test]
-#[ignore = "requires transport + protocol layers (mosh: window-resize.test)"]
-fn e2e_window_resize() {
-    // TODO: Start a RoSE server with a PTY running a program that redraws
-    // on resize (e.g., `less` or a custom test program). Connect a client.
-    // Resize the client terminal. Verify the server PTY receives SIGWINCH
-    // and the program redraws correctly.
-    unimplemented!("window resize e2e test");
+#[tokio::test]
+async fn e2e_window_resize() {
+    use bytes::Bytes;
+    use rose::protocol::{ClientSession, ControlMessage, ServerSession};
+    use rose::pty::PtySession;
+    use rose::ssp::DATAGRAM_KEYSTROKE;
+    use rose::transport::{QuicClient, QuicServer};
+    use std::time::Duration;
+
+    let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = server.local_addr().unwrap();
+    let cert = server.server_cert_der().clone();
+
+    // Server: accept, spawn sh, handle resize + I/O
+    let server_task = tokio::spawn(async move {
+        let conn = server.accept().await.unwrap().unwrap();
+        let (mut session, rows, cols) = ServerSession::accept(conn).await.unwrap();
+        let pty = PtySession::open_command(rows, cols, "sh", &[]).unwrap();
+        let pty_writer = pty.clone_writer();
+        let mut rx = pty.subscribe_output();
+
+        // Forward PTY output -> client datagrams
+        let output_conn = session.connection().clone();
+        let output_fwd = tokio::spawn(async move {
+            while let Ok(chunk) = rx.recv().await {
+                if output_conn
+                    .send_datagram(Bytes::from(chunk.to_vec()))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        // Forward client datagrams -> PTY input (strip keystroke prefix)
+        let input_conn = session.connection().clone();
+        let input_fwd = tokio::spawn(async move {
+            while let Ok(data) = input_conn.read_datagram().await {
+                if data.is_empty() {
+                    continue;
+                }
+                if data[0] == DATAGRAM_KEYSTROKE {
+                    let mut w = pty_writer.lock().expect("writer lock poisoned");
+                    if std::io::Write::write_all(&mut *w, &data[1..]).is_err() {
+                        break;
+                    }
+                    let _ = std::io::Write::flush(&mut *w);
+                }
+            }
+        });
+
+        // Handle control messages (resize)
+        let control_task = tokio::spawn(async move {
+            loop {
+                match session.recv_control().await {
+                    Ok(Some(ControlMessage::Resize { rows, cols })) => {
+                        let _ = pty.resize(rows, cols);
+                    }
+                    Ok(Some(ControlMessage::Goodbye) | None) => break,
+                    Ok(Some(_)) => {}
+                    Err(_) => break,
+                }
+            }
+        });
+
+        tokio::select! {
+            _ = output_fwd => {}
+            _ = input_fwd => {}
+            _ = control_task => {}
+        }
+    });
+
+    // Client: connect, send resize, then query columns
+    let client = QuicClient::new().unwrap();
+    let client_conn = client.connect(addr, "localhost", &cert).await.unwrap();
+    let mut client_session = ClientSession::connect(client_conn, 24, 80).await.unwrap();
+
+    // Wait for shell to start
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Send resize to 24x120
+    client_session
+        .send_control(&ControlMessage::Resize {
+            rows: 24,
+            cols: 120,
+        })
+        .await
+        .unwrap();
+
+    // Wait for resize to propagate
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Send "tput cols\n" as keystroke to query the column count
+    let mut data = vec![DATAGRAM_KEYSTROKE];
+    data.extend_from_slice(b"tput cols\n");
+    client_session.send_input(Bytes::from(data)).unwrap();
+
+    // Read output until we see "120"
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut collected = String::new();
+    let mut found = false;
+
+    loop {
+        let timeout = tokio::time::timeout_at(deadline, client_session.recv_output()).await;
+        match timeout {
+            Ok(Ok(data)) => {
+                collected.push_str(&String::from_utf8_lossy(&data));
+                if collected.contains("120") {
+                    found = true;
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+
+    assert!(
+        found,
+        "expected '120' in output after resize, got: {collected:?}"
+    );
+
+    server_task.abort();
 }
 
 // ---------------------------------------------------------------------------
@@ -128,12 +242,90 @@ async fn e2e_basic_connection() {
 // Tests local (loopback) connection mode.
 // ---------------------------------------------------------------------------
 
-#[test]
-#[ignore = "requires transport + protocol layers (mosh: local.test)"]
-fn e2e_local_connection() {
-    // TODO: Start server and client on localhost. Verify they connect
-    // and can exchange data.
-    unimplemented!("local connection e2e test");
+#[tokio::test]
+async fn e2e_local_connection() {
+    use bytes::Bytes;
+    use rose::protocol::{ClientSession, ServerSession};
+    use rose::pty::PtySession;
+    use rose::transport::{QuicClient, QuicServer};
+    use std::time::Duration;
+
+    let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = server.local_addr().unwrap();
+    let cert = server.server_cert_der().clone();
+
+    // Server: accept, spawn cat, forward I/O
+    let server_task = tokio::spawn(async move {
+        let conn = server.accept().await.unwrap().unwrap();
+        let (session, rows, cols) = ServerSession::accept(conn).await.unwrap();
+        let pty = PtySession::open_command(rows, cols, "cat", &[]).unwrap();
+        let pty_writer = pty.clone_writer();
+        let mut rx = pty.subscribe_output();
+
+        let output_conn = session.connection().clone();
+        let output_fwd = tokio::spawn(async move {
+            while let Ok(chunk) = rx.recv().await {
+                if output_conn
+                    .send_datagram(Bytes::from(chunk.to_vec()))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        let input_conn = session.connection().clone();
+        let input_fwd = tokio::spawn(async move {
+            while let Ok(data) = input_conn.read_datagram().await {
+                let mut w = pty_writer.lock().expect("writer lock poisoned");
+                if std::io::Write::write_all(&mut *w, &data).is_err() {
+                    break;
+                }
+                let _ = std::io::Write::flush(&mut *w);
+            }
+        });
+
+        tokio::select! {
+            _ = output_fwd => {}
+            _ = input_fwd => {}
+        }
+
+        drop(pty);
+        drop(session);
+    });
+
+    let client = QuicClient::new().unwrap();
+    let client_conn = client.connect(addr, "localhost", &cert).await.unwrap();
+    let client_session = ClientSession::connect(client_conn, 24, 80).await.unwrap();
+
+    client_session
+        .send_input(Bytes::from_static(b"local_e2e_test\n"))
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut collected = String::new();
+    let mut found = false;
+
+    loop {
+        let timeout = tokio::time::timeout_at(deadline, client_session.recv_output()).await;
+        match timeout {
+            Ok(Ok(data)) => {
+                collected.push_str(&String::from_utf8_lossy(&data));
+                if collected.contains("local_e2e_test") {
+                    found = true;
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+
+    assert!(
+        found,
+        "expected 'local_e2e_test' in echoed output, got: {collected:?}"
+    );
+
+    server_task.abort();
 }
 
 // ---------------------------------------------------------------------------
@@ -142,13 +334,76 @@ fn e2e_local_connection() {
 // Tests repeated connect/disconnect cycles to verify no resource leaks.
 // ---------------------------------------------------------------------------
 
-#[test]
-#[ignore = "requires transport + protocol layers (mosh: repeat.test)"]
-fn e2e_repeat_connections() {
-    // TODO: Connect and disconnect 5+ times in sequence. Verify each
-    // connection works and there are no leaked file descriptors, ports,
-    // or PTYs.
-    unimplemented!("repeat connections e2e test");
+#[tokio::test]
+async fn e2e_repeat_connections() {
+    use bytes::Bytes;
+    use rose::protocol::{ClientSession, ServerSession};
+    use rose::pty::PtySession;
+    use rose::transport::{QuicClient, QuicServer};
+    use std::time::Duration;
+
+    for i in 0..5 {
+        let marker = format!("repeat_marker_{i}");
+
+        // Create a fresh server + client pair each iteration to verify
+        // clean resource lifecycle
+        let iter_server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let iter_addr = iter_server.local_addr().unwrap();
+        let iter_cert = iter_server.server_cert_der().clone();
+
+        let marker_clone = marker.clone();
+        let server_task = tokio::spawn(async move {
+            let conn = iter_server.accept().await.unwrap().unwrap();
+            let (session, rows, cols) = ServerSession::accept(conn).await.unwrap();
+            let pty = PtySession::open_command(rows, cols, "echo", &[&marker_clone]).unwrap();
+            let mut rx = pty.subscribe_output();
+
+            let output_conn = session.connection().clone();
+            while let Ok(chunk) = rx.recv().await {
+                if output_conn
+                    .send_datagram(Bytes::from(chunk.to_vec()))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+
+            drop(pty);
+            drop(session);
+        });
+
+        let client = QuicClient::new().unwrap();
+        let client_conn = client
+            .connect(iter_addr, "localhost", &iter_cert)
+            .await
+            .unwrap();
+        let client_session = ClientSession::connect(client_conn, 24, 80).await.unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut collected = String::new();
+        let mut found = false;
+
+        loop {
+            let timeout = tokio::time::timeout_at(deadline, client_session.recv_output()).await;
+            match timeout {
+                Ok(Ok(data)) => {
+                    collected.push_str(&String::from_utf8_lossy(&data));
+                    if collected.contains(&marker) {
+                        found = true;
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        assert!(
+            found,
+            "iteration {i}: expected '{marker}' in output, got: {collected:?}"
+        );
+
+        server_task.abort();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -159,13 +414,40 @@ fn e2e_repeat_connections() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "requires protocol layer (mosh: network-no-diff.test)"]
 fn protocol_no_diff_no_spin() {
-    // TODO: Set up a server terminal and repeatedly write the same
-    // character at the same position (e.g., "x\b" in a loop). Verify
-    // that the diff engine produces no output / minimal CPU usage
-    // when the framebuffer hasn't actually changed.
-    unimplemented!("no-diff optimization test");
+    use rose::ssp::SspSender;
+    use rose::terminal::RoseTerminal;
+
+    let mut term = RoseTerminal::new(24, 80);
+    let mut sender = SspSender::new();
+
+    // Write initial state
+    term.advance(b"x");
+    let snap1 = term.snapshot();
+    sender.push_state(snap1);
+
+    // Client acks state 1
+    sender.process_ack(1);
+
+    // Now repeatedly write "\x08x" (backspace, then rewrite x) — the screen
+    // state remains identical each time (cursor moves back, same char written).
+    for _ in 0..10 {
+        term.advance(b"\x08x");
+        let snap = term.snapshot();
+        sender.push_state(snap);
+
+        // The frame should have an empty diff (no changed rows) since the
+        // visible state hasn't changed from the ack'd state.
+        let frame = sender.generate_frame().unwrap();
+        let diff = frame.diff.as_ref().unwrap();
+        assert!(
+            diff.changed_rows.is_empty(),
+            "expected no changed rows when screen is unchanged, got: {:?}",
+            diff.changed_rows
+        );
+
+        sender.process_ack(sender.current_num());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -196,13 +478,42 @@ fn prediction_unicode_multibyte() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "requires PTY layer (mosh: pty-deadlock.test)"]
 fn pty_flow_control_no_deadlock() {
-    // TODO: Start a RoSE server running a program that produces high
-    // output volume. Send ^S (XOFF) to pause output, wait, then send
-    // ^Q (XON) to resume. Verify the server does not deadlock and the
-    // program eventually produces a clean exit message.
-    unimplemented!("PTY flow control deadlock test");
+    use rose::pty::PtySession;
+    use std::time::{Duration, Instant};
+
+    // Spawn `yes` which produces output at maximum rate, overwhelming
+    // the broadcast channel's 256-slot buffer.
+    let session = PtySession::open_command(24, 80, "yes", &[]).unwrap();
+    let mut rx = session.subscribe_output();
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut lagged = false;
+
+    while Instant::now() < deadline {
+        match rx.try_recv() {
+            Ok(_) => {}
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                lagged = true;
+                // Keep reading to exercise the recovery path
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+        }
+    }
+
+    assert!(
+        lagged,
+        "expected broadcast channel to lag under backpressure from `yes`"
+    );
+
+    // Drop session — this kills `yes` and should not deadlock.
+    // The reader thread must exit cleanly when the PTY closes.
+    drop(rx);
+    drop(session);
+    // If we get here without hanging, the test passes.
 }
 
 // ---------------------------------------------------------------------------
