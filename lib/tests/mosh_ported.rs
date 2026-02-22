@@ -460,13 +460,40 @@ fn protocol_no_diff_no_spin() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "requires prediction engine (mosh: prediction-unicode.test)"]
 fn prediction_unicode_multibyte() {
-    // TODO: Set up a client with prediction enabled. Type "glück" and
-    // "faĩl" with delays between characters. Verify the predicted
-    // display shows the correct Unicode characters at all times, never
-    // showing replacement characters or wrong characters.
-    unimplemented!("unicode prediction test");
+    use rose::ssp::Predictor;
+
+    let mut predictor = Predictor::new(24, 80);
+
+    // Type "glück" keystroke by keystroke
+    // g, l, ü (UTF-8: 0xC3 0xBC), c, k
+    let keystrokes: &[&[u8]] = &[b"g", b"l", "ü".as_bytes(), b"c", b"k"];
+    let mut last_state = predictor.predicted_state();
+
+    for ks in keystrokes {
+        last_state = predictor.predict_keystroke(ks);
+    }
+
+    // The predicted state should show "glück" on the first row
+    assert!(
+        last_state.rows[0].contains("glück"),
+        "expected 'glück' in predicted state, got: {:?}",
+        last_state.rows[0]
+    );
+
+    // Also test "faĩl" (ĩ = U+0129, UTF-8: 0xC4 0xA9)
+    let mut predictor2 = Predictor::new(24, 80);
+    let keystrokes2: &[&[u8]] = &[b"f", b"a", "ĩ".as_bytes(), b"l"];
+
+    for ks in keystrokes2 {
+        last_state = predictor2.predict_keystroke(ks);
+    }
+
+    assert!(
+        last_state.rows[0].contains("faĩl"),
+        "expected 'faĩl' in predicted state, got: {:?}",
+        last_state.rows[0]
+    );
 }
 
 // ---------------------------------------------------------------------------

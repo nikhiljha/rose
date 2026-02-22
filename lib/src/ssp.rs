@@ -527,6 +527,100 @@ pub fn render_diff_ansi(old: &ScreenState, new: &ScreenState) -> Vec<u8> {
     buf
 }
 
+/// Client-side keystroke predictor.
+///
+/// Maintains a local terminal emulator that processes keystrokes immediately,
+/// providing instant visual feedback before the server confirms the state.
+/// When the server state arrives, it is reconciled with the prediction.
+pub struct Predictor {
+    terminal: crate::terminal::RoseTerminal,
+    confirmed_state: ScreenState,
+    active: bool,
+    last_keystroke: std::time::Instant,
+}
+
+/// Prediction timeout: after this duration without keystrokes, predictions
+/// are discarded in favor of the server state.
+const PREDICTION_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+impl Predictor {
+    /// Creates a new predictor with the given terminal dimensions.
+    #[must_use]
+    pub fn new(rows: u16, cols: u16) -> Self {
+        Self {
+            terminal: crate::terminal::RoseTerminal::new(rows, cols),
+            confirmed_state: ScreenState::empty(rows),
+            active: false,
+            last_keystroke: std::time::Instant::now(),
+        }
+    }
+
+    /// Feeds a keystroke into the local terminal for prediction.
+    ///
+    /// Returns the predicted screen state after this keystroke.
+    pub fn predict_keystroke(&mut self, data: &[u8]) -> ScreenState {
+        self.terminal.advance(data);
+        self.active = true;
+        self.last_keystroke = std::time::Instant::now();
+        self.terminal.snapshot()
+    }
+
+    /// Reconciles the prediction with the authoritative server state.
+    ///
+    /// - If no prediction is active, returns the server state.
+    /// - If the prediction has expired (>500ms since last keystroke), returns
+    ///   the server state and deactivates prediction.
+    /// - If prediction is active and recent, returns the predicted state
+    ///   (local terminal snapshot).
+    #[must_use]
+    pub fn reconcile(&mut self, server_state: &ScreenState) -> ScreenState {
+        self.confirmed_state = server_state.clone();
+
+        if !self.active {
+            return server_state.clone();
+        }
+
+        if self.last_keystroke.elapsed() > PREDICTION_TIMEOUT {
+            // Prediction expired — trust server, sync local terminal
+            self.active = false;
+            self.sync_terminal(server_state);
+            return server_state.clone();
+        }
+
+        // Prediction still active — use local terminal state
+        self.terminal.snapshot()
+    }
+
+    /// Resizes the prediction terminal.
+    pub fn resize(&mut self, rows: u16, cols: u16) {
+        self.terminal.resize(rows, cols);
+    }
+
+    /// Returns the current predicted screen state.
+    #[must_use]
+    pub fn predicted_state(&self) -> ScreenState {
+        self.terminal.snapshot()
+    }
+
+    /// Syncs the local terminal to match the server state.
+    ///
+    /// Resets the terminal and replays the server state content.
+    fn sync_terminal(&mut self, state: &ScreenState) {
+        let (rows, cols) = self.terminal.size();
+        self.terminal = crate::terminal::RoseTerminal::new(rows as u16, cols as u16);
+        // Replay server state by writing each row
+        for (i, row) in state.rows.iter().enumerate() {
+            if !row.is_empty() {
+                self.terminal
+                    .advance(format!("\x1b[{};1H{}", i + 1, row).as_bytes());
+            }
+        }
+        // Position cursor
+        self.terminal
+            .advance(format!("\x1b[{};{}H", state.cursor_y + 1, state.cursor_x + 1).as_bytes());
+    }
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
@@ -1182,5 +1276,72 @@ mod tests {
             }),
         };
         assert!(receiver.process_frame(&bad_frame).is_err());
+    }
+
+    // -- Predictor --------------------------------------------------------
+
+    #[test]
+    fn predictor_basic() {
+        let mut predictor = Predictor::new(24, 80);
+        let state = predictor.predict_keystroke(b"hello");
+        assert!(state.rows[0].contains("hello"));
+    }
+
+    #[test]
+    fn predictor_reconcile_no_prediction() {
+        let mut predictor = Predictor::new(24, 80);
+        let server_state = ScreenState {
+            rows: vec!["server".into(); 24],
+            cursor_x: 6,
+            cursor_y: 0,
+        };
+        let result = predictor.reconcile(&server_state);
+        assert_eq!(result, server_state);
+    }
+
+    #[test]
+    fn predictor_reconcile_active_prediction() {
+        let mut predictor = Predictor::new(24, 80);
+        predictor.predict_keystroke(b"local");
+
+        let server_state = ScreenState::empty(24);
+        // Prediction is recent and active — should return predicted state
+        let result = predictor.reconcile(&server_state);
+        assert!(
+            result.rows[0].contains("local"),
+            "active prediction should override server state"
+        );
+    }
+
+    #[test]
+    fn predictor_reconcile_expired() {
+        let mut predictor = Predictor::new(24, 80);
+        predictor.predict_keystroke(b"old");
+
+        // Force expiration by backdating the last keystroke
+        predictor.last_keystroke = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .unwrap();
+
+        let mut server_rows = vec![String::new(); 24];
+        server_rows[0] = "server-confirmed".into();
+        let server_state = ScreenState {
+            rows: server_rows,
+            cursor_x: 16,
+            cursor_y: 0,
+        };
+        let result = predictor.reconcile(&server_state);
+        assert_eq!(
+            result.rows[0], "server-confirmed",
+            "expired prediction should yield server state"
+        );
+    }
+
+    #[test]
+    fn predictor_resize() {
+        let mut predictor = Predictor::new(24, 80);
+        predictor.resize(40, 120);
+        let state = predictor.predicted_state();
+        assert_eq!(state.rows.len(), 40);
     }
 }
