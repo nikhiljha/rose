@@ -31,11 +31,17 @@ pub enum ProtocolError {
     DatagramSend(#[from] quinn::SendDatagramError),
 }
 
+/// Current protocol version. Incremented when the wire format changes
+/// in an incompatible way.
+pub const PROTOCOL_VERSION: u16 = 1;
+
 /// Control messages exchanged over the reliable bi-stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlMessage {
     /// Initial handshake from client to server.
     Hello {
+        /// Protocol version.
+        version: u16,
         /// Terminal rows.
         rows: u16,
         /// Terminal columns.
@@ -52,6 +58,8 @@ pub enum ControlMessage {
     Goodbye,
     /// Reconnect to an existing session (client → server).
     Reconnect {
+        /// Protocol version.
+        version: u16,
         /// Terminal rows.
         rows: u16,
         /// Terminal columns.
@@ -61,6 +69,8 @@ pub enum ControlMessage {
     },
     /// Session metadata sent by the server after accepting a connection.
     SessionInfo {
+        /// Protocol version.
+        version: u16,
         /// Unique session identifier.
         session_id: [u8; 16],
     },
@@ -78,9 +88,14 @@ impl ControlMessage {
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         match self {
-            Self::Hello { rows, cols } => {
-                let mut buf = Vec::with_capacity(5);
+            Self::Hello {
+                version,
+                rows,
+                cols,
+            } => {
+                let mut buf = Vec::with_capacity(7);
                 buf.push(MSG_HELLO);
+                buf.extend_from_slice(&version.to_be_bytes());
                 buf.extend_from_slice(&rows.to_be_bytes());
                 buf.extend_from_slice(&cols.to_be_bytes());
                 buf
@@ -94,20 +109,26 @@ impl ControlMessage {
             }
             Self::Goodbye => vec![MSG_GOODBYE],
             Self::Reconnect {
+                version,
                 rows,
                 cols,
                 session_id,
             } => {
-                let mut buf = Vec::with_capacity(21);
+                let mut buf = Vec::with_capacity(23);
                 buf.push(MSG_RECONNECT);
+                buf.extend_from_slice(&version.to_be_bytes());
                 buf.extend_from_slice(&rows.to_be_bytes());
                 buf.extend_from_slice(&cols.to_be_bytes());
                 buf.extend_from_slice(session_id);
                 buf
             }
-            Self::SessionInfo { session_id } => {
-                let mut buf = Vec::with_capacity(17);
+            Self::SessionInfo {
+                version,
+                session_id,
+            } => {
+                let mut buf = Vec::with_capacity(19);
                 buf.push(MSG_SESSION_INFO);
+                buf.extend_from_slice(&version.to_be_bytes());
                 buf.extend_from_slice(session_id);
                 buf
             }
@@ -126,12 +147,17 @@ impl ControlMessage {
 
         match msg_type {
             MSG_HELLO => {
-                if payload.len() < 4 {
+                if payload.len() < 6 {
                     return Err(ProtocolError::InvalidMessage("Hello too short".to_string()));
                 }
-                let rows = u16::from_be_bytes([payload[0], payload[1]]);
-                let cols = u16::from_be_bytes([payload[2], payload[3]]);
-                Ok(Self::Hello { rows, cols })
+                let version = u16::from_be_bytes([payload[0], payload[1]]);
+                let rows = u16::from_be_bytes([payload[2], payload[3]]);
+                let cols = u16::from_be_bytes([payload[4], payload[5]]);
+                Ok(Self::Hello {
+                    version,
+                    rows,
+                    cols,
+                })
             }
             MSG_RESIZE => {
                 if payload.len() < 4 {
@@ -145,30 +171,36 @@ impl ControlMessage {
             }
             MSG_GOODBYE => Ok(Self::Goodbye),
             MSG_RECONNECT => {
-                if payload.len() < 20 {
+                if payload.len() < 22 {
                     return Err(ProtocolError::InvalidMessage(
                         "Reconnect too short".to_string(),
                     ));
                 }
-                let rows = u16::from_be_bytes([payload[0], payload[1]]);
-                let cols = u16::from_be_bytes([payload[2], payload[3]]);
+                let version = u16::from_be_bytes([payload[0], payload[1]]);
+                let rows = u16::from_be_bytes([payload[2], payload[3]]);
+                let cols = u16::from_be_bytes([payload[4], payload[5]]);
                 let mut session_id = [0u8; 16];
-                session_id.copy_from_slice(&payload[4..20]);
+                session_id.copy_from_slice(&payload[6..22]);
                 Ok(Self::Reconnect {
+                    version,
                     rows,
                     cols,
                     session_id,
                 })
             }
             MSG_SESSION_INFO => {
-                if payload.len() < 16 {
+                if payload.len() < 18 {
                     return Err(ProtocolError::InvalidMessage(
                         "SessionInfo too short".to_string(),
                     ));
                 }
+                let version = u16::from_be_bytes([payload[0], payload[1]]);
                 let mut session_id = [0u8; 16];
-                session_id.copy_from_slice(&payload[..16]);
-                Ok(Self::SessionInfo { session_id })
+                session_id.copy_from_slice(&payload[2..18]);
+                Ok(Self::SessionInfo {
+                    version,
+                    session_id,
+                })
             }
             other => Err(ProtocolError::InvalidMessage(format!(
                 "unknown message type: {other}"
@@ -237,7 +269,12 @@ impl ServerSession {
     /// Returns `ProtocolError` if the handshake fails.
     pub async fn accept(conn: Connection) -> Result<(Self, u16, u16), ProtocolError> {
         let (session, handshake) = Self::accept_any(conn).await?;
-        let ControlMessage::Hello { rows, cols } = handshake else {
+        let ControlMessage::Hello {
+            version: _,
+            rows,
+            cols,
+        } = handshake
+        else {
             return Err(ProtocolError::InvalidMessage(format!(
                 "expected Hello, got {handshake:?}"
             )));
@@ -252,20 +289,29 @@ impl ServerSession {
     ///
     /// # Errors
     ///
-    /// Returns `ProtocolError` if the handshake fails.
+    /// Returns `ProtocolError` if the handshake fails or the protocol version
+    /// is unsupported.
     pub async fn accept_any(conn: Connection) -> Result<(Self, ControlMessage), ProtocolError> {
         let (control_send, mut control_recv) = conn.accept_bi().await?;
         let msg = read_control(&mut control_recv).await?.ok_or_else(|| {
             ProtocolError::InvalidMessage("stream closed before handshake".into())
         })?;
 
-        match &msg {
-            ControlMessage::Hello { .. } | ControlMessage::Reconnect { .. } => {}
+        let version = match &msg {
+            ControlMessage::Hello { version, .. } | ControlMessage::Reconnect { version, .. } => {
+                *version
+            }
             other => {
                 return Err(ProtocolError::InvalidMessage(format!(
                     "expected Hello or Reconnect, got {other:?}"
                 )));
             }
+        };
+
+        if version != PROTOCOL_VERSION {
+            return Err(ProtocolError::InvalidMessage(format!(
+                "unsupported protocol version {version} (expected {PROTOCOL_VERSION})"
+            )));
         }
 
         Ok((
@@ -339,7 +385,15 @@ impl ClientSession {
     /// Returns `ProtocolError` if the handshake fails.
     pub async fn connect(conn: Connection, rows: u16, cols: u16) -> Result<Self, ProtocolError> {
         let (mut control_send, control_recv) = conn.open_bi().await?;
-        write_control(&mut control_send, &ControlMessage::Hello { rows, cols }).await?;
+        write_control(
+            &mut control_send,
+            &ControlMessage::Hello {
+                version: PROTOCOL_VERSION,
+                rows,
+                cols,
+            },
+        )
+        .await?;
 
         Ok(Self {
             conn,
@@ -363,6 +417,7 @@ impl ClientSession {
         write_control(
             &mut control_send,
             &ControlMessage::Reconnect {
+                version: PROTOCOL_VERSION,
                 rows,
                 cols,
                 session_id,
@@ -431,7 +486,11 @@ mod tests {
 
     #[test]
     fn encode_decode_hello() {
-        let msg = ControlMessage::Hello { rows: 24, cols: 80 };
+        let msg = ControlMessage::Hello {
+            version: PROTOCOL_VERSION,
+            rows: 24,
+            cols: 80,
+        };
         let encoded = msg.encode();
         let decoded = ControlMessage::decode(&encoded).unwrap();
         assert_eq!(msg, decoded);
@@ -460,6 +519,7 @@ mod tests {
     fn encode_decode_reconnect() {
         let session_id = [42u8; 16];
         let msg = ControlMessage::Reconnect {
+            version: PROTOCOL_VERSION,
             rows: 30,
             cols: 100,
             session_id,
@@ -472,7 +532,10 @@ mod tests {
     #[test]
     fn encode_decode_session_info() {
         let session_id = [7u8; 16];
-        let msg = ControlMessage::SessionInfo { session_id };
+        let msg = ControlMessage::SessionInfo {
+            version: PROTOCOL_VERSION,
+            session_id,
+        };
         let encoded = msg.encode();
         let decoded = ControlMessage::decode(&encoded).unwrap();
         assert_eq!(msg, decoded);
@@ -480,13 +543,13 @@ mod tests {
 
     #[test]
     fn decode_truncated_reconnect_is_error() {
-        // MSG_RECONNECT needs 20 bytes payload (4 + 16)
-        assert!(ControlMessage::decode(&[MSG_RECONNECT, 0, 24, 0]).is_err());
+        // MSG_RECONNECT needs 22 bytes payload (2 + 4 + 16)
+        assert!(ControlMessage::decode(&[MSG_RECONNECT, 0, 1, 0, 24, 0]).is_err());
     }
 
     #[test]
     fn decode_truncated_session_info_is_error() {
-        // MSG_SESSION_INFO needs 16 bytes payload
+        // MSG_SESSION_INFO needs 18 bytes payload (2 + 16)
         assert!(ControlMessage::decode(&[MSG_SESSION_INFO, 0, 0, 0]).is_err());
     }
 
@@ -502,7 +565,8 @@ mod tests {
 
     #[test]
     fn decode_truncated_hello_is_error() {
-        assert!(ControlMessage::decode(&[MSG_HELLO, 0, 24]).is_err());
+        // MSG_HELLO needs 6 bytes payload (2 + 4)
+        assert!(ControlMessage::decode(&[MSG_HELLO, 0, 1, 0, 24]).is_err());
     }
 
     /// Helper: create connected QUIC pair for protocol tests.
@@ -539,6 +603,60 @@ mod tests {
 
         // Keep sessions alive for clean shutdown
         drop(server_session);
+    }
+
+    #[tokio::test]
+    async fn version_mismatch_hello_rejected() {
+        let (client_conn, server_conn, _s, _c) = quic_pair().await;
+
+        let server_task = tokio::spawn(async move { ServerSession::accept_any(server_conn).await });
+
+        // Manually send a Hello with a bogus version instead of using ClientSession::connect
+        let (mut send, _recv) = client_conn.open_bi().await.unwrap();
+        let bad_hello = ControlMessage::Hello {
+            version: 999,
+            rows: 24,
+            cols: 80,
+        };
+        write_control(&mut send, &bad_hello).await.unwrap();
+
+        match server_task.await.unwrap() {
+            Err(e) => {
+                let err = e.to_string();
+                assert!(
+                    err.contains("unsupported protocol version 999"),
+                    "error should mention version: {err}"
+                );
+            }
+            Ok(_) => panic!("server should reject unknown version"),
+        }
+    }
+
+    #[tokio::test]
+    async fn version_mismatch_reconnect_rejected() {
+        let (client_conn, server_conn, _s, _c) = quic_pair().await;
+
+        let server_task = tokio::spawn(async move { ServerSession::accept_any(server_conn).await });
+
+        let (mut send, _recv) = client_conn.open_bi().await.unwrap();
+        let bad_reconnect = ControlMessage::Reconnect {
+            version: 0,
+            rows: 24,
+            cols: 80,
+            session_id: [1u8; 16],
+        };
+        write_control(&mut send, &bad_reconnect).await.unwrap();
+
+        match server_task.await.unwrap() {
+            Err(e) => {
+                let err = e.to_string();
+                assert!(
+                    err.contains("unsupported protocol version 0"),
+                    "error should mention version: {err}"
+                );
+            }
+            Ok(_) => panic!("server should reject version 0"),
+        }
     }
 
     #[tokio::test]

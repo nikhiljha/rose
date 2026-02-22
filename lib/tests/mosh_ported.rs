@@ -576,13 +576,21 @@ async fn session_persists_across_network_disruption() {
             let conn = server.accept().await.unwrap().unwrap();
             let (mut session, handshake) = ServerSession::accept_any(conn).await.unwrap();
 
-            let ControlMessage::Hello { rows, cols } = handshake else {
+            let ControlMessage::Hello {
+                version: _,
+                rows,
+                cols,
+            } = handshake
+            else {
                 panic!("expected Hello");
             };
 
             let sid = [42u8; 16]; // Deterministic for test
             session
-                .send_control(&ControlMessage::SessionInfo { session_id: sid })
+                .send_control(&ControlMessage::SessionInfo {
+                    version: rose::protocol::PROTOCOL_VERSION,
+                    session_id: sid,
+                })
                 .await
                 .unwrap();
 
@@ -648,7 +656,8 @@ async fn session_persists_across_network_disruption() {
         // Read SessionInfo
         let info = client_session.recv_control().await.unwrap().unwrap();
         let ControlMessage::SessionInfo {
-            session_id: sid, ..
+            version: _,
+            session_id: sid,
         } = info
         else {
             panic!("expected SessionInfo, got {info:?}");
@@ -697,6 +706,7 @@ async fn session_persists_across_network_disruption() {
             let (mut session, handshake) = ServerSession::accept_any(conn).await.unwrap();
 
             let ControlMessage::Reconnect {
+                version: _,
                 rows: _,
                 cols: _,
                 session_id: rsid,
@@ -709,7 +719,10 @@ async fn session_persists_across_network_disruption() {
             let detached = store_clone2.remove(&rsid).unwrap();
 
             session
-                .send_control(&ControlMessage::SessionInfo { session_id: rsid })
+                .send_control(&ControlMessage::SessionInfo {
+                    version: rose::protocol::PROTOCOL_VERSION,
+                    session_id: rsid,
+                })
                 .await
                 .unwrap();
 

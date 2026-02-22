@@ -269,7 +269,11 @@ async fn handle_server_session(conn: quinn::Connection, store: SessionStore) -> 
 
     // Generate session ID and resolve PTY/terminal/sender
     let (session_id, pty, terminal, ssp_sender, rows, cols) = match handshake {
-        ControlMessage::Hello { rows, cols } => {
+        ControlMessage::Hello {
+            version: _,
+            rows,
+            cols,
+        } => {
             let session_id: [u8; 16] = rand_session_id();
             tracing::info!(rows, cols, "new session");
 
@@ -279,12 +283,16 @@ async fn handle_server_session(conn: quinn::Connection, store: SessionStore) -> 
 
             // Send SessionInfo to client
             session
-                .send_control(&ControlMessage::SessionInfo { session_id })
+                .send_control(&ControlMessage::SessionInfo {
+                    version: rose::protocol::PROTOCOL_VERSION,
+                    session_id,
+                })
                 .await?;
 
             (session_id, pty, terminal, ssp_sender, rows, cols)
         }
         ControlMessage::Reconnect {
+            version: _,
             rows,
             cols,
             session_id,
@@ -307,7 +315,10 @@ async fn handle_server_session(conn: quinn::Connection, store: SessionStore) -> 
 
             // Send SessionInfo to confirm reconnection
             session
-                .send_control(&ControlMessage::SessionInfo { session_id })
+                .send_control(&ControlMessage::SessionInfo {
+                    version: rose::protocol::PROTOCOL_VERSION,
+                    session_id,
+                })
                 .await?;
 
             // Reset SSP sender so client gets a full init diff
@@ -628,7 +639,10 @@ async fn client_session_loop(
 
         // Read SessionInfo from server
         match session.recv_control().await? {
-            Some(ControlMessage::SessionInfo { session_id: sid }) => {
+            Some(ControlMessage::SessionInfo {
+                version: _,
+                session_id: sid,
+            }) => {
                 session_id = Some(sid);
             }
             Some(other) => {
