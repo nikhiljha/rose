@@ -297,3 +297,76 @@ async fn e2e_echo_command() {
     // Clean up
     server_task.abort();
 }
+
+// ---------------------------------------------------------------------------
+// SSP stream fallback: oversized frames sent via uni stream
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn ssp_oversized_frame_via_stream() {
+    use rose::protocol::{ClientSession, ServerSession};
+    use rose::ssp::{ScreenState, SspFrame, SspReceiver, SspSender};
+    use rose::transport::{QuicClient, QuicServer};
+
+    let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = server.local_addr().unwrap();
+    let cert = server.server_cert_der().clone();
+
+    // Server: accept, build a large screen state, send via uni stream
+    let server_task = tokio::spawn(async move {
+        let conn = server.accept().await.unwrap().unwrap();
+        let (session, _, _) = ServerSession::accept(conn).await.unwrap();
+
+        let mut sender = SspSender::new();
+        // Create a state with long rows to produce an oversized frame
+        let rows: Vec<String> = (0..24)
+            .map(|i| format!("row_{i}_{}", "X".repeat(200)))
+            .collect();
+        sender.push_state(ScreenState {
+            rows,
+            cursor_x: 0,
+            cursor_y: 0,
+        });
+
+        let frame = sender.generate_frame().unwrap();
+        let stream_data = frame.encode_for_stream();
+
+        // Send via uni stream (simulating the oversized fallback)
+        let conn = session.connection().clone();
+        let mut stream = conn.open_uni().await.unwrap();
+        stream.write_all(&stream_data).await.unwrap();
+        stream.finish().unwrap();
+
+        // Keep alive for client to read
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        drop(session);
+        drop(server);
+    });
+
+    // Client: connect, accept uni stream, decode frame
+    let client = QuicClient::new().unwrap();
+    let client_conn = client.connect(addr, "localhost", &cert).await.unwrap();
+    let _client_session = ClientSession::connect(client_conn.clone(), 24, 80)
+        .await
+        .unwrap();
+
+    let mut uni = tokio::time::timeout(Duration::from_secs(5), client_conn.accept_uni())
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Read length prefix
+    let mut len_buf = [0u8; 4];
+    uni.read_exact(&mut len_buf).await.unwrap();
+    let len = u32::from_be_bytes(len_buf) as usize;
+    let data = uni.read_to_end(len).await.unwrap();
+
+    let frame = SspFrame::decode(&data).unwrap();
+    let mut receiver = SspReceiver::new(24);
+    let result = receiver.process_frame(&frame).unwrap();
+    assert!(result.is_some());
+    assert!(receiver.state().rows[0].starts_with("row_0_"));
+    assert_eq!(receiver.state().rows.len(), 24);
+
+    server_task.abort();
+}

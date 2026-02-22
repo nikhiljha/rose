@@ -271,6 +271,41 @@ impl SspFrame {
     }
 }
 
+impl SspFrame {
+    /// Encodes this frame to a stream format with a length prefix.
+    ///
+    /// Format: `[len: u32 big-endian][frame bytes]`
+    #[must_use]
+    pub fn encode_for_stream(&self) -> Vec<u8> {
+        let encoded = self.encode();
+        let mut buf = Vec::with_capacity(4 + encoded.len());
+        buf.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&encoded);
+        buf
+    }
+
+    /// Decodes a frame from a length-prefixed byte buffer (as read from a stream).
+    ///
+    /// # Errors
+    ///
+    /// Returns `SspError::MalformedFrame` if the data is truncated or invalid.
+    pub fn decode_from_stream(data: &[u8]) -> Result<Self, SspError> {
+        if data.len() < 4 {
+            return Err(SspError::MalformedFrame(
+                "stream frame too short for length prefix".to_string(),
+            ));
+        }
+        let len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        if data.len() < 4 + len {
+            return Err(SspError::MalformedFrame(format!(
+                "stream frame truncated: expected {len} bytes, got {}",
+                data.len() - 4
+            )));
+        }
+        Self::decode(&data[4..4 + len])
+    }
+}
+
 /// Datagram prefix for client-to-server raw keystroke data.
 pub const DATAGRAM_KEYSTROKE: u8 = 0x00;
 
@@ -1099,6 +1134,36 @@ mod tests {
         let ack_frame = SspFrame::ack_only(5);
         assert_eq!(receiver.process_frame(&ack_frame).unwrap(), None);
         assert_eq!(receiver.ack_num(), 0); // unchanged
+    }
+
+    #[test]
+    fn ssp_frame_stream_encode_decode() {
+        let frame = SspFrame {
+            old_num: 0,
+            new_num: 1,
+            ack_num: 0,
+            diff: Some(ScreenDiff {
+                changed_rows: vec![(0, "hello stream".into())],
+                cursor_x: 12,
+                cursor_y: 0,
+                total_rows: 24,
+            }),
+        };
+        let encoded = frame.encode_for_stream();
+        let decoded = SspFrame::decode_from_stream(&encoded).unwrap();
+        assert_eq!(frame, decoded);
+    }
+
+    #[test]
+    fn ssp_frame_stream_decode_truncated_header() {
+        assert!(SspFrame::decode_from_stream(&[0, 0]).is_err());
+    }
+
+    #[test]
+    fn ssp_frame_stream_decode_truncated_body() {
+        // Length says 100 bytes but only 4 + 2 bytes present
+        let data = vec![0, 0, 0, 100, 0, 0];
+        assert!(SspFrame::decode_from_stream(&data).is_err());
     }
 
     #[test]

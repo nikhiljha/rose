@@ -157,8 +157,21 @@ async fn handle_server_session(conn: quinn::Connection) -> anyhow::Result<()> {
                         sender.push_state(state);
                         if let Some(frame) = sender.generate_frame() {
                             let data = frame.encode();
-                            if session_conn.send_datagram(Bytes::from(data)).is_err() {
-                                break;
+                            let max_dgram = session_conn.max_datagram_size().unwrap_or(1200);
+                            if data.len() <= max_dgram {
+                                if session_conn.send_datagram(Bytes::from(data)).is_err() {
+                                    break;
+                                }
+                            } else {
+                                // Oversized frame: send via reliable uni stream
+                                let stream_data = frame.encode_for_stream();
+                                let conn = session_conn.clone();
+                                tokio::spawn(async move {
+                                    if let Ok(mut stream) = conn.open_uni().await {
+                                        let _ = stream.write_all(&stream_data).await;
+                                        let _ = stream.finish();
+                                    }
+                                });
                             }
                         }
                     }
@@ -278,37 +291,41 @@ async fn run_client(host: &str, port: u16, cert_path: Option<PathBuf>) -> anyhow
     let _ = stdout.write_all(b"\x1b[2J\x1b[H");
     let _ = stdout.flush();
 
-    // Task: receive SSP frames → apply diff → render ANSI → stdout + send ACK
-    let output_conn = session.connection().clone();
-    let output_task = tokio::spawn(async move {
-        let mut receiver = SspReceiver::new(rows);
-        let mut prev_state = ScreenState::empty(rows);
+    // Shared SSP receiver state for both datagram and stream frames
+    let receiver = Arc::new(Mutex::new(SspReceiver::new(rows)));
+    let prev_state = Arc::new(Mutex::new(ScreenState::empty(rows)));
 
+    // Task: receive SSP frames via datagrams → apply diff → render
+    let output_conn = session.connection().clone();
+    let recv_dgram = Arc::clone(&receiver);
+    let prev_dgram = Arc::clone(&prev_state);
+    let output_task = tokio::spawn(async move {
         while let Ok(data) = output_conn.read_datagram().await {
             let Ok(frame) = SspFrame::decode(&data) else {
                 continue;
             };
-            match receiver.process_frame(&frame) {
-                Ok(Some(_)) => {
-                    let new_state = receiver.state().clone();
-                    let ansi = render_diff_ansi(&prev_state, &new_state);
-                    let mut out = std::io::stdout();
-                    if out.write_all(&ansi).is_err() {
-                        break;
-                    }
-                    let _ = out.flush();
-                    prev_state = new_state;
+            process_ssp_frame(&frame, &recv_dgram, &prev_dgram, &output_conn);
+        }
+    });
 
-                    // Send ACK back to server
-                    let ack = SspFrame::ack_only(receiver.ack_num());
-                    let mut ack_data = vec![DATAGRAM_SSP_ACK];
-                    ack_data.extend_from_slice(&ack.encode());
-                    let _ = output_conn.send_datagram(Bytes::from(ack_data));
+    // Task: receive oversized SSP frames via uni streams
+    let stream_conn = session.connection().clone();
+    let recv_stream = Arc::clone(&receiver);
+    let prev_stream = Arc::clone(&prev_state);
+    let stream_task = tokio::spawn(async move {
+        while let Ok(mut uni) = stream_conn.accept_uni().await {
+            let mut len_buf = [0u8; 4];
+            if uni.read_exact(&mut len_buf).await.is_err() {
+                continue;
+            }
+            let len = u32::from_be_bytes(len_buf) as usize;
+            match uni.read_to_end(len).await {
+                Ok(data) => {
+                    if let Ok(frame) = SspFrame::decode(&data) {
+                        process_ssp_frame(&frame, &recv_stream, &prev_stream, &stream_conn);
+                    }
                 }
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::warn!("SSP frame error: {e}");
-                }
+                Err(_) => continue,
             }
         }
     });
@@ -360,6 +377,7 @@ async fn run_client(host: &str, port: u16, cert_path: Option<PathBuf>) -> anyhow
 
     tokio::select! {
         _ = output_task => {}
+        _ = stream_task => {}
         _ = input_task => {}
         _ = resize_task => {}
     }
@@ -369,6 +387,42 @@ async fn run_client(host: &str, port: u16, cert_path: Option<PathBuf>) -> anyhow
     let _ = stdout.flush();
 
     Ok(())
+}
+
+/// Processes an SSP frame: applies diff, renders to stdout, sends ACK.
+///
+/// Shared by both the datagram and stream receive paths.
+///
+/// COVERAGE: CLI helper tested via integration/e2e tests.
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn process_ssp_frame(
+    frame: &SspFrame,
+    receiver: &Arc<Mutex<SspReceiver>>,
+    prev_state: &Arc<Mutex<ScreenState>>,
+    conn: &quinn::Connection,
+) {
+    let mut recv = receiver.lock().expect("receiver lock poisoned");
+    match recv.process_frame(frame) {
+        Ok(Some(_)) => {
+            let new_state = recv.state().clone();
+            let mut prev = prev_state.lock().expect("prev_state lock poisoned");
+            let ansi = render_diff_ansi(&prev, &new_state);
+            let mut out = std::io::stdout();
+            let _ = out.write_all(&ansi);
+            let _ = out.flush();
+            *prev = new_state;
+
+            // Send ACK back to server
+            let ack = SspFrame::ack_only(recv.ack_num());
+            let mut ack_data = vec![DATAGRAM_SSP_ACK];
+            ack_data.extend_from_slice(&ack.encode());
+            let _ = conn.send_datagram(Bytes::from(ack_data));
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!("SSP frame error: {e}");
+        }
+    }
 }
 
 /// COVERAGE: Keygen is a simple CLI command tested manually.
