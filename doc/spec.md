@@ -14,7 +14,7 @@ RoSE is a single binary (`rose`) with subcommands:
 - `rose server` — run the server daemon (native mode)
 - `rose keygen` — generate X.509 client certificates
 
-Aliases (`rose-client`, `rose-server`, `rose-keygen`) and man pages (via `clap-mangen`) will be generated for discoverability.
+Man pages are generated at build time via `clap_mangen` (`rose.1`, `rose-connect.1`, `rose-server.1`, `rose-keygen.1`). Shell aliases (e.g., `alias rose-server='rose server'`) can be created by users if desired.
 
 ### Terminal Emulator
 
@@ -47,8 +47,9 @@ Interactive terminal data flows over QUIC datagrams (unreliable, unordered). The
 
 QUIC streams are used for data that must not be lost:
 
-- **Control stream:** Initial handshake, session setup, connection parameters.
-- **Scrollback stream:** Scrollback history synchronization. This uses a separate QUIC stream from the control channel to avoid head-of-line blocking on the interactive datagram channel.
+- **Control stream (bi-directional):** Initial handshake (Hello/Reconnect), session setup (SessionInfo), resize events, and graceful disconnect (Goodbye).
+- **Scrollback stream (uni, server→client):** Scrollback history synchronization. The server opens a long-lived uni stream prefixed with a `0x02` type byte and incrementally sends scrollback lines as they appear. This avoids head-of-line blocking on the interactive datagram channel.
+- **Oversized SSP frames (uni, server→client):** When an SSP frame exceeds the QUIC datagram MTU, it is sent via a one-shot uni stream prefixed with a `0x01` type byte, followed by the length-prefixed frame data.
 
 Additional reliable streams may be added in the future for features like file transfer and port forwarding.
 
@@ -66,20 +67,22 @@ Both client and server run persistent RoSE processes. Authentication uses mutual
 
 #### Trust Model
 
-- **CA-signed server certificates:** Verified against the system trust store. No additional configuration needed. Compatible with standard reverse proxies and SNI routing (e.g., `ssh.myserver.mydomain.com`).
+- **CA-signed server certificates:** Verified against the system trust store via `rustls-platform-verifier`. No additional configuration needed. Compatible with standard reverse proxies and SNI routing (e.g., `ssh.myserver.mydomain.com`).
 - **Self-signed server certificates:** Trust on first use (TOFU). The server's certificate is cached in `~/.config/rose/known_hosts/<hostname>.crt` on first connection and verified on subsequent connections.
 
 ### SSH Bootstrap Mode
 
-No persistent server daemon required. The client:
+No persistent server daemon required. RoSE uses the system `ssh` binary for bootstrap connections, which means it inherits your `~/.ssh/config` settings, ProxyJump rules, agent forwarding, host aliases, and any other SSH configuration. No separate SSH library or configuration is needed.
 
-1. SSHs into the remote host.
-2. Starts a temporary `rose server` on a high port (coordinated over the SSH channel).
-3. Downloads the server's certificate and uploads the client's certificate over SSH.
-4. Connects via QUIC to the temporary server.
-5. The SSH connection is dropped.
+The client:
 
-This mode does not cache certificates (the session is ephemeral).
+1. Spawns `ssh <host> rose server --bootstrap --ephemeral` to start a temporary server.
+2. The server picks a random UDP port in the 60000-61000 range and prints `ROSE_BOOTSTRAP <port> <hex_cert>` to stdout.
+3. The client parses the port and certificate, then connects QUIC directly to `<host>:<port>`.
+4. The SSH connection is kept alive as a watchdog — if it dies, the server exits.
+5. When the QUIC session ends, the client kills the SSH process.
+
+This mode does not cache certificates (the session is ephemeral). If UDP is blocked by a firewall, the connection fails (same limitation as mosh).
 
 ## State Synchronization Protocol
 
@@ -94,9 +97,14 @@ Heavily inspired by Mosh's State Synchronization Protocol (SSP), but not wire-co
 
 ### Session Persistence
 
-- Sessions survive network changes (WiFi to cellular, IP address changes, NAT rebinding).
-- Sessions survive client sleep/resume.
-- Sessions persist indefinitely until the server-side shell process exits. There is no idle timeout.
+Sessions survive network changes (WiFi to cellular, IP address changes, NAT rebinding). The client automatically reconnects with exponential backoff (100ms to 5s) when the connection is lost. On reconnect:
+
+- The client sends a `Reconnect` message with the session ID from the original `SessionInfo`.
+- The server resumes the detached session (PTY, terminal state, SSP sender are all preserved).
+- The server resets its `SspSender` so the client gets a full init diff.
+- The client starts fresh SSP state each connection.
+
+Sessions persist indefinitely until the server-side shell process exits. There is no idle timeout.
 
 ## Platforms
 
@@ -112,6 +120,8 @@ Heavily inspired by Mosh's State Synchronization Protocol (SSP), but not wire-co
 | `wezterm-term` | Terminal emulator (client + server) |
 | `portable-pty` | PTY management (server) |
 | `clap` | CLI argument parsing |
+| `clap_mangen` | Man page generation (build-time) |
 | `rcgen` | X.509 certificate generation |
+| `rustls-platform-verifier` | OS trust store verification for CA-signed certs |
 | `tokio` | Async runtime |
 | `tracing` | Instrumentation |
