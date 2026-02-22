@@ -578,14 +578,90 @@ fn ssh_bootstrap_mode() {
 // Tests that mutual TLS authentication works with X.509 certificates.
 // ---------------------------------------------------------------------------
 
-#[test]
-#[ignore = "requires certificate management"]
-fn native_mode_mutual_tls_auth() {
-    // TODO: Generate client and server certificates with `rose keygen`.
-    // Place client cert in server's authorized_certs. Start server.
-    // Connect client. Verify mutual TLS authentication succeeds.
-    // Also test rejection when the client cert is not authorized.
-    unimplemented!("mutual TLS auth test");
+#[tokio::test]
+async fn native_mode_mutual_tls_auth() {
+    use rose::config::generate_self_signed_cert;
+    use rose::protocol::{ClientSession, ServerSession};
+    use rose::transport::{QuicClient, QuicServer};
+    use std::time::Duration;
+
+    let dir = std::env::temp_dir().join(format!("rose-mtls-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let auth_dir = dir.join("authorized_certs");
+    std::fs::create_dir_all(&auth_dir).unwrap();
+
+    let authorized_client = generate_self_signed_cert(&["authorized-client".to_string()]).unwrap();
+    let unauthorized_client =
+        generate_self_signed_cert(&["unauthorized-client".to_string()]).unwrap();
+
+    // Place the authorized client cert in the server's authorized_certs dir
+    std::fs::write(
+        auth_dir.join("authorized.crt"),
+        authorized_client.cert_der.as_ref(),
+    )
+    .unwrap();
+
+    // Test 1: authorized client connects successfully
+    {
+        let server = QuicServer::bind_mutual_tls(
+            "127.0.0.1:0".parse().unwrap(),
+            generate_self_signed_cert(&["localhost".to_string()]).unwrap(),
+            &auth_dir,
+        )
+        .unwrap();
+        let addr = server.local_addr().unwrap();
+        let cert_der = server.server_cert_der().clone();
+
+        let server_task = tokio::spawn(async move {
+            let conn = server.accept().await.unwrap().unwrap();
+            ServerSession::accept(conn).await
+        });
+
+        let client = QuicClient::new().unwrap();
+        let client_conn = client
+            .connect_with_cert(addr, "localhost", &cert_der, &authorized_client)
+            .await
+            .unwrap();
+
+        let _client_session = ClientSession::connect(client_conn, 24, 80).await.unwrap();
+        let (_, rows, cols) = server_task.await.unwrap().unwrap();
+        assert_eq!(rows, 24);
+        assert_eq!(cols, 80);
+    }
+
+    // Test 2: unauthorized client is rejected
+    {
+        let server = QuicServer::bind_mutual_tls(
+            "127.0.0.1:0".parse().unwrap(),
+            generate_self_signed_cert(&["localhost".to_string()]).unwrap(),
+            &auth_dir,
+        )
+        .unwrap();
+        let addr = server.local_addr().unwrap();
+        let cert_der = server.server_cert_der().clone();
+
+        let server_task = tokio::spawn(async move {
+            // Server may reject at the connection level or at the handshake level
+            let conn_result = server.accept().await;
+            match conn_result {
+                Ok(Some(conn)) => ServerSession::accept(conn).await.is_err(),
+                _ => true, // connection-level rejection
+            }
+        });
+
+        let client = QuicClient::new().unwrap();
+        let result = client
+            .connect_with_cert(addr, "localhost", &cert_der, &unauthorized_client)
+            .await;
+
+        // Either the client connection fails or the server rejects
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let server_rejected = server_task.await.unwrap();
+        let rejected = result.is_err() || server_rejected;
+        assert!(rejected, "unauthorized client should be rejected");
+    }
+
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 // ---------------------------------------------------------------------------

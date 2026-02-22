@@ -6,6 +6,8 @@
 
 use std::net::SocketAddr;
 
+use std::path::Path;
+
 use crate::config::{self, CertKeyPair, ConfigError};
 use rustls::pki_types::CertificateDer;
 
@@ -53,6 +55,23 @@ impl QuicServer {
     /// `TransportError::Bind` if the socket cannot be bound.
     pub fn bind_with_cert(addr: SocketAddr, cert: CertKeyPair) -> Result<Self, TransportError> {
         let server_config = config::build_server_config(&cert)?;
+        let endpoint =
+            quinn::Endpoint::server(server_config, addr).map_err(TransportError::Bind)?;
+        Ok(Self { endpoint, cert })
+    }
+
+    /// Binds a QUIC server requiring mutual TLS client authentication.
+    ///
+    /// # Errors
+    ///
+    /// Returns `TransportError::Config` if the TLS config is invalid, or
+    /// `TransportError::Bind` if the socket cannot be bound.
+    pub fn bind_mutual_tls(
+        addr: SocketAddr,
+        cert: CertKeyPair,
+        authorized_certs_dir: &Path,
+    ) -> Result<Self, TransportError> {
+        let server_config = config::build_mutual_tls_server_config(&cert, authorized_certs_dir)?;
         let endpoint =
             quinn::Endpoint::server(server_config, addr).map_err(TransportError::Bind)?;
         Ok(Self { endpoint, cert })
@@ -126,6 +145,27 @@ impl QuicClient {
         server_cert_der: &CertificateDer<'static>,
     ) -> Result<quinn::Connection, TransportError> {
         let client_config = config::build_client_config(server_cert_der)?;
+        let conn = self
+            .endpoint
+            .connect_with(client_config, addr, server_name)?
+            .await?;
+        Ok(conn)
+    }
+    /// Connects to a QUIC server presenting a client certificate for mutual TLS.
+    ///
+    /// # Errors
+    ///
+    /// Returns `TransportError::Config` if the TLS config is invalid,
+    /// `TransportError::Connect` if the connection cannot be initiated, or
+    /// `TransportError::Connection` if the handshake fails.
+    pub async fn connect_with_cert(
+        &self,
+        addr: SocketAddr,
+        server_name: &str,
+        server_cert_der: &CertificateDer<'static>,
+        client_cert: &CertKeyPair,
+    ) -> Result<quinn::Connection, TransportError> {
+        let client_config = config::build_client_config_with_cert(server_cert_der, client_cert)?;
         let conn = self
             .endpoint
             .connect_with(client_config, addr, server_name)?

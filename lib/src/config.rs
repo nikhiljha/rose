@@ -264,6 +264,90 @@ pub fn build_tofu_client_config() -> Result<quinn::ClientConfig, ConfigError> {
     Ok(client_config)
 }
 
+/// Builds a quinn `ServerConfig` that requires mutual TLS client authentication.
+///
+/// Loads all `.crt` files from `authorized_certs_dir` as trusted client certificate
+/// authorities.
+///
+/// # Errors
+///
+/// Returns `ConfigError` if any cert file is invalid or TLS configuration fails.
+pub fn build_mutual_tls_server_config(
+    cert: &CertKeyPair,
+    authorized_certs_dir: &Path,
+) -> Result<quinn::ServerConfig, ConfigError> {
+    let mut root_store = rustls::RootCertStore::empty();
+
+    if authorized_certs_dir.exists() {
+        for entry in std::fs::read_dir(authorized_certs_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "crt") {
+                let cert_data = std::fs::read(&path)?;
+                let cert_der = CertificateDer::from(cert_data);
+                root_store.add(cert_der)?;
+            }
+        }
+    }
+
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let client_verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+        Arc::new(root_store),
+        Arc::clone(&provider),
+    )
+    .build()
+    .map_err(|e| ConfigError::QuicCrypto(e.to_string()))?;
+    let rustls_config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|e| ConfigError::QuicCrypto(e.to_string()))?
+        .with_client_cert_verifier(client_verifier)
+        .with_single_cert(
+            vec![cert.cert_der.clone()],
+            PrivateKeyDer::Pkcs8(cert.key_der.clone().into()),
+        )?;
+
+    let server_config = quinn::ServerConfig::with_crypto(Arc::new(
+        quinn::crypto::rustls::QuicServerConfig::try_from(rustls_config)
+            .map_err(|e| ConfigError::QuicCrypto(e.to_string()))?,
+    ));
+
+    Ok(server_config)
+}
+
+/// Builds a quinn `ClientConfig` that trusts a server cert and provides a client cert.
+///
+/// # Errors
+///
+/// Returns `ConfigError` if the TLS configuration cannot be built.
+pub fn build_client_config_with_cert(
+    server_cert_der: &CertificateDer<'static>,
+    client_cert: &CertKeyPair,
+) -> Result<quinn::ClientConfig, ConfigError> {
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.add(server_cert_der.clone())?;
+
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let rustls_config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|e| ConfigError::QuicCrypto(e.to_string()))?
+        .with_root_certificates(root_store)
+        .with_client_auth_cert(
+            vec![client_cert.cert_der.clone()],
+            PrivateKeyDer::Pkcs8(client_cert.key_der.clone().into()),
+        )?;
+
+    let quic_client_config = QuicClientConfig::try_from(rustls_config)
+        .map_err(|e| ConfigError::QuicCrypto(e.to_string()))?;
+
+    let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
+
+    let mut transport = quinn::TransportConfig::default();
+    transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
+    client_config.transport_config(Arc::new(transport));
+
+    Ok(client_config)
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
