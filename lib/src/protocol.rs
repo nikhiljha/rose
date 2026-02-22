@@ -50,12 +50,28 @@ pub enum ControlMessage {
     },
     /// Graceful disconnect.
     Goodbye,
+    /// Reconnect to an existing session (client → server).
+    Reconnect {
+        /// Terminal rows.
+        rows: u16,
+        /// Terminal columns.
+        cols: u16,
+        /// Session identifier from a previous `SessionInfo`.
+        session_id: [u8; 16],
+    },
+    /// Session metadata sent by the server after accepting a connection.
+    SessionInfo {
+        /// Unique session identifier.
+        session_id: [u8; 16],
+    },
 }
 
 // Wire format constants
 const MSG_HELLO: u8 = 1;
 const MSG_RESIZE: u8 = 2;
 const MSG_GOODBYE: u8 = 3;
+const MSG_RECONNECT: u8 = 4;
+const MSG_SESSION_INFO: u8 = 5;
 
 impl ControlMessage {
     /// Serializes this message to bytes (type byte + payload).
@@ -77,6 +93,24 @@ impl ControlMessage {
                 buf
             }
             Self::Goodbye => vec![MSG_GOODBYE],
+            Self::Reconnect {
+                rows,
+                cols,
+                session_id,
+            } => {
+                let mut buf = Vec::with_capacity(21);
+                buf.push(MSG_RECONNECT);
+                buf.extend_from_slice(&rows.to_be_bytes());
+                buf.extend_from_slice(&cols.to_be_bytes());
+                buf.extend_from_slice(session_id);
+                buf
+            }
+            Self::SessionInfo { session_id } => {
+                let mut buf = Vec::with_capacity(17);
+                buf.push(MSG_SESSION_INFO);
+                buf.extend_from_slice(session_id);
+                buf
+            }
         }
     }
 
@@ -110,6 +144,32 @@ impl ControlMessage {
                 Ok(Self::Resize { rows, cols })
             }
             MSG_GOODBYE => Ok(Self::Goodbye),
+            MSG_RECONNECT => {
+                if payload.len() < 20 {
+                    return Err(ProtocolError::InvalidMessage(
+                        "Reconnect too short".to_string(),
+                    ));
+                }
+                let rows = u16::from_be_bytes([payload[0], payload[1]]);
+                let cols = u16::from_be_bytes([payload[2], payload[3]]);
+                let mut session_id = [0u8; 16];
+                session_id.copy_from_slice(&payload[4..20]);
+                Ok(Self::Reconnect {
+                    rows,
+                    cols,
+                    session_id,
+                })
+            }
+            MSG_SESSION_INFO => {
+                if payload.len() < 16 {
+                    return Err(ProtocolError::InvalidMessage(
+                        "SessionInfo too short".to_string(),
+                    ));
+                }
+                let mut session_id = [0u8; 16];
+                session_id.copy_from_slice(&payload[..16]);
+                Ok(Self::SessionInfo { session_id })
+            }
             other => Err(ProtocolError::InvalidMessage(format!(
                 "unknown message type: {other}"
             ))),
@@ -176,16 +236,37 @@ impl ServerSession {
     ///
     /// Returns `ProtocolError` if the handshake fails.
     pub async fn accept(conn: Connection) -> Result<(Self, u16, u16), ProtocolError> {
-        let (control_send, mut control_recv) = conn.accept_bi().await?;
-        let hello = read_control(&mut control_recv)
-            .await?
-            .ok_or_else(|| ProtocolError::InvalidMessage("stream closed before Hello".into()))?;
-
-        let ControlMessage::Hello { rows, cols } = hello else {
+        let (session, handshake) = Self::accept_any(conn).await?;
+        let ControlMessage::Hello { rows, cols } = handshake else {
             return Err(ProtocolError::InvalidMessage(format!(
-                "expected Hello, got {hello:?}"
+                "expected Hello, got {handshake:?}"
             )));
         };
+        Ok((session, rows, cols))
+    }
+
+    /// Accepts a new client session and returns the raw handshake message.
+    ///
+    /// The caller is responsible for handling both `Hello` and `Reconnect`
+    /// messages. Use this for servers that support session persistence.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ProtocolError` if the handshake fails.
+    pub async fn accept_any(conn: Connection) -> Result<(Self, ControlMessage), ProtocolError> {
+        let (control_send, mut control_recv) = conn.accept_bi().await?;
+        let msg = read_control(&mut control_recv).await?.ok_or_else(|| {
+            ProtocolError::InvalidMessage("stream closed before handshake".into())
+        })?;
+
+        match &msg {
+            ControlMessage::Hello { .. } | ControlMessage::Reconnect { .. } => {}
+            other => {
+                return Err(ProtocolError::InvalidMessage(format!(
+                    "expected Hello or Reconnect, got {other:?}"
+                )));
+            }
+        }
 
         Ok((
             Self {
@@ -193,8 +274,7 @@ impl ServerSession {
                 control_send,
                 control_recv,
             },
-            rows,
-            cols,
+            msg,
         ))
     }
 
@@ -260,6 +340,35 @@ impl ClientSession {
     pub async fn connect(conn: Connection, rows: u16, cols: u16) -> Result<Self, ProtocolError> {
         let (mut control_send, control_recv) = conn.open_bi().await?;
         write_control(&mut control_send, &ControlMessage::Hello { rows, cols }).await?;
+
+        Ok(Self {
+            conn,
+            control_send,
+            control_recv,
+        })
+    }
+
+    /// Reconnects to an existing session: opens a bi-stream and sends a Reconnect.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ProtocolError` if the handshake fails.
+    pub async fn reconnect(
+        conn: Connection,
+        rows: u16,
+        cols: u16,
+        session_id: [u8; 16],
+    ) -> Result<Self, ProtocolError> {
+        let (mut control_send, control_recv) = conn.open_bi().await?;
+        write_control(
+            &mut control_send,
+            &ControlMessage::Reconnect {
+                rows,
+                cols,
+                session_id,
+            },
+        )
+        .await?;
 
         Ok(Self {
             conn,
@@ -345,6 +454,40 @@ mod tests {
         let encoded = msg.encode();
         let decoded = ControlMessage::decode(&encoded).unwrap();
         assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn encode_decode_reconnect() {
+        let session_id = [42u8; 16];
+        let msg = ControlMessage::Reconnect {
+            rows: 30,
+            cols: 100,
+            session_id,
+        };
+        let encoded = msg.encode();
+        let decoded = ControlMessage::decode(&encoded).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn encode_decode_session_info() {
+        let session_id = [7u8; 16];
+        let msg = ControlMessage::SessionInfo { session_id };
+        let encoded = msg.encode();
+        let decoded = ControlMessage::decode(&encoded).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn decode_truncated_reconnect_is_error() {
+        // MSG_RECONNECT needs 20 bytes payload (4 + 16)
+        assert!(ControlMessage::decode(&[MSG_RECONNECT, 0, 24, 0]).is_err());
+    }
+
+    #[test]
+    fn decode_truncated_session_info_is_error() {
+        // MSG_SESSION_INFO needs 16 bytes payload
+        assert!(ControlMessage::decode(&[MSG_SESSION_INFO, 0, 0, 0]).is_err());
     }
 
     #[test]

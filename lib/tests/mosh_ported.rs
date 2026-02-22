@@ -524,13 +524,242 @@ fn pty_flow_control_no_deadlock() {
 // network disruption.
 // ---------------------------------------------------------------------------
 
-#[test]
-#[ignore = "requires transport layer"]
-fn session_persists_across_network_disruption() {
-    // TODO: Establish a RoSE session. Simulate a network disruption
-    // (drop all datagrams for N seconds). Resume. Verify the session
-    // is still alive and the screen state synchronizes correctly.
-    unimplemented!("session persistence test");
+#[tokio::test]
+async fn session_persists_across_network_disruption() {
+    use bytes::Bytes;
+    use rose::protocol::{ClientSession, ControlMessage, ServerSession};
+    use rose::pty::PtySession;
+    use rose::session::{DetachedSession, SessionStore};
+    use rose::ssp::{DATAGRAM_KEYSTROKE, SspSender};
+    use rose::terminal::RoseTerminal;
+    use rose::transport::{QuicClient, QuicServer};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = server.local_addr().unwrap();
+    let cert = server.server_cert_der().clone();
+    let store = SessionStore::new();
+
+    // Phase 1: Initial connection — client connects, sends command, gets session ID
+    let session_id: [u8; 16];
+    {
+        let store_clone = store.clone();
+        let server_task = tokio::spawn(async move {
+            let conn = server.accept().await.unwrap().unwrap();
+            let (mut session, handshake) = ServerSession::accept_any(conn).await.unwrap();
+
+            let ControlMessage::Hello { rows, cols } = handshake else {
+                panic!("expected Hello");
+            };
+
+            let sid = [42u8; 16]; // Deterministic for test
+            session
+                .send_control(&ControlMessage::SessionInfo { session_id: sid })
+                .await
+                .unwrap();
+
+            let pty = PtySession::open_command(rows, cols, "cat", &[]).unwrap();
+            let pty_writer = pty.clone_writer();
+            let terminal = Arc::new(Mutex::new(RoseTerminal::new(rows, cols)));
+            let ssp_sender = Arc::new(Mutex::new(SspSender::new()));
+            let mut rx = pty.subscribe_output();
+
+            // Forward I/O
+            let output_conn = session.connection().clone();
+            let output_fwd = tokio::spawn(async move {
+                while let Ok(chunk) = rx.recv().await {
+                    if output_conn
+                        .send_datagram(Bytes::from(chunk.to_vec()))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+
+            let input_conn = session.connection().clone();
+            let input_fwd = tokio::spawn(async move {
+                while let Ok(data) = input_conn.read_datagram().await {
+                    if data.is_empty() {
+                        continue;
+                    }
+                    if data[0] == DATAGRAM_KEYSTROKE {
+                        let mut w = pty_writer.lock().expect("writer lock poisoned");
+                        if std::io::Write::write_all(&mut *w, &data[1..]).is_err() {
+                            break;
+                        }
+                        let _ = std::io::Write::flush(&mut *w);
+                    }
+                }
+            });
+
+            tokio::select! {
+                _ = output_fwd => {}
+                _ = input_fwd => {}
+            }
+
+            // Connection lost — detach session
+            let _ = store_clone.insert(
+                sid,
+                DetachedSession {
+                    pty,
+                    terminal,
+                    ssp_sender,
+                    rows,
+                    cols,
+                },
+            );
+
+            (sid, server)
+        });
+
+        let client = QuicClient::new().unwrap();
+        let client_conn = client.connect(addr, "localhost", &cert).await.unwrap();
+        let mut client_session = ClientSession::connect(client_conn, 24, 80).await.unwrap();
+
+        // Read SessionInfo
+        let info = client_session.recv_control().await.unwrap().unwrap();
+        let ControlMessage::SessionInfo {
+            session_id: sid, ..
+        } = info
+        else {
+            panic!("expected SessionInfo, got {info:?}");
+        };
+        session_id = sid;
+
+        // Send a command
+        let mut data = vec![DATAGRAM_KEYSTROKE];
+        data.extend_from_slice(b"hello_persist\n");
+        client_session.send_input(Bytes::from(data)).unwrap();
+
+        // Read echo
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut collected = String::new();
+        loop {
+            let timeout = tokio::time::timeout_at(deadline, client_session.recv_output()).await;
+            match timeout {
+                Ok(Ok(data)) => {
+                    collected.push_str(&String::from_utf8_lossy(&data));
+                    if collected.contains("hello_persist") {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        assert!(
+            collected.contains("hello_persist"),
+            "expected echo before disconnect"
+        );
+
+        // Drop client connection to simulate network disruption
+        drop(client_session);
+        drop(client);
+
+        // Wait for server to detach
+        let (_, returned_server) = server_task.await.unwrap();
+
+        // Phase 2: Reconnect with same session_id
+        let store_clone2 = store.clone();
+        let addr2 = returned_server.local_addr().unwrap();
+        let cert2 = returned_server.server_cert_der().clone();
+
+        let server_task2 = tokio::spawn(async move {
+            let conn = returned_server.accept().await.unwrap().unwrap();
+            let (mut session, handshake) = ServerSession::accept_any(conn).await.unwrap();
+
+            let ControlMessage::Reconnect {
+                rows: _,
+                cols: _,
+                session_id: rsid,
+            } = handshake
+            else {
+                panic!("expected Reconnect, got {handshake:?}");
+            };
+            assert_eq!(rsid, session_id);
+
+            let detached = store_clone2.remove(&rsid).unwrap();
+
+            session
+                .send_control(&ControlMessage::SessionInfo { session_id: rsid })
+                .await
+                .unwrap();
+
+            // The PTY is still alive — send another command through it
+            let pty_writer = detached.pty.clone_writer();
+            let mut rx = detached.pty.subscribe_output();
+
+            let output_conn = session.connection().clone();
+            let output_fwd = tokio::spawn(async move {
+                while let Ok(chunk) = rx.recv().await {
+                    if output_conn
+                        .send_datagram(Bytes::from(chunk.to_vec()))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+
+            let input_conn = session.connection().clone();
+            let input_fwd = tokio::spawn(async move {
+                while let Ok(data) = input_conn.read_datagram().await {
+                    if data.is_empty() {
+                        continue;
+                    }
+                    if data[0] == DATAGRAM_KEYSTROKE {
+                        let mut w = pty_writer.lock().expect("writer lock poisoned");
+                        if std::io::Write::write_all(&mut *w, &data[1..]).is_err() {
+                            break;
+                        }
+                        let _ = std::io::Write::flush(&mut *w);
+                    }
+                }
+            });
+
+            tokio::select! {
+                _ = output_fwd => {}
+                _ = input_fwd => {}
+            }
+        });
+
+        let client2 = QuicClient::new().unwrap();
+        let client_conn2 = client2.connect(addr2, "localhost", &cert2).await.unwrap();
+        let mut client_session2 = ClientSession::reconnect(client_conn2, 24, 80, session_id)
+            .await
+            .unwrap();
+
+        // Read SessionInfo confirming reconnection
+        let info2 = client_session2.recv_control().await.unwrap().unwrap();
+        assert!(matches!(info2, ControlMessage::SessionInfo { .. }));
+
+        // Send another command to verify PTY is still alive
+        let mut data2 = vec![DATAGRAM_KEYSTROKE];
+        data2.extend_from_slice(b"still_alive\n");
+        client_session2.send_input(Bytes::from(data2)).unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut collected2 = String::new();
+        loop {
+            let timeout = tokio::time::timeout_at(deadline, client_session2.recv_output()).await;
+            match timeout {
+                Ok(Ok(data)) => {
+                    collected2.push_str(&String::from_utf8_lossy(&data));
+                    if collected2.contains("still_alive") {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        assert!(
+            collected2.contains("still_alive"),
+            "expected 'still_alive' after reconnect, got: {collected2:?}"
+        );
+
+        server_task2.abort();
+    }
 }
 
 // ---------------------------------------------------------------------------

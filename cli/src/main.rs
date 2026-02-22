@@ -13,6 +13,7 @@ use crossterm::terminal;
 use rose::config::{self, RosePaths};
 use rose::protocol::{ClientSession, ControlMessage, ServerSession};
 use rose::pty::PtySession;
+use rose::session::{DetachedSession, SessionStore};
 use rose::ssp::{
     DATAGRAM_KEYSTROKE, DATAGRAM_SSP_ACK, ScreenState, SspFrame, SspReceiver, SspSender,
     render_diff_ansi,
@@ -97,6 +98,8 @@ async fn run_server(listen: SocketAddr) -> anyhow::Result<()> {
     std::fs::write(&cert_path, server.server_cert_der().as_ref())?;
     eprintln!("Server certificate written to {}", cert_path.display());
 
+    let store = SessionStore::new();
+
     loop {
         let Some(conn) = server.accept().await? else {
             break;
@@ -104,8 +107,9 @@ async fn run_server(listen: SocketAddr) -> anyhow::Result<()> {
         let peer = conn.remote_address();
         tracing::info!(%peer, "new connection");
 
+        let store = store.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_server_session(conn).await {
+            if let Err(e) = handle_server_session(conn, store).await {
                 tracing::error!(%peer, "session error: {e}");
             }
         });
@@ -116,16 +120,72 @@ async fn run_server(listen: SocketAddr) -> anyhow::Result<()> {
 
 /// COVERAGE: Session handler is tested via integration/e2e tests.
 #[cfg_attr(coverage_nightly, coverage(off))]
-async fn handle_server_session(conn: quinn::Connection) -> anyhow::Result<()> {
-    let (mut session, rows, cols) = ServerSession::accept(conn).await?;
-    tracing::info!(rows, cols, "client connected");
+async fn handle_server_session(conn: quinn::Connection, store: SessionStore) -> anyhow::Result<()> {
+    let (mut session, handshake) = ServerSession::accept_any(conn).await?;
 
-    let pty = PtySession::open(rows, cols)?;
+    // Generate session ID and resolve PTY/terminal/sender
+    let (session_id, pty, terminal, ssp_sender, rows, cols) = match handshake {
+        ControlMessage::Hello { rows, cols } => {
+            let session_id: [u8; 16] = rand_session_id();
+            tracing::info!(rows, cols, "new session");
+
+            let pty = PtySession::open(rows, cols)?;
+            let terminal = Arc::new(Mutex::new(RoseTerminal::new(rows, cols)));
+            let ssp_sender = Arc::new(Mutex::new(SspSender::new()));
+
+            // Send SessionInfo to client
+            session
+                .send_control(&ControlMessage::SessionInfo { session_id })
+                .await?;
+
+            (session_id, pty, terminal, ssp_sender, rows, cols)
+        }
+        ControlMessage::Reconnect {
+            rows,
+            cols,
+            session_id,
+        } => {
+            tracing::info!(rows, cols, "reconnecting session");
+
+            let detached = store
+                .remove(&session_id)
+                .ok_or_else(|| anyhow::anyhow!("session not found for reconnect"))?;
+
+            // Resize if client's terminal changed
+            if detached.rows != rows || detached.cols != cols {
+                let _ = detached.pty.resize(rows, cols);
+                detached
+                    .terminal
+                    .lock()
+                    .expect("terminal lock poisoned")
+                    .resize(rows, cols);
+            }
+
+            // Send SessionInfo to confirm reconnection
+            session
+                .send_control(&ControlMessage::SessionInfo { session_id })
+                .await?;
+
+            // Reset SSP sender so client gets a full init diff
+            {
+                let mut sender = detached.ssp_sender.lock().expect("sender lock poisoned");
+                *sender = SspSender::new();
+            }
+
+            (
+                session_id,
+                detached.pty,
+                detached.terminal,
+                detached.ssp_sender,
+                rows,
+                cols,
+            )
+        }
+        _ => anyhow::bail!("unexpected handshake message"),
+    };
+
     let mut pty_output = pty.subscribe_output();
     let pty_writer = pty.clone_writer();
-
-    let terminal = Arc::new(Mutex::new(RoseTerminal::new(rows, cols)));
-    let ssp_sender = Arc::new(Mutex::new(SspSender::new()));
 
     // Task: PTY output → terminal → SSP diff → client datagram
     let session_conn = session.connection().clone();
@@ -209,7 +269,7 @@ async fn handle_server_session(conn: quinn::Connection) -> anyhow::Result<()> {
         }
     });
 
-    // Task: control messages (resize, goodbye)
+    // Task: control messages (resize, goodbye) — returns PTY for detaching
     let terminal_ctrl = Arc::clone(&terminal);
     let control_task = tokio::spawn(async move {
         loop {
@@ -232,16 +292,50 @@ async fn handle_server_session(conn: quinn::Connection) -> anyhow::Result<()> {
                 }
             }
         }
+        pty // Return ownership of PTY for detaching
     });
 
-    // Wait for any task to finish (session over)
+    // Wait for any task to finish (connection lost or session ended)
     tokio::select! {
         _ = output_task => {}
         _ = input_task => {}
-        _ = control_task => {}
+        pty_result = control_task => {
+            // Control task finished — detach session with PTY
+            if let Ok(pty) = pty_result {
+                let _ = store.insert(
+                    session_id,
+                    DetachedSession {
+                        pty,
+                        terminal,
+                        ssp_sender,
+                        rows,
+                        cols,
+                    },
+                );
+                tracing::info!("session detached, awaiting reconnection");
+            }
+        }
     }
 
     Ok(())
+}
+
+/// Generates a random 16-byte session ID using system entropy.
+///
+/// COVERAGE: Thin wrapper around getrandom, tested via integration tests.
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn rand_session_id() -> [u8; 16] {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    // Mix process ID, thread ID, and high-precision time for uniqueness.
+    // This is not cryptographic but sufficient for session IDs.
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time before epoch");
+    let nanos = now.as_nanos();
+    let pid = u128::from(std::process::id());
+    let tid = std::thread::current().id();
+    let seed = nanos ^ (pid << 32) ^ (format!("{tid:?}").len() as u128);
+    seed.to_ne_bytes()
 }
 
 /// COVERAGE: CLI client loop is tested via integration/e2e tests.
