@@ -4,6 +4,13 @@ resolver = "3"
 
 [workspace.package]
 version = "0.1.0"
+authors = ["Nikhil Jha <oss@nikhiljha.com>", "Devin <devin@cognition.ai>"]
+description = "RoSE - The Remote Shell Environment"
+homepage = "https://rose.nikhiljha.com/"
+documentation = "https://rose.nikhiljha.com/docs"
+repository = "https://github.com/nikhiljha/rose"
+keywords = ["ssh", "mosh"]
+categories = ["command-line-utilities"]
 edition = "2024"
 license = "MIT"
 
