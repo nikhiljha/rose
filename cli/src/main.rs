@@ -102,12 +102,31 @@ async fn main() -> anyhow::Result<()> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn run_server(listen: SocketAddr, bootstrap: bool, ephemeral: bool) -> anyhow::Result<()> {
     let server = if bootstrap {
-        // Bootstrap mode: try random ports in the mosh range (60000-61000)
+        // Bootstrap mode: read the client's public cert from stdin (sent by the client
+        // over the authenticated SSH channel), then bind with mutual TLS requiring it.
+        // The client's private key never leaves the client.
+        use std::io::BufRead;
+
+        let mut client_cert_hex = String::new();
+        std::io::stdin()
+            .lock()
+            .read_line(&mut client_cert_hex)
+            .map_err(|e| anyhow::anyhow!("failed to read client cert from stdin: {e}"))?;
+        let client_cert_der = hex_decode(client_cert_hex.trim())?;
+
+        let server_cert = config::generate_self_signed_cert(&["localhost".to_string()])?;
+
+        // Write the client cert to a temp dir for mutual TLS authorization
+        let auth_dir = std::env::temp_dir().join(format!("rose-bootstrap-{}", std::process::id()));
+        std::fs::create_dir_all(&auth_dir)?;
+        std::fs::write(auth_dir.join("bootstrap-client.crt"), &client_cert_der)?;
+
+        // Try random ports in the mosh range (60000-61000) with mutual TLS
         let mut bound = None;
         for _ in 0..100 {
             let port = 60000 + (rand_u16() % 1000);
             let addr: SocketAddr = format!("0.0.0.0:{port}").parse()?;
-            match QuicServer::bind(addr) {
+            match QuicServer::bind_mutual_tls(addr, server_cert.clone(), &auth_dir) {
                 Ok(s) => {
                     bound = Some(s);
                     break;
@@ -115,18 +134,28 @@ async fn run_server(listen: SocketAddr, bootstrap: bool, ephemeral: bool) -> any
                 Err(_) => continue,
             }
         }
-        bound.ok_or_else(|| anyhow::anyhow!("failed to bind to any port in 60000-61000"))?
+        // Clean up temp dir (server already loaded the certs)
+        let _ = std::fs::remove_dir_all(&auth_dir);
+
+        let server =
+            bound.ok_or_else(|| anyhow::anyhow!("failed to bind to any port in 60000-61000"))?;
+
+        let addr = server.local_addr()?;
+        // Print server cert only — client already has its own keypair
+        let server_cert_hex = hex_encode(server.server_cert_der().as_ref());
+        println!(
+            "ROSE_BOOTSTRAP {port} {server_cert_hex}",
+            port = addr.port()
+        );
+
+        server
     } else {
         QuicServer::bind(listen)?
     };
 
     let addr = server.local_addr()?;
 
-    if bootstrap {
-        // Print machine-readable bootstrap info to stdout
-        let cert_hex = hex_encode(server.server_cert_der().as_ref());
-        println!("ROSE_BOOTSTRAP {port} {cert_hex}", port = addr.port());
-    } else {
+    if !bootstrap {
         eprintln!("RoSE server listening on {addr}");
 
         // Save server cert for clients to use
@@ -201,7 +230,7 @@ fn hex_encode(data: &[u8]) -> String {
 
 /// Parses a `ROSE_BOOTSTRAP` line from the server's stdout.
 ///
-/// Expected format: `ROSE_BOOTSTRAP <port> <hex_cert>`
+/// Expected format: `ROSE_BOOTSTRAP <port> <server_cert_hex>`
 ///
 /// # Errors
 ///
@@ -210,13 +239,13 @@ fn parse_bootstrap_line(line: &str) -> anyhow::Result<(u16, Vec<u8>)> {
     let line = line.trim();
     let parts: Vec<&str> = line.splitn(3, ' ').collect();
     if parts.len() != 3 || parts[0] != "ROSE_BOOTSTRAP" {
-        anyhow::bail!("invalid bootstrap line: {line}");
+        anyhow::bail!("invalid bootstrap line: expected ROSE_BOOTSTRAP <port> <server_cert_hex>");
     }
     let port: u16 = parts[1]
         .parse()
         .map_err(|_| anyhow::anyhow!("invalid port in bootstrap line: {}", parts[1]))?;
-    let cert_der = hex_decode(parts[2])?;
-    Ok((port, cert_der))
+    let server_cert_der = hex_decode(parts[2])?;
+    Ok((port, server_cert_der))
 }
 
 /// Hex-decodes a string to bytes.
@@ -531,23 +560,33 @@ async fn run_client(host: &str, port: u16, cert_path: Option<PathBuf>) -> anyhow
     terminal::enable_raw_mode()?;
     let _raw_guard = RawModeGuard;
 
-    client_session_loop(addr, &cert_der).await
+    client_session_loop(addr, &cert_der, None).await
 }
 
 /// Reconnection loop: connects/reconnects to the server with exponential backoff.
+///
+/// When `client_cert` is `Some`, mutual TLS is used (for SSH bootstrap mode).
 ///
 /// COVERAGE: CLI client session loop is tested via integration/e2e tests.
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn client_session_loop(
     addr: SocketAddr,
     cert_der: &rustls::pki_types::CertificateDer<'static>,
+    client_cert: Option<&config::CertKeyPair>,
 ) -> anyhow::Result<()> {
     let mut session_id: Option<[u8; 16]> = None;
     let mut backoff = Duration::from_millis(100);
     let client = QuicClient::new()?;
 
     loop {
-        let conn = match client.connect(addr, "localhost", cert_der).await {
+        let conn_result = if let Some(cc) = client_cert {
+            client
+                .connect_with_cert(addr, "localhost", cert_der, cc)
+                .await
+        } else {
+            client.connect(addr, "localhost", cert_der).await
+        };
+        let conn = match conn_result {
             Ok(c) => {
                 backoff = Duration::from_millis(100);
                 c
@@ -767,13 +806,20 @@ async fn client_session_loop(
     }
 }
 
-/// SSH bootstrap mode: spawns `ssh <host> rose server --bootstrap --ephemeral`,
-/// parses the `ROSE_BOOTSTRAP` line, then connects QUIC directly to the host.
+/// SSH bootstrap mode: generates an ephemeral client cert, spawns
+/// `ssh <host> rose server --bootstrap --ephemeral`, sends the client's
+/// public cert over stdin, parses the `ROSE_BOOTSTRAP` line, then connects
+/// QUIC directly to the host with mutual TLS.
+///
+/// The client's private key never leaves this process.
 ///
 /// COVERAGE: CLI bootstrap mode is tested via unit tests for parsing.
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn run_ssh_bootstrap(host: &str) -> anyhow::Result<()> {
-    use tokio::io::AsyncBufReadExt;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    // Generate ephemeral client cert — private key stays local
+    let client_cert = config::generate_self_signed_cert(&["bootstrap-client".to_string()])?;
 
     eprintln!("Starting SSH bootstrap to {host}...");
 
@@ -789,6 +835,18 @@ async fn run_ssh_bootstrap(host: &str) -> anyhow::Result<()> {
         .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn ssh: {e}"))?;
 
+    // Send client's public cert to the server over the SSH channel
+    {
+        let stdin = ssh
+            .stdin
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("failed to capture ssh stdin"))?;
+        let cert_hex = hex_encode(client_cert.cert_der.as_ref());
+        stdin.write_all(cert_hex.as_bytes()).await?;
+        stdin.write_all(b"\n").await?;
+        stdin.flush().await?;
+    }
+
     let stdout = ssh
         .stdout
         .take()
@@ -801,10 +859,10 @@ async fn run_ssh_bootstrap(host: &str) -> anyhow::Result<()> {
         .map_err(|_| anyhow::anyhow!("timeout waiting for ROSE_BOOTSTRAP line"))?
         .map_err(|e| anyhow::anyhow!("failed to read bootstrap line: {e}"))?;
 
-    let (port, cert_der) = parse_bootstrap_line(&line)?;
+    let (port, server_cert_der) = parse_bootstrap_line(&line)?;
     eprintln!("Bootstrap: server on port {port}");
 
-    let cert_der = rustls::pki_types::CertificateDer::from(cert_der);
+    let server_cert_der = rustls::pki_types::CertificateDer::from(server_cert_der);
 
     // Resolve host to an IP for QUIC (UDP) connection
     let addr: SocketAddr = {
@@ -816,11 +874,11 @@ async fn run_ssh_bootstrap(host: &str) -> anyhow::Result<()> {
             .ok_or_else(|| anyhow::anyhow!("could not resolve {host}:{port}"))?
     };
 
-    // Enter raw mode and start the client session loop
+    // Enter raw mode and start the client session loop with mutual TLS
     terminal::enable_raw_mode()?;
     let _raw_guard = RawModeGuard;
 
-    let result = client_session_loop(addr, &cert_der).await;
+    let result = client_session_loop(addr, &server_cert_der, Some(&client_cert)).await;
 
     // Kill SSH process when done
     let _ = ssh.kill().await;
@@ -979,12 +1037,11 @@ mod tests {
 
     #[test]
     fn parse_bootstrap_valid() {
-        let cert = b"\x01\x02\x03";
-        let hex_cert = hex_encode(cert);
-        let line = format!("ROSE_BOOTSTRAP 60123 {hex_cert}\n");
+        let server_cert = b"\x01\x02\x03";
+        let line = format!("ROSE_BOOTSTRAP 60123 {}\n", hex_encode(server_cert));
         let (port, der) = parse_bootstrap_line(&line).unwrap();
         assert_eq!(port, 60123);
-        assert_eq!(der, cert);
+        assert_eq!(der, server_cert);
     }
 
     #[test]

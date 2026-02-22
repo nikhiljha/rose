@@ -30,6 +30,7 @@ pub enum ConfigError {
 }
 
 /// A generated certificate and its private key in both PEM and DER formats.
+#[derive(Clone)]
 pub struct CertKeyPair {
     /// PEM-encoded certificate.
     pub cert_pem: String,

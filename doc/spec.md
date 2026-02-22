@@ -76,13 +76,16 @@ No persistent server daemon required. RoSE uses the system `ssh` binary for boot
 
 The client:
 
-1. Spawns `ssh <host> rose server --bootstrap --ephemeral` to start a temporary server.
-2. The server picks a random UDP port in the 60000-61000 range and prints `ROSE_BOOTSTRAP <port> <hex_cert>` to stdout.
-3. The client parses the port and certificate, then connects QUIC directly to `<host>:<port>`.
-4. The SSH connection is kept alive as a watchdog — if it dies, the server exits.
-5. When the QUIC session ends, the client kills the SSH process.
+1. Generates an ephemeral client certificate (private key stays local).
+2. Spawns `ssh <host> rose server --bootstrap --ephemeral` and writes the client's public certificate (hex-encoded DER) to the SSH process's stdin.
+3. The server reads the client cert from stdin, generates its own server certificate, binds with mutual TLS requiring that specific client cert, picks a random UDP port in the 60000-61000 range, and prints `ROSE_BOOTSTRAP <port> <server_cert_hex>` to stdout.
+4. The client parses the server cert and port, then connects QUIC to `<host>:<port>` using mutual TLS.
+5. The SSH connection is kept alive as a watchdog — if it dies, the server exits.
+6. When the QUIC session ends, the client kills the SSH process.
 
-This mode does not cache certificates (the session is ephemeral). If UDP is blocked by a firewall, the connection fails (same limitation as mosh).
+**Security:** The client's private key never leaves the client process. The public certificate is sent to the server over the authenticated SSH channel, and the server requires it for mutual TLS — preventing unauthorized connections to the bootstrap port. Both certificates are ephemeral and not cached.
+
+If UDP is blocked by a firewall, the connection fails (same limitation as mosh).
 
 ## State Synchronization Protocol
 
