@@ -3,6 +3,8 @@
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
@@ -11,6 +13,11 @@ use crossterm::terminal;
 use rose::config::{self, RosePaths};
 use rose::protocol::{ClientSession, ControlMessage, ServerSession};
 use rose::pty::PtySession;
+use rose::ssp::{
+    DATAGRAM_KEYSTROKE, DATAGRAM_SSP_ACK, ScreenState, SspFrame, SspReceiver, SspSender,
+    render_diff_ansi,
+};
+use rose::terminal::RoseTerminal;
 use rose::transport::{QuicClient, QuicServer};
 
 /// `RoSE` — Remote Shell Environment.
@@ -115,48 +122,92 @@ async fn handle_server_session(conn: quinn::Connection) -> anyhow::Result<()> {
 
     let pty = PtySession::open(rows, cols)?;
     let mut pty_output = pty.subscribe_output();
+    let pty_writer = pty.clone_writer();
 
-    // Task: PTY output -> client datagrams
+    let terminal = Arc::new(Mutex::new(RoseTerminal::new(rows, cols)));
+    let ssp_sender = Arc::new(Mutex::new(SspSender::new()));
+
+    // Task: PTY output → terminal → SSP diff → client datagram
     let session_conn = session.connection().clone();
+    let terminal_out = Arc::clone(&terminal);
+    let sender_out = Arc::clone(&ssp_sender);
     let output_task = tokio::spawn(async move {
+        let mut dirty = false;
+        let mut interval = tokio::time::interval(Duration::from_millis(20));
         loop {
-            match pty_output.recv().await {
-                Ok(data) => {
-                    if session_conn
-                        .send_datagram(Bytes::from(data.to_vec()))
-                        .is_err()
-                    {
-                        break;
+            tokio::select! {
+                result = pty_output.recv() => {
+                    match result {
+                        Ok(data) => {
+                            terminal_out.lock().expect("terminal lock poisoned").advance(&data);
+                            dirty = true;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!(n, "output subscriber lagged");
+                            dirty = true;
+                        }
                     }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!(n, "output subscriber lagged");
+                _ = interval.tick() => {
+                    if dirty {
+                        dirty = false;
+                        let state = terminal_out.lock().expect("terminal lock poisoned").snapshot();
+                        let mut sender = sender_out.lock().expect("sender lock poisoned");
+                        sender.push_state(state);
+                        if let Some(frame) = sender.generate_frame() {
+                            let data = frame.encode();
+                            if session_conn.send_datagram(Bytes::from(data)).is_err() {
+                                break;
+                            }
+                        }
+                    }
                 }
             }
         }
     });
 
-    // Task: client datagrams -> PTY input
+    // Task: client datagrams → parse prefix → keystroke or ACK
     let input_conn = session.connection().clone();
-    let pty_writer = pty.clone_writer();
+    let sender_input = Arc::clone(&ssp_sender);
     let input_task = tokio::spawn(async move {
         while let Ok(data) = input_conn.read_datagram().await {
-            let mut w = pty_writer.lock().expect("writer lock poisoned");
-            if std::io::Write::write_all(&mut *w, &data).is_err() {
-                break;
+            if data.is_empty() {
+                continue;
             }
-            let _ = std::io::Write::flush(&mut *w);
+            match data[0] {
+                DATAGRAM_KEYSTROKE => {
+                    let mut w = pty_writer.lock().expect("writer lock poisoned");
+                    if std::io::Write::write_all(&mut *w, &data[1..]).is_err() {
+                        break;
+                    }
+                    let _ = std::io::Write::flush(&mut *w);
+                }
+                DATAGRAM_SSP_ACK => {
+                    if let Ok(frame) = SspFrame::decode(&data[1..]) {
+                        sender_input
+                            .lock()
+                            .expect("sender lock poisoned")
+                            .process_ack(frame.ack_num);
+                    }
+                }
+                _ => {}
+            }
         }
     });
 
     // Task: control messages (resize, goodbye)
+    let terminal_ctrl = Arc::clone(&terminal);
     let control_task = tokio::spawn(async move {
         loop {
             match session.recv_control().await {
                 Ok(Some(ControlMessage::Resize { rows, cols })) => {
                     tracing::info!(rows, cols, "resize");
                     let _ = pty.resize(rows, cols);
+                    terminal_ctrl
+                        .lock()
+                        .expect("terminal lock poisoned")
+                        .resize(rows, cols);
                 }
                 Ok(Some(ControlMessage::Goodbye) | None) => break,
                 Ok(Some(msg)) => {
@@ -223,28 +274,59 @@ async fn run_client(host: &str, port: u16, cert_path: Option<PathBuf>) -> anyhow
 
     let mut stdout = std::io::stdout();
 
-    // Task: receive server output -> stdout
+    // Clear screen so SSP rendering starts clean
+    let _ = stdout.write_all(b"\x1b[2J\x1b[H");
+    let _ = stdout.flush();
+
+    // Task: receive SSP frames → apply diff → render ANSI → stdout + send ACK
     let output_conn = session.connection().clone();
     let output_task = tokio::spawn(async move {
+        let mut receiver = SspReceiver::new(rows);
+        let mut prev_state = ScreenState::empty(rows);
+
         while let Ok(data) = output_conn.read_datagram().await {
-            let mut out = std::io::stdout();
-            if out.write_all(&data).is_err() {
-                break;
+            let Ok(frame) = SspFrame::decode(&data) else {
+                continue;
+            };
+            match receiver.process_frame(&frame) {
+                Ok(Some(_)) => {
+                    let new_state = receiver.state().clone();
+                    let ansi = render_diff_ansi(&prev_state, &new_state);
+                    let mut out = std::io::stdout();
+                    if out.write_all(&ansi).is_err() {
+                        break;
+                    }
+                    let _ = out.flush();
+                    prev_state = new_state;
+
+                    // Send ACK back to server
+                    let ack = SspFrame::ack_only(receiver.ack_num());
+                    let mut ack_data = vec![DATAGRAM_SSP_ACK];
+                    ack_data.extend_from_slice(&ack.encode());
+                    let _ = output_conn.send_datagram(Bytes::from(ack_data));
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!("SSP frame error: {e}");
+                }
             }
-            let _ = out.flush();
         }
     });
 
-    // Task: stdin -> send input datagrams
+    // Task: stdin → prefix with 0x00 → send input datagrams
     let input_conn = session.connection().clone();
     let input_task = tokio::spawn(async move {
         loop {
             let event = tokio::task::spawn_blocking(crossterm::event::read).await;
             match event {
                 Ok(Ok(Event::Key(key))) => {
-                    let bytes = key_event_to_bytes(&key);
-                    if !bytes.is_empty() && input_conn.send_datagram(Bytes::from(bytes)).is_err() {
-                        break;
+                    let key_bytes = key_event_to_bytes(&key);
+                    if !key_bytes.is_empty() {
+                        let mut data = vec![DATAGRAM_KEYSTROKE];
+                        data.extend_from_slice(&key_bytes);
+                        if input_conn.send_datagram(Bytes::from(data)).is_err() {
+                            break;
+                        }
                     }
                 }
                 Ok(Ok(Event::Resize(_, _))) => {
@@ -260,7 +342,7 @@ async fn run_client(host: &str, port: u16, cert_path: Option<PathBuf>) -> anyhow
     let resize_task = tokio::spawn(async move {
         let mut last_size = (cols, rows);
         loop {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
             if let Ok(new_size) = terminal::size()
                 && new_size != last_size
             {

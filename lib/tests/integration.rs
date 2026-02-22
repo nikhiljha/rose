@@ -90,6 +90,149 @@ async fn transport_protocol_handshake_and_datagram() {
 }
 
 // ---------------------------------------------------------------------------
+// Terminal snapshot captures screen state correctly
+// ---------------------------------------------------------------------------
+
+#[test]
+fn terminal_snapshot() {
+    use rose::terminal::RoseTerminal;
+
+    let mut term = RoseTerminal::new(24, 80);
+    term.advance(b"hello world\r\nline two");
+
+    let snap = term.snapshot();
+    assert_eq!(snap.rows.len(), 24);
+    assert_eq!(snap.rows[0], "hello world");
+    assert_eq!(snap.rows[1], "line two");
+    assert_eq!(snap.rows[2], ""); // empty row
+    assert_eq!(snap.cursor_x, 8); // "line two" is 8 chars
+    assert_eq!(snap.cursor_y, 1);
+}
+
+// ---------------------------------------------------------------------------
+// SSP sender → receiver roundtrip (no network)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ssp_sender_receiver_roundtrip() {
+    use rose::ssp::{ScreenState, SspReceiver, SspSender};
+
+    let mut sender = SspSender::new();
+    let mut receiver = SspReceiver::new(24);
+
+    // Push first state
+    let mut rows1 = vec![String::new(); 24];
+    rows1[0] = "first".into();
+    sender.push_state(ScreenState {
+        rows: rows1,
+        cursor_x: 5,
+        cursor_y: 0,
+    });
+
+    // Generate and apply init frame
+    let frame1 = sender.generate_frame().unwrap();
+    let result = receiver.process_frame(&frame1).unwrap();
+    assert!(result.is_some());
+    assert_eq!(receiver.state().rows[0], "first");
+
+    // Ack and push second state
+    sender.process_ack(receiver.ack_num());
+    let mut rows2 = vec![String::new(); 24];
+    rows2[0] = "first".into();
+    rows2[1] = "second".into();
+    sender.push_state(ScreenState {
+        rows: rows2,
+        cursor_x: 6,
+        cursor_y: 1,
+    });
+
+    // Generate and apply incremental frame
+    let frame2 = sender.generate_frame().unwrap();
+    let result = receiver.process_frame(&frame2).unwrap();
+    assert!(result.is_some());
+    assert_eq!(receiver.state().rows[0], "first");
+    assert_eq!(receiver.state().rows[1], "second");
+    assert_eq!(receiver.state().cursor_x, 6);
+
+    // After ack, no new frame needed
+    sender.process_ack(receiver.ack_num());
+    assert!(sender.generate_frame().is_none());
+}
+
+// ---------------------------------------------------------------------------
+// SSP over QUIC: server sends state update, client receives and applies
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn ssp_over_quic() {
+    use bytes::Bytes;
+    use rose::protocol::{ClientSession, ServerSession};
+    use rose::ssp::{DATAGRAM_SSP_ACK, ScreenState, SspFrame, SspReceiver, SspSender};
+    use rose::transport::{QuicClient, QuicServer};
+
+    let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = server.local_addr().unwrap();
+    let cert = server.server_cert_der().clone();
+
+    // Server: accept, create SSP state, send frame
+    let server_task = tokio::spawn(async move {
+        let conn = server.accept().await.unwrap().unwrap();
+        let (session, _, _) = ServerSession::accept(conn).await.unwrap();
+
+        let mut sender = SspSender::new();
+        let mut rows = vec![String::new(); 24];
+        rows[0] = "ssp over quic".into();
+        rows[1] = "line two".into();
+        sender.push_state(ScreenState {
+            rows,
+            cursor_x: 8,
+            cursor_y: 1,
+        });
+
+        let frame = sender.generate_frame().unwrap();
+        session.send_output(Bytes::from(frame.encode())).unwrap();
+
+        // Wait for ACK
+        let ack_data = session.recv_input().await.unwrap();
+        assert_eq!(ack_data[0], DATAGRAM_SSP_ACK);
+        let ack_frame = SspFrame::decode(&ack_data[1..]).unwrap();
+        assert_eq!(ack_frame.ack_num, 1);
+
+        // Keep alive for clean shutdown
+        drop(session);
+        drop(server);
+    });
+
+    // Client: connect, receive frame, verify state
+    let client = QuicClient::new().unwrap();
+    let client_conn = client.connect(addr, "localhost", &cert).await.unwrap();
+    let client_session = ClientSession::connect(client_conn, 24, 80).await.unwrap();
+
+    let data = tokio::time::timeout(Duration::from_secs(5), client_session.recv_output())
+        .await
+        .unwrap()
+        .unwrap();
+
+    let frame = SspFrame::decode(&data).unwrap();
+    let mut receiver = SspReceiver::new(24);
+    let result = receiver.process_frame(&frame).unwrap();
+    assert!(result.is_some());
+    assert_eq!(receiver.state().rows[0], "ssp over quic");
+    assert_eq!(receiver.state().rows[1], "line two");
+    assert_eq!(receiver.state().cursor_x, 8);
+
+    // Send ACK back
+    let ack = SspFrame::ack_only(receiver.ack_num());
+    let mut ack_data = vec![DATAGRAM_SSP_ACK];
+    ack_data.extend_from_slice(&ack.encode());
+    client_session.send_input(Bytes::from(ack_data)).unwrap();
+
+    // Wait a moment for server to process
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    server_task.abort();
+}
+
+// ---------------------------------------------------------------------------
 // End-to-end: server with PTY + client, send command, verify output
 // ---------------------------------------------------------------------------
 

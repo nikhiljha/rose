@@ -8,6 +8,8 @@ use std::sync::Arc;
 
 use wezterm_term::{Terminal, TerminalConfiguration, TerminalSize};
 
+use crate::ssp::ScreenState;
+
 /// Configuration for the wezterm terminal emulator.
 #[derive(Debug)]
 struct RoseTerminalConfig;
@@ -103,6 +105,24 @@ impl RoseTerminal {
     pub fn size(&self) -> (usize, usize) {
         let s = self.inner.get_size();
         (s.rows, s.cols)
+    }
+
+    /// Captures the current visible screen state as a [`ScreenState`].
+    ///
+    /// Each row has trailing whitespace trimmed.
+    #[must_use]
+    pub fn snapshot(&self) -> ScreenState {
+        let size = self.inner.get_size();
+        let mut rows = Vec::with_capacity(size.rows);
+        for row in 0..size.rows {
+            rows.push(self.line_text(row).trim_end().to_string());
+        }
+        let (cx, cy) = self.cursor_pos();
+        ScreenState {
+            rows,
+            cursor_x: cx as u16,
+            cursor_y: cy as u16,
+        }
     }
 }
 

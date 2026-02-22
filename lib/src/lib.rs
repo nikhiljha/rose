@@ -6,5 +6,6 @@
 pub mod config;
 pub mod protocol;
 pub mod pty;
+pub mod ssp;
 pub mod terminal;
 pub mod transport;
