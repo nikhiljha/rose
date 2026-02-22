@@ -3,6 +3,7 @@
 //!
 //! A modern replacement for Mosh built on QUIC and wezterm's terminal emulator.
 
+pub mod cli;
 pub mod config;
 pub mod protocol;
 pub mod pty;

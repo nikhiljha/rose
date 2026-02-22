@@ -13,17 +13,8 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
-bytes = "1.11.1"
-clap = { version = "4.5.60", features = ["derive"] }
-crossterm = "0.29.0"
-quinn = "0.11.9"
 rose = { version = "0.1.0", path = "../lib" }
-rustls = "0.23.36"
 tokio.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
-
-[dev-dependencies]
 
 [build-dependencies]
 clap = { version = "4.5.60", features = ["derive"] }
