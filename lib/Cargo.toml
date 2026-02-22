@@ -20,6 +20,8 @@ tracing.workspace = true
 wezterm-term = { git = "https://github.com/wezterm/wezterm", branch = "main", version = "0.1.0" }
 
 [dev-dependencies]
+bytes = "1.11.1"
 criterion.workspace = true
 insta.workspace = true
+tokio = { workspace = true, features = ["full"] }
 

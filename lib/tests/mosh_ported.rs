@@ -31,13 +31,95 @@ fn e2e_window_resize() {
 // disconnects cleanly.
 // ---------------------------------------------------------------------------
 
-#[test]
-#[ignore = "requires transport + protocol layers (mosh: e2e-success.test)"]
-fn e2e_basic_connection() {
-    // TODO: Start a RoSE server. Connect a client. Verify the connection
-    // is established and the client can see the shell prompt. Send "exit"
-    // and verify clean disconnection.
-    unimplemented!("basic connection e2e test");
+#[tokio::test]
+async fn e2e_basic_connection() {
+    use bytes::Bytes;
+    use rose::protocol::{ClientSession, ServerSession};
+    use rose::pty::PtySession;
+    use rose::transport::{QuicClient, QuicServer};
+    use std::time::Duration;
+
+    let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = server.local_addr().unwrap();
+    let cert = server.server_cert_der().clone();
+
+    // Server: accept, spawn cat, forward I/O in both directions
+    let server_task = tokio::spawn(async move {
+        let conn = server.accept().await.unwrap().unwrap();
+        let (session, rows, cols) = ServerSession::accept(conn).await.unwrap();
+        let pty = PtySession::open_command(rows, cols, "cat", &[]).unwrap();
+        let pty_writer = pty.clone_writer();
+        let mut rx = pty.subscribe_output();
+
+        // Forward PTY output -> client datagrams
+        let output_conn = session.connection().clone();
+        let output_fwd = tokio::spawn(async move {
+            while let Ok(chunk) = rx.recv().await {
+                if output_conn
+                    .send_datagram(Bytes::from(chunk.to_vec()))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        // Forward client datagrams -> PTY input
+        let input_conn = session.connection().clone();
+        let input_fwd = tokio::spawn(async move {
+            while let Ok(data) = input_conn.read_datagram().await {
+                let mut w = pty_writer.lock().expect("writer lock poisoned");
+                if std::io::Write::write_all(&mut *w, &data).is_err() {
+                    break;
+                }
+                let _ = std::io::Write::flush(&mut *w);
+            }
+        });
+
+        tokio::select! {
+            _ = output_fwd => {}
+            _ = input_fwd => {}
+        }
+
+        drop(pty);
+        drop(session);
+    });
+
+    // Client: connect, send data, read echo
+    let client = QuicClient::new().unwrap();
+    let client_conn = client.connect(addr, "localhost", &cert).await.unwrap();
+    let client_session = ClientSession::connect(client_conn, 24, 80).await.unwrap();
+
+    // Send some input
+    client_session
+        .send_input(Bytes::from_static(b"hello_e2e\n"))
+        .unwrap();
+
+    // Read output — cat should echo our input back
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut collected = String::new();
+    let mut found = false;
+
+    loop {
+        let timeout = tokio::time::timeout_at(deadline, client_session.recv_output()).await;
+        match timeout {
+            Ok(Ok(data)) => {
+                collected.push_str(&String::from_utf8_lossy(&data));
+                if collected.contains("hello_e2e") {
+                    found = true;
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+
+    assert!(
+        found,
+        "expected 'hello_e2e' in echoed output, got: {collected:?}"
+    );
+
+    server_task.abort();
 }
 
 // ---------------------------------------------------------------------------

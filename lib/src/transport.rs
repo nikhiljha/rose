@@ -108,8 +108,7 @@ impl QuicClient {
     /// Returns `TransportError::Bind` if the socket cannot be bound.
     pub fn new() -> Result<Self, TransportError> {
         let addr = SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0));
-        let endpoint = quinn::Endpoint::client(addr)
-            .map_err(TransportError::Bind)?;
+        let endpoint = quinn::Endpoint::client(addr).map_err(TransportError::Bind)?;
         Ok(Self { endpoint })
     }
 

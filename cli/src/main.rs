@@ -122,7 +122,10 @@ async fn handle_server_session(conn: quinn::Connection) -> anyhow::Result<()> {
         loop {
             match pty_output.recv().await {
                 Ok(data) => {
-                    if session_conn.send_datagram(Bytes::from(data.to_vec())).is_err() {
+                    if session_conn
+                        .send_datagram(Bytes::from(data.to_vec()))
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -240,9 +243,7 @@ async fn run_client(host: &str, port: u16, cert_path: Option<PathBuf>) -> anyhow
             match event {
                 Ok(Ok(Event::Key(key))) => {
                     let bytes = key_event_to_bytes(&key);
-                    if !bytes.is_empty()
-                        && input_conn.send_datagram(Bytes::from(bytes)).is_err()
-                    {
+                    if !bytes.is_empty() && input_conn.send_datagram(Bytes::from(bytes)).is_err() {
                         break;
                     }
                 }
@@ -261,16 +262,17 @@ async fn run_client(host: &str, port: u16, cert_path: Option<PathBuf>) -> anyhow
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             if let Ok(new_size) = terminal::size()
-                && new_size != last_size {
-                    last_size = new_size;
-                    let msg = ControlMessage::Resize {
-                        rows: new_size.1,
-                        cols: new_size.0,
-                    };
-                    if session.send_control(&msg).await.is_err() {
-                        break;
-                    }
+                && new_size != last_size
+            {
+                last_size = new_size;
+                let msg = ControlMessage::Resize {
+                    rows: new_size.1,
+                    cols: new_size.0,
+                };
+                if session.send_control(&msg).await.is_err() {
+                    break;
                 }
+            }
         }
     });
 
@@ -320,11 +322,12 @@ impl Drop for RawModeGuard {
 fn key_event_to_bytes(key: &crossterm::event::KeyEvent) -> Vec<u8> {
     // Ctrl+C
     if key.modifiers.contains(KeyModifiers::CONTROL)
-        && let KeyCode::Char(c) = key.code {
-            // Ctrl+letter maps to ASCII 1-26
-            let ctrl_byte = (c as u8).wrapping_sub(b'a').wrapping_add(1);
-            return vec![ctrl_byte];
-        }
+        && let KeyCode::Char(c) = key.code
+    {
+        // Ctrl+letter maps to ASCII 1-26
+        let ctrl_byte = (c as u8).wrapping_sub(b'a').wrapping_add(1);
+        return vec![ctrl_byte];
+    }
 
     match key.code {
         KeyCode::Char(c) => {

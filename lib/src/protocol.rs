@@ -93,9 +93,7 @@ impl ControlMessage {
         match msg_type {
             MSG_HELLO => {
                 if payload.len() < 4 {
-                    return Err(ProtocolError::InvalidMessage(
-                        "Hello too short".to_string(),
-                    ));
+                    return Err(ProtocolError::InvalidMessage("Hello too short".to_string()));
                 }
                 let rows = u16::from_be_bytes([payload[0], payload[1]]);
                 let cols = u16::from_be_bytes([payload[2], payload[3]]);
@@ -259,11 +257,7 @@ impl ClientSession {
     /// # Errors
     ///
     /// Returns `ProtocolError` if the handshake fails.
-    pub async fn connect(
-        conn: Connection,
-        rows: u16,
-        cols: u16,
-    ) -> Result<Self, ProtocolError> {
+    pub async fn connect(conn: Connection, rows: u16, cols: u16) -> Result<Self, ProtocolError> {
         let (mut control_send, control_recv) = conn.open_bi().await?;
         write_control(&mut control_send, &ControlMessage::Hello { rows, cols }).await?;
 
