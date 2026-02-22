@@ -593,11 +593,29 @@ fn native_mode_mutual_tls_auth() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "requires certificate management"]
 fn native_mode_tofu_self_signed() {
-    // TODO: Generate a self-signed server certificate. Connect a client
-    // for the first time — should prompt/succeed and cache the cert in
-    // known_hosts. Connect again — should verify against cached cert.
-    // Change the server cert — should reject (TOFU violation).
-    unimplemented!("TOFU self-signed cert test");
+    use rose::config::{TofuResult, generate_self_signed_cert, tofu_check};
+
+    let dir = std::env::temp_dir().join(format!("rose-tofu-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let cert1 = generate_self_signed_cert(&["localhost".to_string()]).unwrap();
+    let cert2 = generate_self_signed_cert(&["localhost".to_string()]).unwrap();
+
+    // First connection: cert is saved
+    let result = tofu_check(&dir, "testhost", cert1.cert_der.as_ref()).unwrap();
+    assert_eq!(result, TofuResult::FirstConnection);
+
+    // Second connection with same cert: verified
+    let result = tofu_check(&dir, "testhost", cert1.cert_der.as_ref()).unwrap();
+    assert_eq!(result, TofuResult::Verified);
+
+    // Third connection with different cert: mismatch (TOFU violation)
+    let result = tofu_check(&dir, "testhost", cert2.cert_der.as_ref()).unwrap();
+    assert!(
+        matches!(result, TofuResult::Mismatch { .. }),
+        "expected Mismatch for changed cert, got {result:?}"
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
 }
