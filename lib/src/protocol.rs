@@ -131,7 +131,8 @@ pub async fn write_control(
     msg: &ControlMessage,
 ) -> Result<(), ProtocolError> {
     let encoded = msg.encode();
-    let len = u32::try_from(encoded.len()).expect("message too large");
+    // Control messages are at most 5 bytes, always fits in u32.
+    let len = encoded.len() as u32;
     send.write_all(&len.to_be_bytes()).await?;
     send.write_all(&encoded).await?;
     Ok(())
@@ -240,7 +241,7 @@ impl ServerSession {
 
     /// Returns a reference to the underlying connection.
     #[must_use]
-    pub fn connection(&self) -> &Connection {
+    pub const fn connection(&self) -> &Connection {
         &self.conn
     }
 }
@@ -314,7 +315,7 @@ impl ClientSession {
 
     /// Returns a reference to the underlying connection.
     #[must_use]
-    pub fn connection(&self) -> &Connection {
+    pub const fn connection(&self) -> &Connection {
         &self.conn
     }
 }

@@ -123,11 +123,21 @@ impl PtySession {
         self.output_tx.subscribe()
     }
 
+    /// Returns a clone of the writer handle for use from another task/thread.
+    #[must_use]
+    pub fn clone_writer(&self) -> Arc<Mutex<Box<dyn std::io::Write + Send>>> {
+        Arc::clone(&self.writer)
+    }
+
     /// Writes input bytes to the PTY (i.e., sends keystrokes to the child).
     ///
     /// # Errors
     ///
     /// Returns `PtyError::Io` if the write fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the writer mutex is poisoned (a thread panicked while holding it).
     pub fn write(&self, data: &[u8]) -> Result<(), PtyError> {
         let mut w = self.writer.lock().expect("writer lock poisoned");
         std::io::Write::write_all(&mut *w, data)?;

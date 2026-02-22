@@ -84,7 +84,7 @@ impl QuicServer {
 
     /// Returns the DER-encoded server certificate for sharing with clients.
     #[must_use]
-    pub fn server_cert_der(&self) -> &CertificateDer<'static> {
+    pub const fn server_cert_der(&self) -> &CertificateDer<'static> {
         &self.cert.cert_der
     }
 
@@ -107,7 +107,8 @@ impl QuicClient {
     ///
     /// Returns `TransportError::Bind` if the socket cannot be bound.
     pub fn new() -> Result<Self, TransportError> {
-        let endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().expect("valid addr"))
+        let addr = SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0));
+        let endpoint = quinn::Endpoint::client(addr)
             .map_err(TransportError::Bind)?;
         Ok(Self { endpoint })
     }
