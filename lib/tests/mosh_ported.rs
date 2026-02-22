@@ -894,17 +894,13 @@ async fn scrollback_sync_over_reliable_stream() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "requires SSH bootstrap implementation"]
+#[ignore = "requires SSH server"]
 fn ssh_bootstrap_mode() {
-    // TODO: Start an SSH server (or mock). Run `rose connect --ssh`.
-    // Verify the client:
-    // 1. SSHs in
-    // 2. Starts rose server on a high port
-    // 3. Exchanges certificates
-    // 4. Connects via QUIC
-    // 5. Drops the SSH connection
-    // 6. The session works over QUIC
-    unimplemented!("SSH bootstrap mode test");
+    // Full e2e test requires an SSH server. The parsing logic
+    // (parse_bootstrap_line, hex_encode/decode) is unit tested in cli/src/main.rs.
+    // To test manually: run `rose connect --ssh localhost` against a machine
+    // with `rose` installed and SSH access.
+    unimplemented!("SSH bootstrap e2e test requires SSH server");
 }
 
 // ---------------------------------------------------------------------------
