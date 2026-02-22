@@ -367,120 +367,198 @@ async fn run_client(host: &str, port: u16, cert_path: Option<PathBuf>) -> anyhow
             })
     });
 
-    let client = QuicClient::new()?;
-    let conn = client.connect(addr, "localhost", &cert_der).await?;
-    eprintln!("Connected to {addr}");
-
-    // Get terminal size
-    let (cols, rows) = terminal::size()?;
-    let mut session = ClientSession::connect(conn, rows, cols).await?;
-
-    // Enter raw mode
+    // Enter raw mode before the reconnection loop so it stays active across reconnections
     terminal::enable_raw_mode()?;
     let _raw_guard = RawModeGuard;
 
-    let mut stdout = std::io::stdout();
+    client_session_loop(addr, &cert_der).await
+}
 
-    // Clear screen so SSP rendering starts clean
-    let _ = stdout.write_all(b"\x1b[2J\x1b[H");
-    let _ = stdout.flush();
+/// Reconnection loop: connects/reconnects to the server with exponential backoff.
+///
+/// COVERAGE: CLI client session loop is tested via integration/e2e tests.
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn client_session_loop(
+    addr: SocketAddr,
+    cert_der: &rustls::pki_types::CertificateDer<'static>,
+) -> anyhow::Result<()> {
+    let mut session_id: Option<[u8; 16]> = None;
+    let mut backoff = Duration::from_millis(100);
+    let client = QuicClient::new()?;
 
-    // Shared SSP receiver state for both datagram and stream frames
-    let receiver = Arc::new(Mutex::new(SspReceiver::new(rows)));
-    let prev_state = Arc::new(Mutex::new(ScreenState::empty(rows)));
-
-    // Task: receive SSP frames via datagrams → apply diff → render
-    let output_conn = session.connection().clone();
-    let recv_dgram = Arc::clone(&receiver);
-    let prev_dgram = Arc::clone(&prev_state);
-    let output_task = tokio::spawn(async move {
-        while let Ok(data) = output_conn.read_datagram().await {
-            let Ok(frame) = SspFrame::decode(&data) else {
-                continue;
-            };
-            process_ssp_frame(&frame, &recv_dgram, &prev_dgram, &output_conn);
-        }
-    });
-
-    // Task: receive oversized SSP frames via uni streams
-    let stream_conn = session.connection().clone();
-    let recv_stream = Arc::clone(&receiver);
-    let prev_stream = Arc::clone(&prev_state);
-    let stream_task = tokio::spawn(async move {
-        while let Ok(mut uni) = stream_conn.accept_uni().await {
-            let mut len_buf = [0u8; 4];
-            if uni.read_exact(&mut len_buf).await.is_err() {
+    loop {
+        let conn = match client.connect(addr, "localhost", cert_der).await {
+            Ok(c) => {
+                backoff = Duration::from_millis(100);
+                c
+            }
+            Err(e) => {
+                let mut stdout = std::io::stdout();
+                let _ = stdout.write_all(
+                    format!(
+                        "\r\n[RoSE: connection failed ({e}), reconnecting in {backoff:?}...]\r\n"
+                    )
+                    .as_bytes(),
+                );
+                let _ = stdout.flush();
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(5));
                 continue;
             }
-            let len = u32::from_be_bytes(len_buf) as usize;
-            match uni.read_to_end(len).await {
-                Ok(data) => {
-                    if let Ok(frame) = SspFrame::decode(&data) {
-                        process_ssp_frame(&frame, &recv_stream, &prev_stream, &stream_conn);
-                    }
+        };
+
+        let (cols, rows) = terminal::size()?;
+        let mut session = if let Some(sid) = session_id {
+            match ClientSession::reconnect(conn, rows, cols, sid).await {
+                Ok(s) => s,
+                Err(e) => {
+                    let mut stdout = std::io::stdout();
+                    let _ = stdout.write_all(
+                        format!("\r\n[RoSE: reconnect handshake failed ({e}), retrying...]\r\n")
+                            .as_bytes(),
+                    );
+                    let _ = stdout.flush();
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(5));
+                    continue;
                 }
-                Err(_) => continue,
+            }
+        } else {
+            ClientSession::connect(conn, rows, cols).await?
+        };
+
+        // Read SessionInfo from server
+        match session.recv_control().await? {
+            Some(ControlMessage::SessionInfo { session_id: sid }) => {
+                session_id = Some(sid);
+            }
+            Some(other) => {
+                anyhow::bail!("expected SessionInfo, got {other:?}");
+            }
+            None => {
+                anyhow::bail!("server closed control stream before SessionInfo");
             }
         }
-    });
 
-    // Task: stdin → prefix with 0x00 → send input datagrams
-    let input_conn = session.connection().clone();
-    let input_task = tokio::spawn(async move {
-        loop {
-            let event = tokio::task::spawn_blocking(crossterm::event::read).await;
-            match event {
-                Ok(Ok(Event::Key(key))) => {
-                    let key_bytes = key_event_to_bytes(&key);
-                    if !key_bytes.is_empty() {
-                        let mut data = vec![DATAGRAM_KEYSTROKE];
-                        data.extend_from_slice(&key_bytes);
-                        if input_conn.send_datagram(Bytes::from(data)).is_err() {
-                            break;
+        {
+            let mut stdout = std::io::stdout();
+            let _ = stdout.write_all(
+                format!(
+                    "\r\n[RoSE: {}]\r\n",
+                    if session_id.is_some() && backoff > Duration::from_millis(100) {
+                        "reconnected"
+                    } else {
+                        "connected"
+                    }
+                )
+                .as_bytes(),
+            );
+            let _ = stdout.flush();
+        }
+
+        // Clear screen so SSP rendering starts clean
+        {
+            let mut stdout = std::io::stdout();
+            let _ = stdout.write_all(b"\x1b[2J\x1b[H");
+            let _ = stdout.flush();
+        }
+
+        // Fresh SSP state each connection (server resets SspSender on reconnect)
+        let receiver = Arc::new(Mutex::new(SspReceiver::new(rows)));
+        let prev_state = Arc::new(Mutex::new(ScreenState::empty(rows)));
+
+        // Task: receive SSP frames via datagrams → apply diff → render
+        let output_conn = session.connection().clone();
+        let recv_dgram = Arc::clone(&receiver);
+        let prev_dgram = Arc::clone(&prev_state);
+        let output_task = tokio::spawn(async move {
+            while let Ok(data) = output_conn.read_datagram().await {
+                let Ok(frame) = SspFrame::decode(&data) else {
+                    continue;
+                };
+                process_ssp_frame(&frame, &recv_dgram, &prev_dgram, &output_conn);
+            }
+        });
+
+        // Task: receive oversized SSP frames via uni streams
+        let stream_conn = session.connection().clone();
+        let recv_stream = Arc::clone(&receiver);
+        let prev_stream = Arc::clone(&prev_state);
+        let stream_task = tokio::spawn(async move {
+            while let Ok(mut uni) = stream_conn.accept_uni().await {
+                let mut len_buf = [0u8; 4];
+                if uni.read_exact(&mut len_buf).await.is_err() {
+                    continue;
+                }
+                let len = u32::from_be_bytes(len_buf) as usize;
+                match uni.read_to_end(len).await {
+                    Ok(data) => {
+                        if let Ok(frame) = SspFrame::decode(&data) {
+                            process_ssp_frame(&frame, &recv_stream, &prev_stream, &stream_conn);
                         }
                     }
-                }
-                Ok(Ok(Event::Resize(_, _))) => {
-                    // Resize handled separately below
-                }
-                Ok(Err(_)) | Err(_) => break,
-                _ => {}
-            }
-        }
-    });
-
-    // Task: resize events -> control messages
-    let resize_task = tokio::spawn(async move {
-        let mut last_size = (cols, rows);
-        loop {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            if let Ok(new_size) = terminal::size()
-                && new_size != last_size
-            {
-                last_size = new_size;
-                let msg = ControlMessage::Resize {
-                    rows: new_size.1,
-                    cols: new_size.0,
-                };
-                if session.send_control(&msg).await.is_err() {
-                    break;
+                    Err(_) => continue,
                 }
             }
-        }
-    });
+        });
 
-    tokio::select! {
-        _ = output_task => {}
-        _ = stream_task => {}
-        _ = input_task => {}
-        _ = resize_task => {}
+        // Task: stdin → prefix with 0x00 → send input datagrams
+        let input_conn = session.connection().clone();
+        let input_task = tokio::spawn(async move {
+            loop {
+                let event = tokio::task::spawn_blocking(crossterm::event::read).await;
+                match event {
+                    Ok(Ok(Event::Key(key))) => {
+                        let key_bytes = key_event_to_bytes(&key);
+                        if !key_bytes.is_empty() {
+                            let mut data = vec![DATAGRAM_KEYSTROKE];
+                            data.extend_from_slice(&key_bytes);
+                            if input_conn.send_datagram(Bytes::from(data)).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Ok(Ok(Event::Resize(_, _))) => {
+                        // Resize handled separately below
+                    }
+                    Ok(Err(_)) | Err(_) => break,
+                    _ => {}
+                }
+            }
+        });
+
+        // Task: resize events -> control messages
+        let resize_task = tokio::spawn(async move {
+            let mut last_size = (cols, rows);
+            loop {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                if let Ok(new_size) = terminal::size()
+                    && new_size != last_size
+                {
+                    last_size = new_size;
+                    let msg = ControlMessage::Resize {
+                        rows: new_size.1,
+                        cols: new_size.0,
+                    };
+                    if session.send_control(&msg).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        tokio::select! {
+            _ = output_task => {}
+            _ = stream_task => {}
+            _ = input_task => {}
+            _ = resize_task => {}
+        }
+
+        // Connection lost — show message and retry
+        let mut stdout = std::io::stdout();
+        let _ = stdout.write_all(b"\r\n[RoSE: connection lost, reconnecting...]\r\n");
+        let _ = stdout.flush();
     }
-
-    // Clear line and show disconnect message
-    let _ = stdout.write_all(b"\r\n[RoSE: connection closed]\r\n");
-    let _ = stdout.flush();
-
-    Ok(())
 }
 
 /// Processes an SSP frame: applies diff, renders to stdout, sends ACK.
