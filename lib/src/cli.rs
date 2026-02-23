@@ -363,12 +363,19 @@ async fn handle_server_session(conn: quinn::Connection, store: SessionStore) -> 
     let pty_writer = pty.clone_writer();
 
     // Task: PTY output → terminal → SSP diff → client datagram
+    //
+    // Sends eagerly: when PTY output arrives, we snapshot and send immediately
+    // (subject to a minimum frame interval to avoid flooding during bursts).
+    // A background interval ensures retransmission of unacked frames even
+    // when no new PTY output arrives.
     let session_conn = session.connection().clone();
     let terminal_out = Arc::clone(&terminal);
     let sender_out = Arc::clone(&ssp_sender);
     let output_task = tokio::spawn(async move {
         let mut dirty = false;
-        let mut interval = tokio::time::interval(Duration::from_millis(20));
+        let mut last_send = tokio::time::Instant::now();
+        let min_frame_interval = Duration::from_millis(5);
+        let mut retransmit = tokio::time::interval(Duration::from_millis(20));
         loop {
             tokio::select! {
                 result = pty_output.recv() => {
@@ -384,36 +391,47 @@ async fn handle_server_session(conn: quinn::Connection, store: SessionStore) -> 
                         }
                     }
                 }
-                _ = interval.tick() => {
-                    // Only take a new snapshot when PTY output arrived
-                    if dirty {
-                        dirty = false;
-                        let state = terminal_out.lock().expect("terminal lock poisoned").snapshot();
-                        sender_out.lock().expect("sender lock poisoned").push_state(state);
+                _ = retransmit.tick() => {}
+            }
+
+            // Send eagerly: snapshot and push state as soon as PTY output
+            // arrives, rate-limited to avoid flooding during bursts.
+            if dirty && last_send.elapsed() >= min_frame_interval {
+                dirty = false;
+                let state = terminal_out
+                    .lock()
+                    .expect("terminal lock poisoned")
+                    .snapshot();
+                sender_out
+                    .lock()
+                    .expect("sender lock poisoned")
+                    .push_state(state);
+                last_send = tokio::time::Instant::now();
+            }
+
+            // Always try to send — retransmits if client hasn't ack'd
+            // (QUIC datagrams are unreliable, so frames can be lost)
+            let sender = sender_out.lock().expect("sender lock poisoned");
+            if let Some(frame) = sender.generate_frame() {
+                let data = frame.encode();
+                let max_dgram = session_conn.max_datagram_size().unwrap_or(1200);
+                if data.len() <= max_dgram {
+                    if session_conn.send_datagram(Bytes::from(data)).is_err() {
+                        break;
                     }
-                    // Always try to send — retransmits if client hasn't ack'd
-                    // (QUIC datagrams are unreliable, so frames can be lost)
-                    let sender = sender_out.lock().expect("sender lock poisoned");
-                    if let Some(frame) = sender.generate_frame() {
-                        let data = frame.encode();
-                        let max_dgram = session_conn.max_datagram_size().unwrap_or(1200);
-                        if data.len() <= max_dgram {
-                            if session_conn.send_datagram(Bytes::from(data)).is_err() {
-                                break;
-                            }
-                        } else {
-                            // Oversized frame: send via reliable uni stream
-                            let stream_data = frame.encode_for_stream();
-                            let conn = session_conn.clone();
-                            tokio::spawn(async move {
-                                if let Ok(mut stream) = conn.open_uni().await {
-                                    let _ = stream.write_all(&[scrollback::stream_type::SSP_FRAME]).await;
-                                    let _ = stream.write_all(&stream_data).await;
-                                    let _ = stream.finish();
-                                }
-                            });
+                } else {
+                    // Oversized frame: send via reliable uni stream
+                    let stream_data = frame.encode_for_stream();
+                    let conn = session_conn.clone();
+                    tokio::spawn(async move {
+                        if let Ok(mut stream) = conn.open_uni().await {
+                            let _ = stream
+                                .write_all(&[scrollback::stream_type::SSP_FRAME])
+                                .await;
+                            let _ = stream.write_all(&stream_data).await;
+                            let _ = stream.finish();
                         }
-                    }
+                    });
                 }
             }
         }
