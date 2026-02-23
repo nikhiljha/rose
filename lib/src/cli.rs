@@ -1246,6 +1246,14 @@ async fn client_session_loop_inner(
         // so the reader thread survives across reconnections.
         let input_conn = session.connection().clone();
         let input_key_rx = Arc::clone(&key_rx);
+        /// What the input task decided.
+        #[derive(Clone, Copy)]
+        enum InputResult {
+            Disconnect,
+            Detach,
+            ConnectionLost,
+        }
+
         let input_task = tokio::spawn(async move {
             let mut escape = EscapeState::Normal;
 
@@ -1298,7 +1306,11 @@ async fn client_session_loop_inner(
                                 match key.code {
                                     crossterm::event::KeyCode::Char('.') => {
                                         // Enter ~ . → user-initiated disconnect
-                                        return true;
+                                        return InputResult::Disconnect;
+                                    }
+                                    crossterm::event::KeyCode::Char('d') => {
+                                        // Enter ~ d → detach (keep session alive)
+                                        return InputResult::Detach;
                                     }
                                     crossterm::event::KeyCode::Char('~') => {
                                         // Enter ~ ~ → send literal ~
@@ -1313,6 +1325,7 @@ async fn client_session_loop_inner(
                                         let _ = stdout.write_all(
                                             b"\r\nSupported escape sequences:\r\n\
                                               \x20 ~.  - disconnect\r\n\
+                                              \x20 ~d  - detach (session stays alive)\r\n\
                                               \x20 ~~  - send literal ~\r\n\
                                               \x20 ~?  - this help\r\n",
                                         );
@@ -1341,7 +1354,7 @@ async fn client_session_loop_inner(
                     _ => {}
                 }
             }
-            false // connection lost, not user-initiated
+            InputResult::ConnectionLost
         });
 
         // Clone connection for checking close reason after the main select
@@ -1383,6 +1396,7 @@ async fn client_session_loop_inner(
         enum SessionExit {
             ShellExited,
             UserDisconnect,
+            UserDetach,
             ConnectionLost,
         }
 
@@ -1390,10 +1404,10 @@ async fn client_session_loop_inner(
             _ = output_task => SessionExit::ConnectionLost,
             _ = stream_task => SessionExit::ConnectionLost,
             result = input_task => {
-                if result.unwrap_or(false) {
-                    SessionExit::UserDisconnect
-                } else {
-                    SessionExit::ConnectionLost
+                match result.ok().unwrap_or(InputResult::ConnectionLost) {
+                    InputResult::Disconnect => SessionExit::UserDisconnect,
+                    InputResult::Detach => SessionExit::UserDetach,
+                    InputResult::ConnectionLost => SessionExit::ConnectionLost,
                 }
             },
             result = control_task => {
@@ -1430,6 +1444,20 @@ async fn client_session_loop_inner(
             SessionExit::UserDisconnect => {
                 let mut stdout = std::io::stdout();
                 let _ = stdout.write_all(b"\r\n[RoSE: disconnected]\r\n");
+                let _ = stdout.flush();
+                break Ok(());
+            }
+            SessionExit::UserDetach => {
+                let mut stdout = std::io::stdout();
+                let _ = stdout.write_all(
+                    format!(
+                        "\r\n[RoSE: detached]\r\n\
+                         [RoSE: to reattach, run: rose connect {} --port {}]\r\n",
+                        addr.ip(),
+                        addr.port()
+                    )
+                    .as_bytes(),
+                );
                 let _ = stdout.flush();
                 break Ok(());
             }
