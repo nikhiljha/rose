@@ -9,6 +9,10 @@ cache:
 steps:
   - label: ":memo: Format"
     command: cargo fmt --all -- --check
+    if_changed:
+      - "**.rs"
+      - Cargo.toml
+      - Cargo.lock
     plugins:
       - docker#v5.11.0:
           image: "ghcr.io/nikhiljha/rose-ci:latest"
@@ -16,6 +20,10 @@ steps:
 
   - label: ":lint-roller: Clippy"
     command: cargo clippy --workspace --all-targets
+    if_changed:
+      - "**.rs"
+      - Cargo.toml
+      - Cargo.lock
     plugins:
       - docker#v5.11.0:
           image: "ghcr.io/nikhiljha/rose-ci:latest"
@@ -25,6 +33,10 @@ steps:
     commands:
       - cargo +nightly llvm-cov-easy nextest --workspace --branch
       - cargo test --workspace --doc
+    if_changed:
+      - "**.rs"
+      - Cargo.toml
+      - Cargo.lock
     plugins:
       - docker#v5.11.0:
           image: "ghcr.io/nikhiljha/rose-ci:latest"
@@ -32,6 +44,10 @@ steps:
 
   - label: ":shield: Security"
     command: cargo deny check
+    if_changed:
+      - Cargo.toml
+      - Cargo.lock
+      - deny.toml
     plugins:
       - docker#v5.11.0:
           image: "ghcr.io/nikhiljha/rose-ci:latest"
