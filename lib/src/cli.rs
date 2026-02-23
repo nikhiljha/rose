@@ -814,18 +814,93 @@ async fn client_session_loop(
         });
 
         // Task: stdin → prefix with 0x00 → send input datagrams
+        // Includes SSH-style escape sequence detection: Enter ~ .
         let input_conn = session.connection().clone();
         let input_task = tokio::spawn(async move {
+            let mut escape = EscapeState::Normal;
+
+            /// Sends raw bytes as a keystroke datagram. Returns false if
+            /// the connection is broken.
+            fn send_keys(conn: &quinn::Connection, bytes: &[u8]) -> bool {
+                let mut data = vec![DATAGRAM_KEYSTROKE];
+                data.extend_from_slice(bytes);
+                conn.send_datagram(Bytes::from(data)).is_ok()
+            }
+
             loop {
                 let event = tokio::task::spawn_blocking(crossterm::event::read).await;
                 match event {
                     Ok(Ok(Event::Key(key))) => {
                         let key_bytes = key_event_to_bytes(&key);
-                        if !key_bytes.is_empty() {
-                            let mut data = vec![DATAGRAM_KEYSTROKE];
-                            data.extend_from_slice(&key_bytes);
-                            if input_conn.send_datagram(Bytes::from(data)).is_err() {
-                                break;
+                        if key_bytes.is_empty() {
+                            continue;
+                        }
+
+                        match escape {
+                            EscapeState::Normal => {
+                                if key.code == crossterm::event::KeyCode::Enter {
+                                    escape = EscapeState::AfterEnter;
+                                    if !send_keys(&input_conn, &key_bytes) {
+                                        break;
+                                    }
+                                } else if !send_keys(&input_conn, &key_bytes) {
+                                    break;
+                                }
+                            }
+                            EscapeState::AfterEnter => {
+                                if key.code == crossterm::event::KeyCode::Char('~') {
+                                    // Buffer the tilde — don't send yet
+                                    escape = EscapeState::AfterTilde;
+                                } else if key.code == crossterm::event::KeyCode::Enter {
+                                    // Another Enter — stay in AfterEnter
+                                    if !send_keys(&input_conn, &key_bytes) {
+                                        break;
+                                    }
+                                } else {
+                                    // Not an escape — send key normally
+                                    escape = EscapeState::Normal;
+                                    if !send_keys(&input_conn, &key_bytes) {
+                                        break;
+                                    }
+                                }
+                            }
+                            EscapeState::AfterTilde => {
+                                match key.code {
+                                    crossterm::event::KeyCode::Char('.') => {
+                                        // Enter ~ . → user-initiated disconnect
+                                        return true;
+                                    }
+                                    crossterm::event::KeyCode::Char('~') => {
+                                        // Enter ~ ~ → send literal ~
+                                        escape = EscapeState::Normal;
+                                        if !send_keys(&input_conn, b"~") {
+                                            break;
+                                        }
+                                    }
+                                    crossterm::event::KeyCode::Char('?') => {
+                                        // Enter ~ ? → show escape help
+                                        let mut stdout = std::io::stdout();
+                                        let _ = stdout.write_all(
+                                            b"\r\nSupported escape sequences:\r\n\
+                                              \x20 ~.  - disconnect\r\n\
+                                              \x20 ~~  - send literal ~\r\n\
+                                              \x20 ~?  - this help\r\n",
+                                        );
+                                        let _ = stdout.flush();
+                                        escape = EscapeState::Normal;
+                                    }
+                                    _ => {
+                                        // Not a recognized escape — flush the
+                                        // buffered tilde and send current key
+                                        escape = EscapeState::Normal;
+                                        if !send_keys(&input_conn, b"~") {
+                                            break;
+                                        }
+                                        if !send_keys(&input_conn, &key_bytes) {
+                                            break;
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -836,6 +911,7 @@ async fn client_session_loop(
                     _ => {}
                 }
             }
+            false // connection lost, not user-initiated
         });
 
         // Task: resize events -> control messages
@@ -858,11 +934,18 @@ async fn client_session_loop(
             }
         });
 
-        tokio::select! {
-            _ = output_task => {}
-            _ = stream_task => {}
-            _ = input_task => {}
-            _ = resize_task => {}
+        let user_disconnect = tokio::select! {
+            _ = output_task => false,
+            _ = stream_task => false,
+            result = input_task => result.unwrap_or(false),
+            _ = resize_task => false,
+        };
+
+        if user_disconnect {
+            let mut stdout = std::io::stdout();
+            let _ = stdout.write_all(b"\r\n[RoSE: disconnected]\r\n");
+            let _ = stdout.flush();
+            break Ok(());
         }
 
         // Connection lost — show message and retry
@@ -1054,6 +1137,19 @@ impl Drop for RawModeGuard {
     fn drop(&mut self) {
         let _ = terminal::disable_raw_mode();
     }
+}
+
+/// SSH-style escape sequence state machine.
+///
+/// Detects `Enter ~ .` to disconnect, `Enter ~ ~` to send literal `~`,
+/// and `Enter ~ ?` for help.
+enum EscapeState {
+    /// No escape sequence in progress.
+    Normal,
+    /// Enter was just pressed — `~` would start an escape.
+    AfterEnter,
+    /// Enter + `~` were pressed — waiting for `.`, `~`, or `?`.
+    AfterTilde,
 }
 
 /// Converts a crossterm key event to bytes to send to the PTY.

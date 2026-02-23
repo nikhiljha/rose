@@ -118,6 +118,115 @@ fn terminal_snapshot() {
 }
 
 // ---------------------------------------------------------------------------
+// SSP rendering E2E: server terminal → SSP → render_diff_ansi → client
+// wezterm terminal. After scrolling, the client terminal must have
+// scrollback lines (meaning render_diff_ansi caused real terminal scrolling,
+// not just absolute cursor repositioning).
+// ---------------------------------------------------------------------------
+
+/// End-to-end SSP rendering test with a real wezterm terminal on the client
+/// side. Verifies that:
+/// 1. Visible content matches between server and client after scrolling
+/// 2. The client terminal has scrollback lines (render caused real scrolling)
+///
+/// Currently fails on (2): `render_diff_ansi` uses absolute cursor positioning
+/// which never causes the client terminal to scroll, so scrollback is empty.
+#[test]
+fn ssp_render_scrollback_in_client_terminal() {
+    use rose::ssp::{render_diff_ansi, ScreenState, SspReceiver, SspSender};
+    use rose::terminal::RoseTerminal;
+
+    let rows: u16 = 5;
+    let cols: u16 = 40;
+
+    // Server side
+    let mut server_term = RoseTerminal::new(rows, cols);
+    let mut sender = SspSender::new();
+
+    // Client side: SSP receiver + a real wezterm terminal that receives
+    // the ANSI output from render_diff_ansi (simulating the user's terminal)
+    let mut receiver = SspReceiver::new(rows);
+    let mut client_term = RoseTerminal::new(rows, cols);
+    let mut prev_state = ScreenState::empty(rows);
+
+    // Clear client terminal (same as client_session_loop does)
+    client_term.advance(b"\x1b[2J\x1b[H");
+
+    // Helper: run one SSP cycle
+    let ssp_cycle = |server_term: &RoseTerminal,
+                     sender: &mut SspSender,
+                     receiver: &mut SspReceiver,
+                     client_term: &mut RoseTerminal,
+                     prev_state: &mut ScreenState| {
+        let snap = server_term.snapshot();
+        sender.push_state(snap);
+        let frame = sender.generate_frame().expect("should have a frame");
+        receiver.process_frame(&frame).expect("frame should apply");
+        let new_state = receiver.state().clone();
+        let ansi = render_diff_ansi(prev_state, &new_state);
+        client_term.advance(&ansi);
+        *prev_state = new_state;
+        sender.process_ack(receiver.ack_num());
+    };
+
+    // Fill the screen (5 lines in 5-row terminal)
+    server_term.advance(b"line 1\r\nline 2\r\nline 3\r\nline 4\r\nline 5");
+    ssp_cycle(
+        &server_term,
+        &mut sender,
+        &mut receiver,
+        &mut client_term,
+        &mut prev_state,
+    );
+
+    // No scrollback yet — screen isn't full enough to scroll
+    assert!(
+        client_term.scrollback_lines().is_empty(),
+        "no scrollback before scroll"
+    );
+
+    // Write 10 more lines — forces server terminal to scroll repeatedly
+    for i in 6..=15 {
+        server_term.advance(format!("\r\nline {i}").as_bytes());
+        ssp_cycle(
+            &server_term,
+            &mut sender,
+            &mut receiver,
+            &mut client_term,
+            &mut prev_state,
+        );
+    }
+
+    // Server terminal has scrolled — verify it has scrollback
+    let server_scrollback = server_term.scrollback_lines();
+    assert!(
+        !server_scrollback.is_empty(),
+        "server should have scrollback after writing 15 lines to 5-row terminal"
+    );
+
+    // Client terminal visible content should match server
+    let server_text = server_term.screen_text();
+    let client_text = client_term.screen_text();
+    let server_lines: Vec<&str> = server_text.lines().map(str::trim_end).collect();
+    let client_lines: Vec<&str> = client_text.lines().map(str::trim_end).collect();
+    assert_eq!(
+        server_lines, client_lines,
+        "client visible content should match server"
+    );
+
+    // KEY ASSERTION: client terminal must also have scrollback.
+    // If render_diff_ansi used absolute positioning only, the client
+    // terminal never actually scrolled, so scrollback will be empty.
+    let client_scrollback = client_term.scrollback_lines();
+    assert!(
+        !client_scrollback.is_empty(),
+        "client terminal should have scrollback lines after server scrolled, \
+         but got none — render_diff_ansi is using absolute positioning instead \
+         of real scroll operations"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Resize + line wrapping: snapshot test with insta
 // ---------------------------------------------------------------------------
 
