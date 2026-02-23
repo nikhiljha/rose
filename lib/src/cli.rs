@@ -405,6 +405,12 @@ async fn handle_server_session(conn: quinn::Connection, store: SessionStore) -> 
         let mut last_send = tokio::time::Instant::now();
         let min_frame_interval = Duration::from_millis(5);
         let mut retransmit = tokio::time::interval(Duration::from_millis(20));
+        // Pin the notified future outside the loop so it persists across
+        // iterations. notify_waiters() doesn't store a permit, so a fresh
+        // notified() inside select! would miss notifications that fire
+        // during the snapshot/send work below.
+        let pty_closed_notified = pty_closed.notified();
+        tokio::pin!(pty_closed_notified);
         loop {
             tokio::select! {
                 result = pty_output.recv() => {
@@ -421,7 +427,7 @@ async fn handle_server_session(conn: quinn::Connection, store: SessionStore) -> 
                     }
                 }
                 _ = retransmit.tick() => {}
-                () = pty_closed.notified() => break,
+                () = &mut pty_closed_notified => break,
             }
 
             // Send eagerly: snapshot and push state as soon as PTY output
@@ -441,18 +447,20 @@ async fn handle_server_session(conn: quinn::Connection, store: SessionStore) -> 
                 let frame = sender.generate_frame();
                 drop(sender);
                 if let Some(ref f) = frame
-                    && !send_ssp_frame(f, &session_conn) {
-                        break;
-                    }
+                    && !send_ssp_frame(f, &session_conn)
+                {
+                    break;
+                }
             } else {
                 // Retransmit unacked frames even without new PTY output
                 let sender = sender_out.lock().expect("sender lock poisoned");
                 let frame = sender.generate_frame();
                 drop(sender);
                 if let Some(ref f) = frame
-                    && !send_ssp_frame(f, &session_conn) {
-                        break;
-                    }
+                    && !send_ssp_frame(f, &session_conn)
+                {
+                    break;
+                }
             }
         }
     });
