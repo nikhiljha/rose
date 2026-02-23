@@ -1110,71 +1110,107 @@ async fn ssh_bootstrap_mode() {
         })
         .expect("could not find rose binary in cargo build output");
 
-    // Spawn the actual `rose connect --ssh` binary. This exercises the
-    // real code path: bootstrap handshake, DETACH over SSH, QUIC connect,
-    // and session loop. The session will end quickly because there's no
-    // real terminal input.
-    let mut rose_client = tokio::process::Command::new(&rose_bin)
-        .arg("connect")
-        .arg("--ssh")
-        .arg("--ssh-port")
-        .arg(ssh_port.to_string())
-        .arg("--ssh-option")
-        .arg("StrictHostKeyChecking=no")
-        .arg("--ssh-option")
-        .arg("UserKnownHostsFile=/dev/null")
-        .arg("--ssh-option")
-        .arg("PreferredAuthentications=none")
-        .arg("127.0.0.1")
-        .arg("--server-binary")
-        .arg(&rose_bin)
-        .env("RUST_LOG", "debug")
-        .stderr(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stdin(std::process::Stdio::null())
-        .spawn()
-        .expect("failed to spawn rose connect");
+    // Spawn the rose client in a real PTY so terminal::enable_raw_mode()
+    // works. This exercises the full code path including raw mode, the
+    // keystroke reader thread, and SSP rendering.
+    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
-    // Wait for the rose client to finish (it will exit because stdin is
-    // /dev/null — the session loop detects "connection lost" or the shell
-    // exits). We mainly care that it doesn't hang or crash.
-    let result = tokio::time::timeout(std::time::Duration::from_secs(15), rose_client.wait()).await;
+    let pty_system = native_pty_system();
+    let pty_pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open PTY");
+
+    let mut cmd = CommandBuilder::new(&rose_bin);
+    cmd.args([
+        "connect",
+        "--ssh",
+        "--ssh-port",
+        &ssh_port.to_string(),
+        "--ssh-option",
+        "StrictHostKeyChecking=no",
+        "--ssh-option",
+        "UserKnownHostsFile=/dev/null",
+        "--ssh-option",
+        "PreferredAuthentications=none",
+        "127.0.0.1",
+        "--server-binary",
+        &rose_bin,
+    ]);
+
+    let mut child = pty_pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rose connect in PTY");
+
+    // Get a writer to send keystrokes and a reader for output
+    let mut pty_writer = pty_pair.master.take_writer().unwrap();
+    let mut pty_reader = pty_pair.master.try_clone_reader().unwrap();
+    // Drop the slave so the PTY master sees EOF when the child exits
+    drop(pty_pair.slave);
+
+    // Read PTY output in a background thread (blocking I/O)
+    let output = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let output_clone = output.clone();
+    let reader_handle = std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match std::io::Read::read(&mut pty_reader, &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let text = String::from_utf8_lossy(&buf[..n]);
+                    output_clone.lock().unwrap().push_str(&text);
+                }
+            }
+        }
+    });
+
+    // Wait for the session to establish (bootstrap + QUIC connect)
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    // Send Ctrl-D to exit the shell
+    std::io::Write::write_all(&mut pty_writer, &[4]).unwrap();
+    std::io::Write::flush(&mut pty_writer).unwrap();
+
+    // Wait for the child to exit
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Ok(Some(status)) = child.try_wait() {
+                return status;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+
+    // Drop writer so the reader thread can exit
+    drop(pty_writer);
+    let _ = reader_handle.join();
+    let captured = output.lock().unwrap().clone();
 
     match result {
-        Ok(Ok(status)) => {
-            // Read stderr to check for the bootstrap message
-            let stderr = rose_client.stderr.take().unwrap();
-            let mut stderr_reader = tokio::io::BufReader::new(stderr);
-            let mut stderr_output = String::new();
-            let _ = tokio::time::timeout(std::time::Duration::from_millis(100), async {
-                loop {
-                    let mut line = String::new();
-                    match stderr_reader.read_line(&mut line).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) => stderr_output.push_str(&line),
-                    }
-                }
-            })
-            .await;
-
-            // The client should have connected successfully and then exited
-            // (shell exits quickly because stdin is /dev/null).
-            // Check for "[RoSE: shell exited]" which means the full flow worked:
-            // bootstrap → detach → QUIC connect → session → shell exit.
+        Ok(status) => {
             assert!(
-                stderr_output.contains("Bootstrap: server on port"),
-                "bootstrap failed. stderr:\n{stderr_output}"
+                status.exit_code() == 0,
+                "rose client exited with {status:?}. output:\n{captured}"
             );
             assert!(
-                !stderr_output.contains("connection error")
-                    && !stderr_output.contains("connection failed"),
-                "QUIC connection failed after bootstrap. stderr:\n{stderr_output}"
+                captured.contains("Bootstrap: server on port"),
+                "bootstrap failed. output:\n{captured}"
+            );
+            // Should see shell exited or at least no connection errors
+            assert!(
+                !captured.contains("connection error") && !captured.contains("connection failed"),
+                "QUIC connection failed. output:\n{captured}"
             );
         }
-        Ok(Err(e)) => panic!("rose client failed: {e}"),
         Err(_) => {
-            let _ = rose_client.kill().await;
-            panic!("rose client timed out — likely hung during bootstrap");
+            child.kill().unwrap();
+            panic!("rose client timed out — likely hung. output:\n{captured}");
         }
     }
 }
