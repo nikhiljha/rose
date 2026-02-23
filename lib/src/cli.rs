@@ -759,6 +759,8 @@ async fn handle_server_session(conn: quinn::Connection, store: SessionStore) -> 
         },
     };
 
+    eprintln!("[RoSE server: select finished, shell_exited={shell_exited}]");
+
     if shell_exited {
         close_conn.close(0u32.into(), b"shell exited");
     } else {
@@ -767,11 +769,15 @@ async fn handle_server_session(conn: quinn::Connection, store: SessionStore) -> 
         // quickly since the connection is dead).
         let pty = match pty_from_control {
             Some(pty) => Some(pty),
-            None => tokio::time::timeout(Duration::from_secs(2), control_task)
-                .await
-                .ok()
-                .and_then(Result::ok),
+            None => {
+                eprintln!("[RoSE server: waiting for control_task to finish...]");
+                tokio::time::timeout(Duration::from_secs(2), control_task)
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+            }
         };
+        eprintln!("[RoSE server: pty for detach: {}]", pty.is_some());
         if let Some(pty) = pty {
             let _ = store.insert(
                 session_id,
@@ -783,7 +789,7 @@ async fn handle_server_session(conn: quinn::Connection, store: SessionStore) -> 
                     cols,
                 },
             );
-            tracing::info!("session detached, awaiting reconnection");
+            eprintln!("[RoSE server: session detached to store]");
         }
     }
 
