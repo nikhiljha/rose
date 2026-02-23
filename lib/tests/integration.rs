@@ -129,11 +129,11 @@ fn terminal_snapshot() {
 /// 1. Visible content matches between server and client after scrolling
 /// 2. The client terminal has scrollback lines (render caused real scrolling)
 ///
-/// Currently fails on (2): `render_diff_ansi` uses absolute cursor positioning
-/// which never causes the client terminal to scroll, so scrollback is empty.
+/// Regression test: previously `render_diff_ansi` used absolute cursor
+/// positioning which never caused the client terminal to scroll.
 #[test]
 fn ssp_render_scrollback_in_client_terminal() {
-    use rose::ssp::{render_diff_ansi, ScreenState, SspReceiver, SspSender};
+    use rose::ssp::{ScreenState, SspReceiver, SspSender, render_diff_ansi};
     use rose::terminal::RoseTerminal;
 
     let rows: u16 = 5;
