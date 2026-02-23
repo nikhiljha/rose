@@ -102,11 +102,17 @@ fn terminal_snapshot() {
 
     let snap = term.snapshot();
     assert_eq!(snap.rows.len(), 24);
+    // snapshot() now returns ANSI-encoded rows; plain text with default attrs
+    // produces identical output to the old trim_end() behavior.
     assert_eq!(snap.rows[0], "hello world");
     assert_eq!(snap.rows[1], "line two");
     assert_eq!(snap.rows[2], ""); // empty row
     assert_eq!(snap.cursor_x, 8); // "line two" is 8 chars
     assert_eq!(snap.cursor_y, 1);
+
+    // Verify via line_text() for plain-text content checks
+    assert_eq!(term.line_text(0).trim_end(), "hello world");
+    assert_eq!(term.line_text(1).trim_end(), "line two");
 }
 
 // ---------------------------------------------------------------------------
@@ -157,6 +163,50 @@ fn ssp_sender_receiver_roundtrip() {
     // After ack, no new frame needed
     sender.process_ack(receiver.ack_num());
     assert!(sender.generate_frame().is_none());
+}
+
+// ---------------------------------------------------------------------------
+// SSP sender → receiver roundtrip with colored text
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ssp_colored_text_roundtrip() {
+    use rose::ssp::{ScreenState, SspReceiver, SspSender, render_diff_ansi};
+    use rose::terminal::RoseTerminal;
+
+    let mut term = RoseTerminal::new(24, 80);
+    term.advance(b"\x1b[31mred\x1b[0m \x1b[1;32mbold green\x1b[0m");
+
+    let snap = term.snapshot();
+    // Snapshot should contain SGR codes
+    assert!(
+        snap.rows[0].contains("\x1b["),
+        "snapshot should contain ANSI SGR"
+    );
+
+    // SSP roundtrip
+    let mut sender = SspSender::new();
+    sender.push_state(snap.clone());
+    let frame = sender.generate_frame().unwrap();
+
+    let mut receiver = SspReceiver::new(24);
+    receiver.process_frame(&frame).unwrap();
+
+    // Receiver should have the ANSI-encoded row
+    assert_eq!(receiver.state().rows[0], snap.rows[0]);
+
+    // render_diff_ansi should pass through the SGR codes
+    let empty = ScreenState::empty(24);
+    let ansi_output = render_diff_ansi(&empty, receiver.state());
+    let output_str = String::from_utf8(ansi_output).unwrap();
+    assert!(
+        output_str.contains("31m"),
+        "render output should preserve red SGR: {output_str:?}"
+    );
+    assert!(
+        output_str.contains("red"),
+        "render output should contain 'red'"
+    );
 }
 
 // ---------------------------------------------------------------------------

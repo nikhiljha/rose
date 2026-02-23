@@ -21,7 +21,7 @@ pub enum SspError {
 /// Snapshot of visible terminal screen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScreenState {
-    /// Text per visible row, trailing whitespace trimmed.
+    /// Content per visible row, may include ANSI SGR escape sequences.
     pub rows: Vec<String>,
     /// Cursor column.
     pub cursor_x: u16,
@@ -512,11 +512,10 @@ pub fn render_diff_ansi(old: &ScreenState, new: &ScreenState) -> Vec<u8> {
         let new_row = new.rows.get(i).map_or("", String::as_str);
 
         if old_row != new_row {
-            // Move cursor to (row, col 0), 1-indexed: CSI row;1 H
-            buf.extend_from_slice(format!("\x1b[{};1H", i + 1).as_bytes());
-            // Clear entire line: CSI 2 K
-            buf.extend_from_slice(b"\x1b[2K");
-            // Write new text
+            // Move cursor to (row, col 0), reset SGR so clear uses default
+            // background, clear entire line, then write new content (which
+            // may contain its own SGR sequences).
+            buf.extend_from_slice(format!("\x1b[{};1H\x1b[0m\x1b[2K", i + 1).as_bytes());
             buf.extend_from_slice(new_row.as_bytes());
         }
     }

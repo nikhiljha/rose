@@ -6,7 +6,10 @@
 
 use std::sync::Arc;
 
-use wezterm_term::{Terminal, TerminalConfiguration, TerminalSize};
+use wezterm_term::color::ColorAttribute;
+use wezterm_term::{
+    Blink, CellAttributes, Intensity, Terminal, TerminalConfiguration, TerminalSize, Underline,
+};
 
 use crate::ssp::ScreenState;
 
@@ -29,6 +32,82 @@ impl std::io::Write for DummyWriter {
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+/// Converts [`CellAttributes`] to an ANSI SGR escape sequence.
+///
+/// Returns an empty string for default attributes.
+fn attrs_to_sgr(attrs: &CellAttributes) -> String {
+    let mut codes: Vec<String> = Vec::new();
+
+    match attrs.intensity() {
+        Intensity::Bold => codes.push("1".into()),
+        Intensity::Half => codes.push("2".into()),
+        Intensity::Normal => {}
+    }
+    if attrs.italic() {
+        codes.push("3".into());
+    }
+    match attrs.underline() {
+        Underline::Single => codes.push("4".into()),
+        Underline::Double => codes.push("21".into()),
+        Underline::Curly => codes.push("4:3".into()),
+        Underline::Dotted => codes.push("4:4".into()),
+        Underline::Dashed => codes.push("4:5".into()),
+        Underline::None => {}
+    }
+    match attrs.blink() {
+        Blink::Slow => codes.push("5".into()),
+        Blink::Rapid => codes.push("6".into()),
+        Blink::None => {}
+    }
+    if attrs.reverse() {
+        codes.push("7".into());
+    }
+    if attrs.invisible() {
+        codes.push("8".into());
+    }
+    if attrs.strikethrough() {
+        codes.push("9".into());
+    }
+    if attrs.overline() {
+        codes.push("53".into());
+    }
+    push_color_sgr(attrs.foreground(), true, &mut codes);
+    push_color_sgr(attrs.background(), false, &mut codes);
+
+    if codes.is_empty() {
+        String::new()
+    } else {
+        format!("\x1b[{}m", codes.join(";"))
+    }
+}
+
+/// Appends SGR codes for a [`ColorAttribute`] to the code list.
+fn push_color_sgr(color: ColorAttribute, is_fg: bool, codes: &mut Vec<String>) {
+    match color {
+        ColorAttribute::Default => {}
+        ColorAttribute::PaletteIndex(idx) => {
+            let base_standard: u16 = if is_fg { 30 } else { 40 };
+            let base_bright: u16 = if is_fg { 90 } else { 100 };
+            let base_extended: u8 = if is_fg { 38 } else { 48 };
+            if idx < 8 {
+                codes.push(format!("{}", base_standard + u16::from(idx)));
+            } else if idx < 16 {
+                codes.push(format!("{}", base_bright + u16::from(idx - 8)));
+            } else {
+                codes.push(format!("{base_extended};5;{idx}"));
+            }
+        }
+        ColorAttribute::TrueColorWithPaletteFallback(rgba, _)
+        | ColorAttribute::TrueColorWithDefaultFallback(rgba) => {
+            let base: u8 = if is_fg { 38 } else { 48 };
+            let r = (rgba.0 * 255.0).round() as u8;
+            let g = (rgba.1 * 255.0).round() as u8;
+            let b = (rgba.2 * 255.0).round() as u8;
+            codes.push(format!("{base};2;{r};{g};{b}"));
+        }
     }
 }
 
@@ -75,8 +154,8 @@ impl RoseTerminal {
     #[must_use]
     pub fn line_text(&self, row: usize) -> String {
         let screen = self.inner.screen();
-        let stable_row = screen.visible_row_to_stable_row(row as i64);
-        let phys_lines = screen.lines_in_phys_range(stable_row as usize..stable_row as usize + 1);
+        let phys = screen.phys_row(row as i64);
+        let phys_lines = screen.lines_in_phys_range(phys..phys + 1);
         phys_lines
             .first()
             .map_or_else(String::new, |line| line.as_str().to_string())
@@ -131,15 +210,82 @@ impl RoseTerminal {
             .collect()
     }
 
+    /// Returns a single visible row with ANSI SGR escape sequences preserving
+    /// colors and text attributes. Trailing default-attributed whitespace is
+    /// trimmed. A final `\x1b[0m` reset is appended when attributes are active
+    /// at end-of-line.
+    #[must_use]
+    pub fn line_ansi(&self, row: usize) -> String {
+        let screen = self.inner.screen();
+        let phys = screen.phys_row(row as i64);
+        let phys_lines = screen.lines_in_phys_range(phys..phys + 1);
+        let Some(line) = phys_lines.first() else {
+            return String::new();
+        };
+
+        let default_attrs = CellAttributes::default();
+
+        // Collect runs of (attrs, text)
+        let mut runs: Vec<(CellAttributes, String)> = Vec::new();
+        for cell in line.visible_cells() {
+            let cell_attrs = cell.attrs().clone();
+            if let Some(last) = runs.last_mut()
+                && last.0 == cell_attrs
+            {
+                last.1.push_str(cell.str());
+                continue;
+            }
+            runs.push((cell_attrs, cell.str().to_string()));
+        }
+
+        // Trim trailing spaces from the last default-attr run
+        if let Some(last) = runs.last_mut()
+            && last.0 == default_attrs
+        {
+            let trimmed = last.1.trim_end().to_string();
+            if trimmed.is_empty() {
+                runs.pop();
+            } else {
+                last.1 = trimmed;
+            }
+        }
+
+        if runs.is_empty() {
+            return String::new();
+        }
+
+        // Build ANSI string
+        let mut result = String::new();
+        let mut current_attrs = default_attrs.clone();
+
+        for (attrs, text) in &runs {
+            if *attrs != current_attrs {
+                if current_attrs != default_attrs {
+                    result.push_str("\x1b[0m");
+                }
+                result.push_str(&attrs_to_sgr(attrs));
+                current_attrs = attrs.clone();
+            }
+            result.push_str(text);
+        }
+
+        // Reset at end if non-default attributes were active
+        if current_attrs != default_attrs {
+            result.push_str("\x1b[0m");
+        }
+
+        result
+    }
+
     /// Captures the current visible screen state as a [`ScreenState`].
     ///
-    /// Each row has trailing whitespace trimmed.
+    /// Each row includes ANSI SGR escape sequences for colors and attributes.
     #[must_use]
     pub fn snapshot(&self) -> ScreenState {
         let size = self.inner.get_size();
         let mut rows = Vec::with_capacity(size.rows);
         for row in 0..size.rows {
-            rows.push(self.line_text(row).trim_end().to_string());
+            rows.push(self.line_ansi(row));
         }
         let (cx, cy) = self.cursor_pos();
         ScreenState {
@@ -687,5 +833,220 @@ mod tests {
         assert!(text.contains("256 color"), "BCE 256 color text missing");
         assert!(text.contains("16 color"), "BCE 16 color text missing");
         assert!(text.contains("done"), "BCE done text missing");
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression test: scrolling should not break snapshot()
+    //
+    // When terminal output fills the visible area and starts scrolling,
+    // snapshot() must still return correct visible content. Previously,
+    // line_text() used visible_row_to_stable_row() then cast to usize,
+    // which produced wrong indices once scrollback existed.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn scroll_produces_valid_snapshot() {
+        let mut term = RoseTerminal::new(5, 40);
+        // Write 10 lines into a 5-row terminal, forcing scrollback
+        for i in 0..10 {
+            term.advance(format!("line {i}\r\n").as_bytes());
+        }
+
+        let snap = term.snapshot();
+        // The last 5 lines written should be visible. Line 9 is followed
+        // by CR+LF, so the cursor sits on a new blank line. Depending on
+        // exact scrollback handling, we expect lines 6..9 plus a blank.
+        assert!(
+            snap.rows.iter().any(|r| !r.is_empty()),
+            "snapshot should have non-empty rows after scroll, got: {snap:?}"
+        );
+        // At least one visible row should contain "line "
+        assert!(
+            snap.rows.iter().any(|r| r.contains("line ")),
+            "snapshot should contain recent output after scroll, got: {snap:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ANSI color/attribute tests for line_ansi()
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ansi_preserves_colors() {
+        let mut term = RoseTerminal::new(24, 80);
+        term.advance(b"\x1b[31mred text\x1b[0m plain");
+
+        let ansi = term.line_ansi(0);
+        let plain = term.line_text(0);
+
+        // Plain text should have no escape sequences
+        assert!(
+            !plain.contains("\x1b["),
+            "line_text should be plain: {plain:?}"
+        );
+        // ANSI text should contain SGR codes for red foreground
+        assert!(
+            ansi.contains("\x1b["),
+            "line_ansi should contain SGR codes: {ansi:?}"
+        );
+        assert!(
+            ansi.contains("31m"),
+            "line_ansi should contain red foreground code: {ansi:?}"
+        );
+        // Both should contain the actual text
+        assert!(plain.contains("red text"), "plain missing 'red text'");
+        assert!(ansi.contains("red text"), "ansi missing 'red text'");
+        assert!(plain.contains("plain"), "plain missing 'plain'");
+        assert!(ansi.contains("plain"), "ansi missing 'plain'");
+    }
+
+    #[test]
+    fn ansi_bold_and_256color() {
+        let mut term = RoseTerminal::new(24, 80);
+        // Bold + 256-color foreground (color 200)
+        term.advance(b"\x1b[1;38;5;200mstyledtext\x1b[0m");
+
+        let ansi = term.line_ansi(0);
+        assert!(
+            ansi.contains('1') && ansi.contains("38;5;200"),
+            "should contain bold and 256-color SGR: {ansi:?}"
+        );
+        assert!(ansi.contains("styledtext"));
+    }
+
+    #[test]
+    fn ansi_truecolor() {
+        let mut term = RoseTerminal::new(24, 80);
+        term.advance(b"\x1b[38;2;100;200;50mrgbtext\x1b[0m");
+
+        let ansi = term.line_ansi(0);
+        assert!(
+            ansi.contains("38;2;"),
+            "should contain true-color SGR: {ansi:?}"
+        );
+        assert!(ansi.contains("rgbtext"));
+    }
+
+    #[test]
+    fn ansi_resets_at_end() {
+        let mut term = RoseTerminal::new(24, 80);
+        // Text with active attributes at end of meaningful content
+        term.advance(b"\x1b[1mboldtext");
+
+        let ansi = term.line_ansi(0);
+        assert!(
+            ansi.ends_with("\x1b[0m"),
+            "line_ansi should reset at end when attrs active: {ansi:?}"
+        );
+    }
+
+    #[test]
+    fn ansi_empty_line_is_empty() {
+        let term = RoseTerminal::new(24, 80);
+        let ansi = term.line_ansi(5);
+        assert_eq!(ansi, "", "empty line should produce empty string");
+    }
+
+    #[test]
+    fn snapshot_with_colors_roundtrip() {
+        let mut term = RoseTerminal::new(24, 80);
+        term.advance(b"\x1b[32mgreen\x1b[0m");
+        let snap = term.snapshot();
+        assert!(
+            snap.rows[0].contains("\x1b["),
+            "snapshot rows should contain ANSI: {:?}",
+            snap.rows[0]
+        );
+        assert!(
+            snap.rows[0].contains("green"),
+            "snapshot rows should contain text"
+        );
+    }
+
+    #[test]
+    fn ansi_all_text_attributes() {
+        let mut term = RoseTerminal::new(24, 80);
+        // Exercise every SGR text attribute branch in attrs_to_sgr
+        // dim(2), italic(3), single-underline(4), slow-blink(5), reverse(7),
+        // invisible(8), strikethrough(9), overline(53)
+        let attrs = [
+            ("2", "dim"),
+            ("3", "ita"),
+            ("4", "und"),
+            ("21", "dbl"), // double underline
+            ("5", "slb"),  // slow blink
+            ("6", "rpb"),  // rapid blink
+            ("7", "rev"),
+            ("8", "inv"),
+            ("9", "stk"),
+            ("53", "ovl"),
+        ];
+        for (code, label) in attrs {
+            term.advance(format!("\x1b[{code}m{label}\x1b[0m ").as_bytes());
+        }
+        let ansi = term.line_ansi(0);
+        for (code, label) in attrs {
+            assert!(
+                ansi.contains(label),
+                "missing text '{label}' in ANSI output"
+            );
+            assert!(
+                ansi.contains(&format!("{code}m")),
+                "missing SGR code {code}m in: {ansi:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ansi_underline_variants() {
+        let mut term = RoseTerminal::new(24, 80);
+        // Curly(4:3), Dotted(4:4), Dashed(4:5) underline styles
+        term.advance(b"\x1b[4:3mcurly\x1b[0m \x1b[4:4mdotted\x1b[0m \x1b[4:5mdashed\x1b[0m");
+        let ansi = term.line_ansi(0);
+        assert!(ansi.contains("curly"), "missing curly text");
+        assert!(ansi.contains("dotted"), "missing dotted text");
+        assert!(ansi.contains("dashed"), "missing dashed text");
+    }
+
+    #[test]
+    fn ansi_bright_palette_colors() {
+        let mut term = RoseTerminal::new(24, 80);
+        // Bright foreground (90-97) and bright background (100-107)
+        term.advance(b"\x1b[91mbrfg\x1b[0m \x1b[101mbrbg\x1b[0m");
+        let ansi = term.line_ansi(0);
+        assert!(ansi.contains("brfg"), "missing bright fg text");
+        assert!(ansi.contains("brbg"), "missing bright bg text");
+        // Bright red fg → palette index 9 → SGR 91
+        assert!(
+            ansi.contains("91"),
+            "missing bright fg SGR code in: {ansi:?}"
+        );
+        // Bright red bg → palette index 9 → SGR 101
+        assert!(
+            ansi.contains("101"),
+            "missing bright bg SGR code in: {ansi:?}"
+        );
+    }
+
+    #[test]
+    fn ansi_background_colors() {
+        let mut term = RoseTerminal::new(24, 80);
+        // Standard bg (40-47), 256-color bg, true-color bg
+        term.advance(b"\x1b[42mstdbg\x1b[0m ");
+        term.advance(b"\x1b[48;5;200m256bg\x1b[0m ");
+        term.advance(b"\x1b[48;2;10;20;30mtcbg\x1b[0m");
+        let ansi = term.line_ansi(0);
+        assert!(ansi.contains("stdbg"), "missing standard bg text");
+        assert!(ansi.contains("256bg"), "missing 256 bg text");
+        assert!(ansi.contains("tcbg"), "missing truecolor bg text");
+        // Standard green bg → palette 2 → SGR 42
+        assert!(ansi.contains("42"), "missing standard bg SGR in: {ansi:?}");
+        // 256-color bg → 48;5;200
+        assert!(ansi.contains("48;5;200"), "missing 256 bg SGR in: {ansi:?}");
+        // True-color bg → 48;2;...
+        assert!(
+            ansi.contains("48;2;"),
+            "missing truecolor bg SGR in: {ansi:?}"
+        );
     }
 }
