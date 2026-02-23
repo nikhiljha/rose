@@ -57,13 +57,10 @@ enum Commands {
         #[arg(long, default_value = "0.0.0.0:4433")]
         listen: SocketAddr,
 
-        /// Bootstrap mode: print connection info to stdout, exit when stdin closes.
+        /// Bootstrap mode: read client cert from stdin, bind random port,
+        /// print `ROSE_BOOTSTRAP` line to stdout.
         #[arg(long)]
         bootstrap: bool,
-
-        /// Ephemeral mode: exit when all sessions disconnect (used with `--bootstrap`).
-        #[arg(long)]
-        ephemeral: bool,
     },
     /// Generate X.509 client certificates for authentication.
     Keygen,

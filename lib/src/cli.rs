@@ -83,13 +83,10 @@ enum Commands {
         #[arg(long, default_value = "0.0.0.0:4433")]
         listen: SocketAddr,
 
-        /// Bootstrap mode: print connection info to stdout, exit when stdin closes.
+        /// Bootstrap mode: read client cert from stdin, bind random port,
+        /// print `ROSE_BOOTSTRAP` line to stdout.
         #[arg(long)]
         bootstrap: bool,
-
-        /// Ephemeral mode: exit when all sessions disconnect (used with `--bootstrap`).
-        #[arg(long)]
-        ephemeral: bool,
     },
     /// Generate X.509 client certificates for authentication.
     Keygen,
@@ -134,11 +131,7 @@ pub async fn run() -> anyhow::Result<()> {
                 run_client(&host, port, cert, client_cert).await
             }
         }
-        Commands::Server {
-            listen,
-            bootstrap,
-            ephemeral,
-        } => run_server(listen, bootstrap, ephemeral).await,
+        Commands::Server { listen, bootstrap } => run_server(listen, bootstrap).await,
         Commands::Keygen => run_keygen(),
     }
 }
@@ -173,7 +166,7 @@ fn send_ssp_frame(frame: &SspFrame, conn: &quinn::Connection) -> bool {
 
 /// COVERAGE: CLI server loop is tested via integration/e2e tests.
 #[cfg_attr(coverage_nightly, coverage(off))]
-async fn run_server(listen: SocketAddr, bootstrap: bool, ephemeral: bool) -> anyhow::Result<()> {
+async fn run_server(listen: SocketAddr, bootstrap: bool) -> anyhow::Result<()> {
     let server = if bootstrap {
         // Bootstrap mode: read the client's public cert from stdin (sent by the client
         // over the authenticated SSH channel), then bind with mutual TLS requiring it.
@@ -279,69 +272,46 @@ async fn run_server(listen: SocketAddr, bootstrap: bool, ephemeral: bool) -> any
 
     let store = SessionStore::new();
 
-    if ephemeral {
-        // Ephemeral mode: accept one session and exit when the shell exits.
-        // The SSH connection that spawned us is killed by the client after
-        // the bootstrap handshake — we don't depend on it staying alive.
-
-        // In bootstrap mode, watch stdin for STUN hole-punch requests.
-        if bootstrap {
-            let punch_server = server.clone_for_punch();
-            tokio::spawn(async move {
-                use tokio::io::AsyncBufReadExt;
-                let stdin = tokio::io::stdin();
-                let mut reader = tokio::io::BufReader::new(stdin);
-                let mut line = String::new();
-                match tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut line))
-                    .await
-                {
-                    Ok(Ok(n)) if n > 0 => {
-                        if let Ok(client_addr) = parse_stun_line(line.trim()) {
-                            tracing::info!(%client_addr, "STUN hole-punch requested");
-                            punch_server.punch_hole(client_addr);
-                        }
+    // In bootstrap mode, watch stdin briefly for a STUN hole-punch request.
+    if bootstrap {
+        let punch_server = server.clone_for_punch();
+        tokio::spawn(async move {
+            use tokio::io::AsyncBufReadExt;
+            let stdin = tokio::io::stdin();
+            let mut reader = tokio::io::BufReader::new(stdin);
+            let mut line = String::new();
+            match tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut line)).await {
+                Ok(Ok(n)) if n > 0 => {
+                    if let Ok(client_addr) = parse_stun_line(line.trim()) {
+                        tracing::info!(%client_addr, "STUN hole-punch requested");
+                        punch_server.punch_hole(client_addr);
                     }
-                    _ => {}
                 }
-            });
-        }
-
-        // Accept connections in a loop: the initial connection and any
-        // reconnections after detach. Exit when the shell exits (store
-        // is empty after handle_server_session returns).
-        loop {
-            let Some(conn) = server.accept().await? else {
-                eprintln!("[RoSE server: endpoint closed]");
-                break;
-            };
-            let peer = conn.remote_address();
-            eprintln!("[RoSE server: connection from {peer}]");
-
-            let session_result = handle_server_session(conn, store.clone()).await;
-            if let Err(e) = &session_result {
-                eprintln!("[RoSE server: session error: {e}]");
+                _ => {}
             }
+        });
+    }
 
-            eprintln!(
-                "[RoSE server: session ended, store has {} sessions]",
-                store.len()
-            );
+    loop {
+        let Some(conn) = server.accept().await? else {
+            break;
+        };
+        let peer = conn.remote_address();
+        tracing::info!(%peer, "new connection");
 
-            // If no detached sessions remain, the shell exited — stop.
+        if bootstrap {
+            // Bootstrap mode: handle session inline so we can exit when
+            // the shell dies. Loop back to accept reconnections after detach.
+            if let Err(e) = handle_server_session(conn, store.clone()).await {
+                tracing::error!(%peer, "session error: {e}");
+            }
+            // If no detached sessions, the shell exited — stop the server.
             if store.is_empty() {
-                eprintln!("[RoSE server: no detached sessions, exiting]");
                 break;
             }
-            eprintln!("[RoSE server: session detached, waiting for reconnection]");
-        }
-    } else {
-        loop {
-            let Some(conn) = server.accept().await? else {
-                break;
-            };
-            let peer = conn.remote_address();
-            tracing::info!(%peer, "new connection");
-
+        } else {
+            // Native mode: spawn each session so the server can handle
+            // multiple concurrent clients.
             let store = store.clone();
             tokio::spawn(async move {
                 if let Err(e) = handle_server_session(conn, store).await {
@@ -1649,7 +1619,6 @@ async fn run_ssh_bootstrap(
         .arg(server_binary)
         .arg("server")
         .arg("--bootstrap")
-        .arg("--ephemeral")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
