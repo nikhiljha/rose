@@ -760,22 +760,37 @@ async fn client_session_loop(
         let sb_rx_dgram = Arc::clone(&scrollback_rx);
         let sb_count_dgram = Arc::clone(&rendered_sb_count);
         let output_task = tokio::spawn(async move {
+            let mut sb_check = tokio::time::interval(Duration::from_millis(200));
             loop {
-                match output_conn.read_datagram().await {
-                    Ok(data) => {
-                        let Ok(frame) = SspFrame::decode(&data) else {
-                            continue;
-                        };
-                        process_ssp_frame(
-                            &frame,
+                tokio::select! {
+                    result = output_conn.read_datagram() => {
+                        match result {
+                            Ok(data) => {
+                                let Ok(frame) = SspFrame::decode(&data) else {
+                                    continue;
+                                };
+                                process_ssp_frame(
+                                    &frame,
+                                    &recv_dgram,
+                                    &client_dgram,
+                                    &output_conn,
+                                    &sb_rx_dgram,
+                                    &sb_count_dgram,
+                                );
+                            }
+                            Err(e) => return e,
+                        }
+                    }
+                    _ = sb_check.tick() => {
+                        // Render scrollback even when no SSP frames are arriving
+                        // (e.g., idle terminal after a burst of output)
+                        maybe_render_scrollback(
                             &recv_dgram,
                             &client_dgram,
-                            &output_conn,
                             &sb_rx_dgram,
                             &sb_count_dgram,
                         );
                     }
-                    Err(e) => return e,
                 }
             }
         });
@@ -1162,6 +1177,86 @@ async fn resolve_ssh_hostname(host: &str) -> anyhow::Result<String> {
     Ok(host.to_string())
 }
 
+/// Performs a full terminal redraw (scrollback + visible) and resets the
+/// client terminal to match.
+///
+/// COVERAGE: CLI helper tested via integration/e2e tests.
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn do_full_redraw(
+    scrollback_rx: &Mutex<ScrollbackReceiver>,
+    rendered_sb_count: &Mutex<usize>,
+    new_state: &crate::ssp::ScreenState,
+    term: &mut RoseTerminal,
+) {
+    let sb = scrollback_rx.lock().expect("scrollback lock poisoned");
+    let mut count = rendered_sb_count
+        .lock()
+        .expect("rendered count lock poisoned");
+
+    let ansi = render_full_redraw(sb.lines(), new_state);
+    *count = sb.len();
+    drop(sb);
+    drop(count);
+
+    let mut out = std::io::stdout();
+    let _ = out.write_all(&ansi);
+    let _ = out.flush();
+
+    // Reset client terminal to match the new visible state.
+    // We can't advance() with the full redraw ANSI because it
+    // contains clear-scrollback + scrollback dumps that would
+    // confuse the wezterm emulator.
+    let cols = terminal::size().map_or(80, |(c, _)| c);
+    let rows = new_state.rows.len() as u16;
+    *term = RoseTerminal::new(rows, cols);
+    for (i, row) in new_state.rows.iter().enumerate() {
+        if !row.is_empty() {
+            term.advance(format!("\x1b[{};1H{row}", i + 1).as_bytes());
+        }
+    }
+    term.advance(
+        format!(
+            "\x1b[{};{}H",
+            new_state.cursor_y + 1,
+            new_state.cursor_x + 1
+        )
+        .as_bytes(),
+    );
+}
+
+/// Checks if scrollback changed and triggers a full redraw if needed.
+///
+/// Called periodically from the output task so scrollback is rendered
+/// even when no SSP frames are arriving (e.g., idle terminal after
+/// a burst of output).
+///
+/// COVERAGE: CLI helper tested via integration/e2e tests.
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn maybe_render_scrollback(
+    receiver: &Arc<Mutex<SspReceiver>>,
+    client_term: &Arc<Mutex<RoseTerminal>>,
+    scrollback_rx: &Arc<Mutex<ScrollbackReceiver>>,
+    rendered_sb_count: &Arc<Mutex<usize>>,
+) {
+    let needs_redraw = {
+        let sb = scrollback_rx.lock().expect("scrollback lock poisoned");
+        let count = rendered_sb_count
+            .lock()
+            .expect("rendered count lock poisoned");
+        sb.len() != *count
+    };
+    if !needs_redraw {
+        return;
+    }
+
+    let recv = receiver.lock().expect("receiver lock poisoned");
+    let state = recv.state().clone();
+    drop(recv);
+
+    let mut term = client_term.lock().expect("client terminal lock poisoned");
+    do_full_redraw(scrollback_rx, rendered_sb_count, &state, &mut term);
+}
+
 /// Processes an SSP frame: applies diff, renders to stdout, sends ACK.
 ///
 /// Shared by both the datagram and stream receive paths.
@@ -1187,48 +1282,17 @@ fn process_ssp_frame(
             let mut term = client_term.lock().expect("client terminal lock poisoned");
 
             // Determine if a full redraw is needed
-            let sb = scrollback_rx.lock().expect("scrollback lock poisoned");
-            let mut count = rendered_sb_count
-                .lock()
-                .expect("rendered count lock poisoned");
-            let needs_full_redraw = sb.len() != *count || new_state.rows.len() != term.size().0;
+            let needs_full_redraw = {
+                let sb = scrollback_rx.lock().expect("scrollback lock poisoned");
+                let count = rendered_sb_count
+                    .lock()
+                    .expect("rendered count lock poisoned");
+                sb.len() != *count || new_state.rows.len() != term.size().0
+            };
 
-            let ansi = if needs_full_redraw {
-                let ansi = render_full_redraw(sb.lines(), &new_state);
-                *count = sb.len();
-                drop(sb);
-                drop(count);
-
-                let mut out = std::io::stdout();
-                let _ = out.write_all(&ansi);
-                let _ = out.flush();
-
-                // Reset client terminal to match the new visible state.
-                // We can't advance() with the full redraw ANSI because it
-                // contains clear-scrollback + scrollback dumps that would
-                // confuse the wezterm emulator.
-                let cols = terminal::size().map_or(80, |(c, _)| c);
-                let rows = new_state.rows.len() as u16;
-                *term = RoseTerminal::new(rows, cols);
-                for (i, row) in new_state.rows.iter().enumerate() {
-                    if !row.is_empty() {
-                        term.advance(format!("\x1b[{};1H{row}", i + 1).as_bytes());
-                    }
-                }
-                term.advance(
-                    format!(
-                        "\x1b[{};{}H",
-                        new_state.cursor_y + 1,
-                        new_state.cursor_x + 1
-                    )
-                    .as_bytes(),
-                );
-
-                ansi
+            if needs_full_redraw {
+                do_full_redraw(scrollback_rx, rendered_sb_count, &new_state, &mut term);
             } else {
-                drop(sb);
-                drop(count);
-
                 let client_state = term.snapshot();
                 let ansi = render_diff_ansi(&client_state, &new_state);
                 let mut out = std::io::stdout();
@@ -1236,9 +1300,7 @@ fn process_ssp_frame(
                 let _ = out.flush();
                 // Advance client terminal with same ANSI so it tracks what's on screen
                 term.advance(&ansi);
-                ansi
-            };
-            drop(ansi);
+            }
 
             // Send ACK back to server
             let ack = SspFrame::ack_only(recv.ack_num());
