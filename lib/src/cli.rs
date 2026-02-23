@@ -1078,6 +1078,9 @@ async fn client_session_loop(
             false // connection lost, not user-initiated
         });
 
+        // Clone connection for checking close reason after the main select
+        let check_conn = session.connection().clone();
+
         // Task: resize events + server control messages (Goodbye)
         // Returns true if the server sent Goodbye (shell exited).
         let control_task = tokio::spawn(async move {
@@ -1118,16 +1121,7 @@ async fn client_session_loop(
         }
 
         let exit = tokio::select! {
-            result = output_task => {
-                match result {
-                    Ok(quinn::ConnectionError::ApplicationClosed(ref close))
-                        if close.error_code == quinn::VarInt::from_u32(0) =>
-                    {
-                        SessionExit::ShellExited
-                    }
-                    _ => SessionExit::ConnectionLost,
-                }
-            },
+            _ = output_task => SessionExit::ConnectionLost,
             _ = stream_task => SessionExit::ConnectionLost,
             result = input_task => {
                 if result.unwrap_or(false) {
@@ -1143,6 +1137,21 @@ async fn client_session_loop(
                     SessionExit::ConnectionLost
                 }
             },
+        };
+
+        // When the server closes the connection gracefully (shell exited),
+        // any task may win the select race. Check the connection's close
+        // reason regardless of which task finished first.
+        let exit = match exit {
+            SessionExit::ConnectionLost => match check_conn.close_reason() {
+                Some(quinn::ConnectionError::ApplicationClosed(ref close))
+                    if close.error_code == quinn::VarInt::from_u32(0) =>
+                {
+                    SessionExit::ShellExited
+                }
+                _ => SessionExit::ConnectionLost,
+            },
+            other => other,
         };
 
         match exit {
