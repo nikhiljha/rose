@@ -799,7 +799,7 @@ async fn client_session_loop(
             }
         };
 
-        let (cols, rows) = terminal::size().unwrap_or((80, 24));
+        let (cols, rows) = terminal::size()?;
         let env = collect_env_vars();
         let mut session = if let Some(sid) = session_id {
             match ClientSession::reconnect(conn, rows, cols, sid, env).await {
