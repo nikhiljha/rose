@@ -2,6 +2,10 @@ env:
   CARGO_TERM_COLOR: "always"
   RUSTFLAGS: "-Dwarnings"
 
+cache:
+  paths:
+    - target
+
 steps:
   - group: ":rust: CI"
     steps:
@@ -10,22 +14,14 @@ steps:
         plugins:
           - docker#v5.11.0:
               image: "ghcr.io/nikhiljha/rose-ci:latest"
-          - cache#v1.4.0:
-              manifest: Cargo.lock
-              path: target
-              restore: pipeline
-              save: pipeline
+              mount-checkout: true
 
       - label: ":lint-roller: Clippy"
         command: cargo clippy --workspace --all-targets
         plugins:
           - docker#v5.11.0:
               image: "ghcr.io/nikhiljha/rose-ci:latest"
-          - cache#v1.4.0:
-              manifest: Cargo.lock
-              path: target
-              restore: pipeline
-              save: pipeline
+              mount-checkout: true
 
       - label: ":test_tube: Test"
         commands:
@@ -34,33 +30,21 @@ steps:
         plugins:
           - docker#v5.11.0:
               image: "ghcr.io/nikhiljha/rose-ci:latest"
-          - cache#v1.4.0:
-              manifest: Cargo.lock
-              path: target
-              restore: pipeline
-              save: pipeline
+              mount-checkout: true
 
       - label: ":bar_chart: Coverage"
         command: cargo +nightly llvm-cov-easy nextest --workspace --branch
         plugins:
           - docker#v5.11.0:
               image: "ghcr.io/nikhiljha/rose-ci:latest"
-          - cache#v1.4.0:
-              manifest: Cargo.lock
-              path: target
-              restore: pipeline
-              save: pipeline
+              mount-checkout: true
 
       - label: ":shield: Security"
         command: cargo deny check
         plugins:
           - docker#v5.11.0:
               image: "ghcr.io/nikhiljha/rose-ci:latest"
-          - cache#v1.4.0:
-              manifest: Cargo.lock
-              path: target
-              restore: pipeline
-              save: pipeline
+              mount-checkout: true
 
   - wait
 
@@ -74,8 +58,4 @@ steps:
         plugins:
           - docker#v5.11.0:
               image: "ghcr.io/nikhiljha/rose-ci:latest"
-          - cache#v1.4.0:
-              manifest: Cargo.lock
-              path: target
-              restore: pipeline
-              save: pipeline
+              mount-checkout: true
