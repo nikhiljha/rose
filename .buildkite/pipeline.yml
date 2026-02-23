@@ -1,0 +1,69 @@
+env:
+  CARGO_TERM_COLOR: "always"
+  RUSTFLAGS: "-Dwarnings"
+
+steps:
+  - group: ":rust: CI"
+    steps:
+      - label: ":memo: Format"
+        command: cargo fmt --all -- --check
+        plugins:
+          - cache#v1.4.0:
+              manifest: Cargo.lock
+              path: target
+              restore: pipeline
+              save: pipeline
+
+      - label: ":lint-roller: Clippy"
+        command: cargo clippy --workspace --all-targets
+        plugins:
+          - cache#v1.4.0:
+              manifest: Cargo.lock
+              path: target
+              restore: pipeline
+              save: pipeline
+
+      - label: ":test_tube: Test"
+        commands:
+          - cargo nextest run --all --no-fail-fast
+          - cargo test --workspace --doc
+        plugins:
+          - cache#v1.4.0:
+              manifest: Cargo.lock
+              path: target
+              restore: pipeline
+              save: pipeline
+
+      - label: ":bar_chart: Coverage"
+        command: cargo +nightly llvm-cov-easy nextest --workspace --branch
+        plugins:
+          - cache#v1.4.0:
+              manifest: Cargo.lock
+              path: target
+              restore: pipeline
+              save: pipeline
+
+      - label: ":shield: Security"
+        command: cargo deny check
+        plugins:
+          - cache#v1.4.0:
+              manifest: Cargo.lock
+              path: target
+              restore: pipeline
+              save: pipeline
+
+  - wait
+
+  - group: ":globe_with_meridians: Deploy"
+    steps:
+      - label: ":zap: Build & Deploy Site"
+        if: build.branch == "main" && build.pull_request.id == null
+        commands:
+          - bash site/build.sh
+          - npx wrangler pages deploy site/public --project-name=rose --branch=main
+        plugins:
+          - cache#v1.4.0:
+              manifest: Cargo.lock
+              path: target
+              restore: pipeline
+              save: pipeline

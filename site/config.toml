@@ -1,0 +1,14 @@
+base_url = "https://rose.nikhiljha.com"
+title = "RoSE"
+description = "A modern replacement for Mosh written in Rust, built on QUIC and wezterm's terminal emulator."
+compile_sass = false
+build_search_index = false
+generate_feeds = false
+
+[markdown.highlighting]
+style = "inline"
+light_theme = "github-light"
+dark_theme = "github-dark"
+
+[extra]
+repo_url = "https://github.com/nikhiljha/rose"

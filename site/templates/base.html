@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}{{ config.title }}{% endblock %}</title>
+  <meta name="description" content="{{ config.description }}">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,600;0,700;1,400&family=IBM+Plex+Mono:wght@400;500;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ get_url(path='style.css') }}">
+</head>
+<body>
+  <!-- Thorned vine SVG background element -->
+  <div class="bg-vine" aria-hidden="true">
+    <svg viewBox="0 0 100 2000" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg">
+      <path d="M 50 0 Q 30 100 50 200 Q 70 300 50 400 Q 30 500 50 600 Q 70 700 50 800 Q 30 900 50 1000 Q 70 1100 50 1200 Q 30 1300 50 1400 Q 70 1500 50 1600 Q 30 1700 50 1800 Q 70 1900 50 2000" fill="none" stroke="var(--thorn)" stroke-width="0.5" opacity="0.3"/>
+      <!-- Thorns -->
+      <line x1="50" y1="100" x2="62" y2="88" stroke="var(--thorn)" stroke-width="0.4" opacity="0.25"/>
+      <line x1="50" y1="300" x2="38" y2="288" stroke="var(--thorn)" stroke-width="0.4" opacity="0.25"/>
+      <line x1="50" y1="500" x2="62" y2="488" stroke="var(--thorn)" stroke-width="0.4" opacity="0.25"/>
+      <line x1="50" y1="700" x2="38" y2="688" stroke="var(--thorn)" stroke-width="0.4" opacity="0.25"/>
+      <line x1="50" y1="900" x2="62" y2="888" stroke="var(--thorn)" stroke-width="0.4" opacity="0.25"/>
+      <line x1="50" y1="1100" x2="38" y2="1088" stroke="var(--thorn)" stroke-width="0.4" opacity="0.25"/>
+      <line x1="50" y1="1300" x2="62" y2="1288" stroke="var(--thorn)" stroke-width="0.4" opacity="0.25"/>
+      <line x1="50" y1="1500" x2="38" y2="1488" stroke="var(--thorn)" stroke-width="0.4" opacity="0.25"/>
+    </svg>
+  </div>
+
+  <div class="container">
+    <main>
+      {% block content %}{% endblock %}
+    </main>
+
+    <footer>
+      <div class="thorn-line" aria-hidden="true">
+        <svg viewBox="0 0 600 12" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg">
+          <line x1="0" y1="6" x2="600" y2="6" stroke="var(--border)" stroke-width="0.5"/>
+          <line x1="150" y1="6" x2="158" y2="0" stroke="var(--thorn)" stroke-width="0.5" opacity="0.5"/>
+          <line x1="300" y1="6" x2="292" y2="0" stroke="var(--thorn)" stroke-width="0.5" opacity="0.5"/>
+          <line x1="450" y1="6" x2="458" y2="0" stroke="var(--thorn)" stroke-width="0.5" opacity="0.5"/>
+        </svg>
+      </div>
+      <p>GPL-3.0-or-later | <a href="{{ config.extra.repo_url | safe }}">Source on GitHub</a></p>
+      <p><a href="https://www.vecteezy.com/free-vector/rose-top-view">Rose Top View Vectors by Juan Huwae</a></p>
+    </footer>
+  </div>
+</body>
+</html>

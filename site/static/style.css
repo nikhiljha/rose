@@ -1,0 +1,448 @@
+/* ── RoSE — noir botanical ────────────────────────────── */
+
+:root {
+  --bg:          #0a0a0b;
+  --bg-surface:  #111114;
+  --fg:          #c8c5c0;
+  --fg-dim:      #706d68;
+  --fg-bright:   #e8e6e2;
+  --rose:        #8b2242;
+  --rose-bright: #c43a5c;
+  --rose-glow:   #d4567430;
+  --thorn:       #4a3a2a;
+  --link:        #c43a5c;
+  --link-hover:  #e05a7c;
+  --code-bg:     #0f0f12;
+  --border:      #1e1c1a;
+  --max-width:   52rem;
+}
+
+/* ── Reset ───────────────────────────────────────────── */
+
+*, *::before, *::after {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+/* ── Page ────────────────────────────────────────────── */
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  font-family: 'Source Serif 4', 'Georgia', serif;
+  font-size: 1.05rem;
+  color: var(--fg);
+  background: var(--bg);
+  line-height: 1.7;
+  -webkit-font-smoothing: antialiased;
+  min-height: 100vh;
+}
+
+/* Subtle noise texture */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  opacity: 0.015;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  pointer-events: none;
+  z-index: -1;
+}
+
+/* ── Background vine ─────────────────────────────────── */
+
+.bg-vine {
+  position: fixed;
+  right: 2rem;
+  top: 0;
+  width: 40px;
+  height: 100vh;
+  pointer-events: none;
+  opacity: 0.4;
+  z-index: 0;
+}
+
+@media (max-width: 60rem) {
+  .bg-vine { display: none; }
+}
+
+/* ── Container ───────────────────────────────────────── */
+
+.container {
+  position: relative;
+  z-index: 1;
+  max-width: var(--max-width);
+  margin: 0 auto;
+  padding: 0 1.5rem;
+}
+
+/* ── Navigation ──────────────────────────────────────── */
+
+nav {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding: 1.5rem 0;
+  margin-bottom: 3rem;
+}
+
+.nav-brand {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  text-decoration: none;
+  color: var(--fg-bright);
+  font-family: 'IBM Plex Mono', 'Menlo', monospace;
+  font-weight: 600;
+  font-size: 1.1rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.nav-brand:hover {
+  color: var(--rose-bright);
+}
+
+.rose-icon {
+  width: 28px;
+  height: 28px;
+  transition: transform 0.4s ease;
+}
+
+.nav-brand:hover .rose-icon {
+  transform: rotate(30deg);
+}
+
+.nav-links {
+  display: flex;
+  gap: 2rem;
+}
+
+.nav-links a {
+  text-decoration: none;
+  color: var(--fg-dim);
+  font-family: 'IBM Plex Mono', 'Menlo', monospace;
+  font-size: 0.85rem;
+  font-weight: 500;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  transition: color 0.2s ease;
+  position: relative;
+}
+
+.nav-links a::after {
+  content: '';
+  position: absolute;
+  bottom: -4px;
+  left: 0;
+  width: 0;
+  height: 1px;
+  background: var(--rose);
+  transition: width 0.3s ease;
+}
+
+.nav-links a:hover {
+  color: var(--rose-bright);
+}
+
+.nav-links a:hover::after {
+  width: 100%;
+}
+
+/* ── Hero ────────────────────────────────────────────── */
+
+.hero {
+  position: relative;
+  text-align: center;
+  padding: 4rem 0 3rem;
+  margin-bottom: 3rem;
+  border-bottom: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.hero-rose {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 360px;
+  height: 360px;
+  opacity: 0.35;
+  animation: rose-spin 120s linear infinite;
+  pointer-events: none;
+  z-index: 0;
+}
+
+@keyframes rose-spin {
+  from { transform: translate(-50%, -50%) rotate(0deg); }
+  to { transform: translate(-50%, -50%) rotate(360deg); }
+}
+
+.hero-title {
+  font-family: 'Cormorant Garamond', 'Georgia', serif;
+  font-size: 5rem;
+  font-weight: 700;
+  letter-spacing: 0.15em;
+  color: var(--fg-bright);
+  position: relative;
+  z-index: 1;
+  text-transform: uppercase;
+  margin-bottom: 0.25rem;
+  text-shadow: 0 0 80px var(--rose-glow);
+}
+
+.hero-sub {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.9rem;
+  color: var(--fg-dim);
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  margin-bottom: 1.5rem;
+  position: relative;
+  z-index: 1;
+}
+
+.hero-desc {
+  font-family: 'Source Serif 4', serif;
+  font-size: 1.15rem;
+  color: var(--fg);
+  max-width: 36rem;
+  margin: 0 auto;
+  font-style: italic;
+  position: relative;
+  z-index: 1;
+}
+
+/* ── Article / Content ───────────────────────────────── */
+
+article {
+  padding-bottom: 2rem;
+}
+
+a {
+  color: var(--link);
+  text-decoration: none;
+  border-bottom: 1px solid transparent;
+  transition: color 0.2s ease, border-color 0.2s ease;
+}
+
+a:hover {
+  color: var(--link-hover);
+  border-bottom-color: var(--link-hover);
+}
+
+h1, h2, h3, h4 {
+  font-family: 'Cormorant Garamond', 'Georgia', serif;
+  color: var(--fg-bright);
+  font-weight: 600;
+}
+
+h2 {
+  font-size: 1.8rem;
+  margin: 3rem 0 1rem;
+  padding-bottom: 0.4rem;
+  border-bottom: 1px solid var(--border);
+  position: relative;
+}
+
+/* Rose accent dot before h2 */
+h2::before {
+  content: '';
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  background: var(--rose);
+  border-radius: 50%;
+  margin-right: 0.75rem;
+  vertical-align: middle;
+  position: relative;
+  top: -2px;
+}
+
+h3 {
+  font-size: 1.35rem;
+  margin: 2rem 0 0.75rem;
+  color: var(--fg);
+}
+
+h4 {
+  font-size: 1.1rem;
+  margin: 1.5rem 0 0.5rem;
+}
+
+h1:first-child, h2:first-child {
+  margin-top: 0;
+}
+
+p {
+  margin-bottom: 1rem;
+}
+
+ul, ol {
+  margin-bottom: 1.25rem;
+  padding-left: 1.5rem;
+}
+
+li {
+  margin-bottom: 0.35rem;
+}
+
+li::marker {
+  color: var(--rose);
+}
+
+strong {
+  color: var(--fg-bright);
+  font-weight: 600;
+}
+
+/* ── Code ────────────────────────────────────────────── */
+
+code {
+  font-family: 'IBM Plex Mono', 'Menlo', 'Consolas', monospace;
+  font-size: 0.88em;
+  background: var(--code-bg);
+  padding: 0.15em 0.4em;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+}
+
+pre {
+  background: var(--code-bg);
+  padding: 1.25rem 1.5rem;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--rose);
+  overflow-x: auto;
+  margin-bottom: 1.5rem;
+  font-size: 0.9rem;
+  line-height: 1.6;
+}
+
+pre code {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: inherit;
+}
+
+/* ── Tables ──────────────────────────────────────────── */
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+  margin-bottom: 1.5rem;
+  font-size: 0.95rem;
+}
+
+th {
+  background: var(--bg-surface);
+  color: var(--fg-bright);
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.85rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.6rem 0.8rem;
+  text-align: left;
+}
+
+tr:hover td {
+  background: var(--bg-surface);
+}
+
+/* ── Thorn line dividers ─────────────────────────────── */
+
+.thorn-line {
+  width: 100%;
+  height: 12px;
+  margin: 0.5rem 0;
+}
+
+.thorn-line svg {
+  width: 100%;
+  height: 12px;
+}
+
+.thorn-line--header {
+  margin-bottom: 2.5rem;
+}
+
+/* ── Page article (spec, etc.) ───────────────────────── */
+
+.page-title {
+  font-family: 'Cormorant Garamond', 'Georgia', serif;
+  font-size: 2.8rem;
+  font-weight: 700;
+  color: var(--fg-bright);
+  margin-bottom: 0.5rem;
+  letter-spacing: 0.02em;
+}
+
+/* ── Footer ──────────────────────────────────────────── */
+
+footer {
+  padding: 1.5rem 0 2rem;
+  margin-top: 3rem;
+  font-size: 0.85rem;
+  color: var(--fg-dim);
+  font-family: 'IBM Plex Mono', monospace;
+}
+
+footer a {
+  color: var(--fg-dim);
+}
+
+footer a:hover {
+  color: var(--rose-bright);
+}
+
+/* ── Responsive ──────────────────────────────────────── */
+
+@media (max-width: 40rem) {
+  .hero-title {
+    font-size: 3rem;
+    letter-spacing: 0.1em;
+  }
+
+  .hero-rose {
+    width: 200px;
+    height: 200px;
+  }
+
+  .hero {
+    padding: 2.5rem 0 2rem;
+  }
+
+  h2 {
+    font-size: 1.5rem;
+  }
+
+  .page-title {
+    font-size: 2rem;
+  }
+
+  nav {
+    flex-direction: column;
+    gap: 1rem;
+    align-items: flex-start;
+  }
+
+  .nav-links {
+    gap: 1.25rem;
+  }
+}
+
+/* ── Selection ───────────────────────────────────────── */
+
+::selection {
+  background: var(--rose);
+  color: var(--fg-bright);
+}

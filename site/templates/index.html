@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="hero">
+  <img class="hero-rose" src="{{ get_url(path='rose.svg') }}" alt="" aria-hidden="true">
+  <h1 class="hero-title">RoSE</h1>
+  <p class="hero-sub">Remote Shell Environment</p>
+  <p class="hero-desc">{{ config.description }}</p>
+</div>
+
+<article>
+  {{ section.content | safe }}
+</article>
+{% endblock %}

@@ -1,6 +1,9 @@
-# RoSE — Remote Shell Environment
-
-A modern replacement for [Mosh](https://mosh.org/) written in Rust, built on QUIC and wezterm's terminal emulator.
+<div align="center">
+  <img src="site/static/rose.svg" width="120" alt="RoSE">
+  <h1>RoSE</h1>
+  <p><em>Remote Shell Environment</em></p>
+  <p>A modern replacement for <a href="https://mosh.org/">Mosh</a> written in Rust, built on QUIC and wezterm's terminal emulator.</p>
+</div>
 
 ## Why RoSE?
 
