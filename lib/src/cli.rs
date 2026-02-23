@@ -311,21 +311,28 @@ async fn run_server(listen: SocketAddr, bootstrap: bool, ephemeral: bool) -> any
         // is empty after handle_server_session returns).
         loop {
             let Some(conn) = server.accept().await? else {
+                eprintln!("[RoSE server: endpoint closed]");
                 break;
             };
             let peer = conn.remote_address();
-            tracing::info!(%peer, "connection");
+            eprintln!("[RoSE server: connection from {peer}]");
 
             let session_result = handle_server_session(conn, store.clone()).await;
-            if let Err(e) = session_result {
-                tracing::error!(%peer, "session error: {e}");
+            if let Err(e) = &session_result {
+                eprintln!("[RoSE server: session error: {e}]");
             }
+
+            eprintln!(
+                "[RoSE server: session ended, store has {} sessions]",
+                store.len()
+            );
 
             // If no detached sessions remain, the shell exited — stop.
             if store.is_empty() {
+                eprintln!("[RoSE server: no detached sessions, exiting]");
                 break;
             }
-            tracing::info!("session detached, waiting for reconnection");
+            eprintln!("[RoSE server: session detached, waiting for reconnection]");
         }
     } else {
         loop {
@@ -552,6 +559,7 @@ async fn handle_server_session(conn: quinn::Connection, store: SessionStore) -> 
     let session_conn = session.connection().clone();
     let terminal_out = Arc::clone(&terminal);
     let sender_out = Arc::clone(&ssp_sender);
+    // Returns true if the shell exited, false if the connection died.
     let output_task = tokio::spawn(async move {
         let mut dirty = false;
         let mut last_send = tokio::time::Instant::now();
@@ -571,7 +579,8 @@ async fn handle_server_session(conn: quinn::Connection, store: SessionStore) -> 
                             terminal_out.lock().expect("terminal lock poisoned").advance(&data);
                             dirty = true;
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        // Broadcast closed = PTY reader thread exited = shell exited
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return true,
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                             tracing::warn!(n, "output subscriber lagged");
                             dirty = true;
@@ -579,7 +588,8 @@ async fn handle_server_session(conn: quinn::Connection, store: SessionStore) -> 
                     }
                 }
                 _ = retransmit.tick() => {}
-                () = &mut pty_closed_notified => break,
+                // PTY closed notification = shell exited
+                () = &mut pty_closed_notified => return true,
             }
 
             // Send eagerly: snapshot and push state as soon as PTY output
@@ -601,7 +611,8 @@ async fn handle_server_session(conn: quinn::Connection, store: SessionStore) -> 
                 if let Some(ref f) = frame
                     && !send_ssp_frame(f, &session_conn)
                 {
-                    break;
+                    // Connection dead, not shell exit
+                    return false;
                 }
             } else {
                 // Retransmit unacked frames even without new PTY output
@@ -611,7 +622,8 @@ async fn handle_server_session(conn: quinn::Connection, store: SessionStore) -> 
                 if let Some(ref f) = frame
                     && !send_ssp_frame(f, &session_conn)
                 {
-                    break;
+                    // Connection dead, not shell exit
+                    return false;
                 }
             }
         }
@@ -729,8 +741,8 @@ async fn handle_server_session(conn: quinn::Connection, store: SessionStore) -> 
     let shell_exited;
     let pty_from_control;
     tokio::select! {
-        _ = output_task => {
-            shell_exited = true;
+        result = output_task => {
+            shell_exited = result.unwrap_or(false);
             pty_from_control = None;
         },
         _ = input_task => {
