@@ -538,11 +538,12 @@ pub fn render_diff_ansi(old: &ScreenState, new: &ScreenState) -> Vec<u8> {
 
     if let Some(k) = detect_scroll_up(old, new) {
         // Scroll path: move cursor to the last row, emit k newlines to
-        // cause the real terminal to scroll, then write the new bottom rows.
+        // cause the real terminal to scroll (pushing old top rows into
+        // scrollback), then redraw ALL visible rows to ensure the live
+        // area is fully consistent with the SSP state.
         buf.extend_from_slice(format!("\x1b[{n};1H").as_bytes());
         buf.extend(std::iter::repeat_n(b'\n', k));
-        // Write the k new rows at the bottom
-        for i in (n - k)..n {
+        for i in 0..n {
             buf.extend_from_slice(format!("\x1b[{};1H\x1b[0m\x1b[2K", i + 1).as_bytes());
             buf.extend_from_slice(new.rows[i].as_bytes());
         }

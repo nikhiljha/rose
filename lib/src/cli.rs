@@ -385,30 +385,33 @@ async fn handle_server_session(conn: quinn::Connection, store: SessionStore) -> 
                     }
                 }
                 _ = interval.tick() => {
+                    // Only take a new snapshot when PTY output arrived
                     if dirty {
                         dirty = false;
                         let state = terminal_out.lock().expect("terminal lock poisoned").snapshot();
-                        let mut sender = sender_out.lock().expect("sender lock poisoned");
-                        sender.push_state(state);
-                        if let Some(frame) = sender.generate_frame() {
-                            let data = frame.encode();
-                            let max_dgram = session_conn.max_datagram_size().unwrap_or(1200);
-                            if data.len() <= max_dgram {
-                                if session_conn.send_datagram(Bytes::from(data)).is_err() {
-                                    break;
-                                }
-                            } else {
-                                // Oversized frame: send via reliable uni stream with type prefix
-                                let stream_data = frame.encode_for_stream();
-                                let conn = session_conn.clone();
-                                tokio::spawn(async move {
-                                    if let Ok(mut stream) = conn.open_uni().await {
-                                        let _ = stream.write_all(&[scrollback::stream_type::SSP_FRAME]).await;
-                                        let _ = stream.write_all(&stream_data).await;
-                                        let _ = stream.finish();
-                                    }
-                                });
+                        sender_out.lock().expect("sender lock poisoned").push_state(state);
+                    }
+                    // Always try to send — retransmits if client hasn't ack'd
+                    // (QUIC datagrams are unreliable, so frames can be lost)
+                    let sender = sender_out.lock().expect("sender lock poisoned");
+                    if let Some(frame) = sender.generate_frame() {
+                        let data = frame.encode();
+                        let max_dgram = session_conn.max_datagram_size().unwrap_or(1200);
+                        if data.len() <= max_dgram {
+                            if session_conn.send_datagram(Bytes::from(data)).is_err() {
+                                break;
                             }
+                        } else {
+                            // Oversized frame: send via reliable uni stream
+                            let stream_data = frame.encode_for_stream();
+                            let conn = session_conn.clone();
+                            tokio::spawn(async move {
+                                if let Ok(mut stream) = conn.open_uni().await {
+                                    let _ = stream.write_all(&[scrollback::stream_type::SSP_FRAME]).await;
+                                    let _ = stream.write_all(&stream_data).await;
+                                    let _ = stream.finish();
+                                }
+                            });
                         }
                     }
                 }
