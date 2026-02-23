@@ -58,6 +58,10 @@ enum Commands {
         /// Path to the `rose` binary on the remote server (for `--ssh` mode).
         #[arg(long, default_value = "rose")]
         server_binary: String,
+
+        /// Skip direct UDP and force STUN hole-punching (for testing).
+        #[arg(long)]
+        force_stun: bool,
     },
     /// Run the `RoSE` server daemon.
     Server {
@@ -105,9 +109,10 @@ pub async fn run() -> anyhow::Result<()> {
             cert,
             ssh,
             server_binary,
+            force_stun,
         } => {
             if ssh {
-                run_ssh_bootstrap(&host, &server_binary).await
+                run_ssh_bootstrap(&host, &server_binary, force_stun).await
             } else {
                 run_client(&host, port, cert).await
             }
@@ -220,13 +225,38 @@ async fn run_server(listen: SocketAddr, bootstrap: bool, ephemeral: bool) -> any
     let store = SessionStore::new();
 
     if ephemeral {
-        // Ephemeral mode: accept one connection, exit when it disconnects and stdin closes
-        let stdin_closed = tokio::spawn(async {
-            use tokio::io::AsyncReadExt;
-            let mut stdin = tokio::io::stdin();
+        // Ephemeral mode: accept one connection, exit when it disconnects and stdin closes.
+        // Also watches for an optional ROSE_STUN line from the client (for NAT hole-punching).
+        let punch_server = if bootstrap {
+            Some(server.clone_for_punch())
+        } else {
+            None
+        };
+        let stdin_closed = tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+            let mut reader = tokio::io::BufReader::new(tokio::io::stdin());
+
+            // In bootstrap mode, read one optional line for STUN hole-punching.
+            // The client sends "ROSE_STUN <ip> <port>" if direct UDP failed.
+            if let Some(server_ref) = punch_server {
+                let mut line = String::new();
+                match tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut line))
+                    .await
+                {
+                    Ok(Ok(n)) if n > 0 => {
+                        if let Ok(client_addr) = parse_stun_line(line.trim()) {
+                            tracing::info!(%client_addr, "STUN hole-punch requested");
+                            server_ref.punch_hole(client_addr);
+                        }
+                        // If not a STUN line, ignore (could be empty or invalid)
+                    }
+                    _ => {} // Timeout or EOF — client connected directly
+                }
+            }
+
+            // Continue watching for EOF (SSH connection dying)
             let mut buf = [0u8; 1];
-            // stdin closes when the SSH connection dies
-            let _ = stdin.read(&mut buf).await;
+            let _ = reader.read(&mut buf).await;
         });
 
         let Some(conn) = server.accept().await? else {
@@ -297,6 +327,28 @@ fn parse_bootstrap_line(line: &str) -> anyhow::Result<(u16, Vec<u8>)> {
         .map_err(|_| anyhow::anyhow!("invalid port in bootstrap line: {}", parts[1]))?;
     let server_cert_der = hex_decode(parts[2])?;
     Ok((port, server_cert_der))
+}
+
+/// Parses a `ROSE_STUN` line from the client's SSH stdin.
+///
+/// Expected format: `ROSE_STUN <ip> <port>`
+///
+/// # Errors
+///
+/// Returns an error if the line is malformed.
+fn parse_stun_line(line: &str) -> anyhow::Result<SocketAddr> {
+    let line = line.trim();
+    let parts: Vec<&str> = line.splitn(3, ' ').collect();
+    if parts.len() != 3 || parts[0] != "ROSE_STUN" {
+        anyhow::bail!("invalid STUN line: expected ROSE_STUN <ip> <port>");
+    }
+    let ip: std::net::IpAddr = parts[1]
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid IP in STUN line: {}", parts[1]))?;
+    let port: u16 = parts[2]
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid port in STUN line: {}", parts[2]))?;
+    Ok(SocketAddr::new(ip, port))
 }
 
 /// Hex-decodes a string to bytes.
@@ -727,8 +779,59 @@ async fn client_session_loop(
     cert_der: &rustls::pki_types::CertificateDer<'static>,
     client_cert: Option<&CertKeyPair>,
 ) -> anyhow::Result<()> {
+    client_session_loop_inner(addr, cert_der, client_cert, None).await
+}
+
+/// Like [`client_session_loop`] but uses a pre-established connection for the
+/// first iteration. Used when direct QUIC connect already succeeded.
+///
+/// COVERAGE: CLI client session loop is tested via integration/e2e tests.
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn client_session_loop_with_conn(
+    first_conn: quinn::Connection,
+    addr: SocketAddr,
+    cert_der: &rustls::pki_types::CertificateDer<'static>,
+    client_cert: Option<&CertKeyPair>,
+) -> anyhow::Result<()> {
+    client_session_loop_inner(addr, cert_der, client_cert, Some(first_conn)).await
+}
+
+/// Like [`client_session_loop`] but uses a pre-created [`QuicClient`] for the
+/// first connection. Used for STUN hole-punching where the client's socket
+/// must preserve its NAT mapping.
+///
+/// COVERAGE: CLI client session loop is tested via integration/e2e tests.
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn client_session_loop_with_client(
+    first_client: QuicClient,
+    addr: SocketAddr,
+    cert_der: &rustls::pki_types::CertificateDer<'static>,
+    client_cert: Option<&CertKeyPair>,
+) -> anyhow::Result<()> {
+    let conn = if let Some(cc) = client_cert {
+        first_client
+            .connect_with_cert(addr, "localhost", cert_der, cc)
+            .await?
+    } else {
+        first_client.connect(addr, "localhost", cert_der).await?
+    };
+    client_session_loop_inner(addr, cert_der, client_cert, Some(conn)).await
+}
+
+/// Core reconnection loop. If `first_conn` is provided, skips the connect
+/// phase for the first iteration.
+///
+/// COVERAGE: CLI client session loop is tested via integration/e2e tests.
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn client_session_loop_inner(
+    addr: SocketAddr,
+    cert_der: &rustls::pki_types::CertificateDer<'static>,
+    client_cert: Option<&CertKeyPair>,
+    first_conn: Option<quinn::Connection>,
+) -> anyhow::Result<()> {
     let mut session_id: Option<[u8; 16]> = None;
     let mut backoff = Duration::from_millis(100);
+    let mut initial_conn = first_conn;
 
     // Long-lived stdin reader: sends crossterm events through a channel
     // that survives across reconnection attempts, so the user can always
@@ -744,58 +847,64 @@ async fn client_session_loop(
     });
 
     loop {
-        // Create a fresh endpoint each iteration so the UDP socket
-        // survives network interface changes (WiFi → cellular, etc.).
-        let client = match QuicClient::new() {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::debug!(?backoff, "failed to create endpoint: {e}");
-                if wait_or_disconnect(&key_rx, backoff).await {
-                    let mut stdout = std::io::stdout();
-                    let _ = stdout.write_all(b"\r\n[RoSE: disconnected]\r\n");
-                    let _ = stdout.flush();
-                    break Ok(());
+        // If we have a pre-established connection (first iteration after
+        // bootstrap), use it directly. Otherwise, create a fresh endpoint
+        // so the UDP socket survives network interface changes.
+        let conn = if let Some(conn) = initial_conn.take() {
+            backoff = Duration::from_millis(100);
+            conn
+        } else {
+            let client = match QuicClient::new() {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::debug!(?backoff, "failed to create endpoint: {e}");
+                    if wait_or_disconnect(&key_rx, backoff).await {
+                        let mut stdout = std::io::stdout();
+                        let _ = stdout.write_all(b"\r\n[RoSE: disconnected]\r\n");
+                        let _ = stdout.flush();
+                        break Ok(());
+                    }
+                    backoff = (backoff * 2).min(Duration::from_secs(5));
+                    continue;
                 }
-                backoff = (backoff * 2).min(Duration::from_secs(5));
-                continue;
-            }
-        };
-        let conn_result = tokio::time::timeout(Duration::from_secs(5), async {
-            if let Some(cc) = client_cert {
-                client
-                    .connect_with_cert(addr, "localhost", cert_der, cc)
-                    .await
-            } else {
-                client.connect(addr, "localhost", cert_der).await
-            }
-        })
-        .await;
-        let conn = match conn_result {
-            Ok(Ok(c)) => {
-                backoff = Duration::from_millis(100);
-                c
-            }
-            Ok(Err(e)) => {
-                tracing::debug!(?backoff, "connection failed: {e}");
-                if wait_or_disconnect(&key_rx, backoff).await {
-                    let mut stdout = std::io::stdout();
-                    let _ = stdout.write_all(b"\r\n[RoSE: disconnected]\r\n");
-                    let _ = stdout.flush();
-                    break Ok(());
+            };
+            let conn_result = tokio::time::timeout(Duration::from_secs(5), async {
+                if let Some(cc) = client_cert {
+                    client
+                        .connect_with_cert(addr, "localhost", cert_der, cc)
+                        .await
+                } else {
+                    client.connect(addr, "localhost", cert_der).await
                 }
-                backoff = (backoff * 2).min(Duration::from_secs(5));
-                continue;
-            }
-            Err(_) => {
-                tracing::debug!(?backoff, "connection timed out");
-                if wait_or_disconnect(&key_rx, backoff).await {
-                    let mut stdout = std::io::stdout();
-                    let _ = stdout.write_all(b"\r\n[RoSE: disconnected]\r\n");
-                    let _ = stdout.flush();
-                    break Ok(());
+            })
+            .await;
+            match conn_result {
+                Ok(Ok(c)) => {
+                    backoff = Duration::from_millis(100);
+                    c
                 }
-                backoff = (backoff * 2).min(Duration::from_secs(5));
-                continue;
+                Ok(Err(e)) => {
+                    tracing::debug!(?backoff, "connection failed: {e}");
+                    if wait_or_disconnect(&key_rx, backoff).await {
+                        let mut stdout = std::io::stdout();
+                        let _ = stdout.write_all(b"\r\n[RoSE: disconnected]\r\n");
+                        let _ = stdout.flush();
+                        break Ok(());
+                    }
+                    backoff = (backoff * 2).min(Duration::from_secs(5));
+                    continue;
+                }
+                Err(_) => {
+                    tracing::debug!(?backoff, "connection timed out");
+                    if wait_or_disconnect(&key_rx, backoff).await {
+                        let mut stdout = std::io::stdout();
+                        let _ = stdout.write_all(b"\r\n[RoSE: disconnected]\r\n");
+                        let _ = stdout.flush();
+                        break Ok(());
+                    }
+                    backoff = (backoff * 2).min(Duration::from_secs(5));
+                    continue;
+                }
             }
         };
 
@@ -1204,11 +1313,20 @@ async fn client_session_loop(
 /// public cert over stdin, parses the `ROSE_BOOTSTRAP` line, then connects
 /// QUIC directly to the host with mutual TLS.
 ///
+/// If the direct QUIC connection fails (e.g., server's UDP port is
+/// firewalled), falls back to STUN-based NAT hole-punching: discovers
+/// the client's public address via STUN, tells the server over SSH stdin,
+/// and the server sends packets to open its firewall for return traffic.
+///
 /// The client's private key never leaves this process.
 ///
 /// COVERAGE: CLI bootstrap mode is tested via unit tests for parsing.
 #[cfg_attr(coverage_nightly, coverage(off))]
-async fn run_ssh_bootstrap(host: &str, server_binary: &str) -> anyhow::Result<()> {
+async fn run_ssh_bootstrap(
+    host: &str,
+    server_binary: &str,
+    force_stun: bool,
+) -> anyhow::Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
     // Generate ephemeral client cert — private key stays local
@@ -1262,10 +1380,17 @@ async fn run_ssh_bootstrap(host: &str, server_binary: &str) -> anyhow::Result<()
     let resolved_host = resolve_ssh_hostname(host).await?;
     let addr: SocketAddr = {
         use std::net::ToSocketAddrs;
-        format!("{resolved_host}:{port}")
+        let addrs: Vec<SocketAddr> = format!("{resolved_host}:{port}")
             .to_socket_addrs()
-            .ok()
-            .and_then(|mut addrs| addrs.next())
+            .map(Iterator::collect)
+            .unwrap_or_default();
+        // Prefer IPv4 — STUN fallback only discovers IPv4 mappings, and an
+        // IPv4 socket can't connect to an IPv6 address.
+        addrs
+            .iter()
+            .find(|a| a.is_ipv4())
+            .or_else(|| addrs.first())
+            .copied()
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "could not resolve {resolved_host}:{port} (from ssh config for {host})"
@@ -1273,11 +1398,84 @@ async fn run_ssh_bootstrap(host: &str, server_binary: &str) -> anyhow::Result<()
             })?
     };
 
-    // Enter raw mode and start the client session loop with mutual TLS
+    // Start STUN discovery in parallel with direct connect attempt.
+    // If direct succeeds, we discard the STUN result. If direct fails,
+    // we use it for hole-punching.
+    let stun_handle = tokio::task::spawn_blocking(|| {
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+        let public_addr = crate::stun::stun_discover(&socket)?;
+        Ok::<_, anyhow::Error>((socket, public_addr))
+    });
+
+    // Try direct QUIC connection first (3s timeout), unless --force-stun
+    let direct_result = if force_stun {
+        eprintln!("[RoSE: --force-stun: skipping direct attempt]");
+        None
+    } else {
+        Some(
+            tokio::time::timeout(Duration::from_secs(3), async {
+                let client = QuicClient::new()?;
+                client
+                    .connect_with_cert(addr, "localhost", &server_cert_der, &client_cert)
+                    .await
+            })
+            .await,
+        )
+    };
+
+    let use_stun = match &direct_result {
+        Some(Ok(Ok(_))) => false,
+        Some(Ok(Err(e))) => {
+            tracing::debug!("direct connection failed: {e}");
+            true
+        }
+        Some(Err(_)) => {
+            tracing::debug!("direct connection timed out");
+            true
+        }
+        None => true, // --force-stun
+    };
+
+    // Enter raw mode before the session loop
     terminal::enable_raw_mode()?;
     let _raw_guard = RawModeGuard;
 
-    let result = client_session_loop(addr, &server_cert_der, Some(&client_cert)).await;
+    let result = if use_stun {
+        eprintln!("[RoSE: direct UDP failed, trying STUN hole-punch...]");
+
+        match stun_handle.await {
+            Ok(Ok((stun_socket, public_addr))) => {
+                eprintln!("[RoSE: STUN discovered {public_addr}]");
+
+                // Tell server our public address so it can punch a hole
+                let stun_msg = format!("ROSE_STUN {} {}\n", public_addr.ip(), public_addr.port());
+                if let Some(stdin) = ssh.stdin.as_mut() {
+                    let _ = stdin.write_all(stun_msg.as_bytes()).await;
+                    let _ = stdin.flush().await;
+                }
+
+                // Wait for server to send punch packets
+                tokio::time::sleep(Duration::from_millis(500)).await;
+
+                // Create QUIC client from the STUN socket (preserves NAT mapping)
+                let client = QuicClient::from_socket(stun_socket)?;
+                client_session_loop_with_client(client, addr, &server_cert_der, Some(&client_cert))
+                    .await
+            }
+            Ok(Err(e)) => {
+                eprintln!("[RoSE: STUN discovery failed: {e}]");
+                anyhow::bail!("direct UDP connection failed and STUN fallback unavailable: {e}");
+            }
+            Err(e) => {
+                anyhow::bail!("STUN discovery task panicked: {e}");
+            }
+        }
+    } else {
+        // Direct connection succeeded — extract the connection and proceed.
+        // Safety: use_stun is false only when direct_result is Some(Ok(Ok(_))).
+        let conn = direct_result.unwrap().unwrap().unwrap();
+        client_session_loop_with_conn(conn, addr, &server_cert_der, Some(&client_cert)).await
+    };
 
     // Kill SSH process when done
     let _ = ssh.kill().await;
@@ -1638,5 +1836,42 @@ mod tests {
     #[test]
     fn parse_bootstrap_empty() {
         assert!(parse_bootstrap_line("").is_err());
+    }
+
+    #[test]
+    fn parse_stun_line_valid() {
+        let addr = parse_stun_line("ROSE_STUN 203.0.113.5 12345").unwrap();
+        assert_eq!(addr, "203.0.113.5:12345".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn parse_stun_line_with_whitespace() {
+        let addr = parse_stun_line("  ROSE_STUN 10.0.0.1 8080  \n").unwrap();
+        assert_eq!(addr, "10.0.0.1:8080".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn parse_stun_line_missing_prefix() {
+        assert!(parse_stun_line("WRONG 10.0.0.1 8080").is_err());
+    }
+
+    #[test]
+    fn parse_stun_line_invalid_ip() {
+        assert!(parse_stun_line("ROSE_STUN not_an_ip 8080").is_err());
+    }
+
+    #[test]
+    fn parse_stun_line_invalid_port() {
+        assert!(parse_stun_line("ROSE_STUN 10.0.0.1 notaport").is_err());
+    }
+
+    #[test]
+    fn parse_stun_line_too_few_parts() {
+        assert!(parse_stun_line("ROSE_STUN 10.0.0.1").is_err());
+    }
+
+    #[test]
+    fn parse_stun_line_empty() {
+        assert!(parse_stun_line("").is_err());
     }
 }

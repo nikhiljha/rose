@@ -85,7 +85,16 @@ The client:
 
 **Security:** The client's private key never leaves the client process. The public certificate is sent to the server over the authenticated SSH channel, and the server requires it for mutual TLS — preventing unauthorized connections to the bootstrap port. Both certificates are ephemeral and not cached.
 
-If UDP is blocked by a firewall, the connection fails (same limitation as mosh).
+#### STUN Hole-Punching Fallback
+
+If the direct QUIC connection to the server's UDP port fails (e.g., the port is firewalled), the client falls back to STUN-based NAT hole-punching using the SSH channel for signaling:
+
+1. The client sends a STUN Binding Request to a public Google STUN server to discover its own public IP:port (NAT-mapped address).
+2. The client writes `ROSE_STUN <ip> <port>` to the SSH process's stdin.
+3. The server reads this and sends QUIC Initial packets from its RoSE port to the client's STUN-discovered address. This creates a stateful firewall entry allowing return traffic.
+4. The client creates a QUIC endpoint from the same UDP socket used for STUN (preserving the NAT mapping) and connects to the server.
+
+STUN discovery runs in parallel with the direct connection attempt (3-second timeout), so the fallback path adds minimal latency. This is best-effort — it works for full-cone and restricted-cone NATs (typical consumer routers) and stateful firewalls, but not for symmetric NAT or stateless packet filters.
 
 ## State Synchronization Protocol
 

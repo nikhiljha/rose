@@ -10,5 +10,6 @@ pub mod pty;
 pub mod scrollback;
 pub mod session;
 pub mod ssp;
+pub mod stun;
 pub mod terminal;
 pub mod transport;

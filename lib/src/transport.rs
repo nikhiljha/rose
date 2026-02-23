@@ -112,6 +112,60 @@ impl QuicServer {
     pub fn server_cert_pem(&self) -> &str {
         &self.cert.cert_pem
     }
+
+    /// Returns a lightweight handle that can only punch holes, not accept connections.
+    ///
+    /// Used to pass hole-punching capability into a background task without
+    /// moving the entire server.
+    #[must_use]
+    pub fn clone_for_punch(&self) -> PunchHandle {
+        PunchHandle {
+            endpoint: self.endpoint.clone(),
+        }
+    }
+
+    /// Sends QUIC Initial packets to `target` to open a firewall pinhole.
+    ///
+    /// The connection attempt is expected to fail — only the UDP packets
+    /// matter. They create a stateful firewall entry that allows return
+    /// traffic from `target` to reach this server's port.
+    pub fn punch_hole(&self, target: SocketAddr) {
+        send_punch_packets(self.endpoint.clone(), target);
+    }
+}
+
+/// A lightweight handle for sending hole-punch packets from a server endpoint.
+///
+/// Created via [`QuicServer::clone_for_punch`]. Can be sent to background
+/// tasks without moving the entire server.
+pub struct PunchHandle {
+    endpoint: quinn::Endpoint,
+}
+
+impl PunchHandle {
+    /// Sends QUIC Initial packets to `target` to open a firewall pinhole.
+    ///
+    /// See [`QuicServer::punch_hole`] for details.
+    pub fn punch_hole(&self, target: SocketAddr) {
+        send_punch_packets(self.endpoint.clone(), target);
+    }
+}
+
+/// Spawns a task that sends QUIC Initial packets to `target` from `endpoint`.
+///
+/// Uses a TOFU (accept-any-cert) client config since we don't care about the
+/// TLS handshake completing — only the UDP packets matter for creating the
+/// firewall pinhole. The connection attempt will fail, which is expected.
+fn send_punch_packets(endpoint: quinn::Endpoint, target: SocketAddr) {
+    tokio::spawn(async move {
+        let Ok(dummy_config) = config::build_tofu_client_config() else {
+            return;
+        };
+        if let Ok(connecting) = endpoint.connect_with(dummy_config, target, "punch") {
+            // Drive the handshake briefly so Initial packets are sent.
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), connecting).await;
+        }
+    });
 }
 
 /// A QUIC client that connects to a server.
@@ -128,6 +182,26 @@ impl QuicClient {
     pub fn new() -> Result<Self, TransportError> {
         let addr = SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0));
         let endpoint = quinn::Endpoint::client(addr).map_err(TransportError::Bind)?;
+        Ok(Self { endpoint })
+    }
+
+    /// Creates a QUIC client from an existing UDP socket.
+    ///
+    /// Used for STUN hole-punching where the socket must preserve its NAT
+    /// mapping. The socket is set to non-blocking mode automatically.
+    ///
+    /// # Errors
+    ///
+    /// Returns `TransportError::Bind` if the endpoint cannot be created.
+    pub fn from_socket(socket: std::net::UdpSocket) -> Result<Self, TransportError> {
+        socket.set_nonblocking(true).map_err(TransportError::Bind)?;
+        let endpoint = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            None,
+            socket,
+            std::sync::Arc::new(quinn::TokioRuntime),
+        )
+        .map_err(TransportError::Bind)?;
         Ok(Self { endpoint })
     }
 
@@ -261,5 +335,36 @@ mod tests {
         assert_eq!(&response[..], b"stream data");
 
         drop(server_task.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn from_socket_connects() {
+        let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = server.local_addr().unwrap();
+        let cert = server.server_cert_der().clone();
+
+        let accept = tokio::spawn({
+            let endpoint = server.endpoint.clone();
+            async move {
+                let incoming = endpoint.accept().await.unwrap();
+                incoming.await.unwrap()
+            }
+        });
+
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let client = QuicClient::from_socket(socket).unwrap();
+        let client_conn = client.connect(addr, "localhost", &cert).await.unwrap();
+        let _server_conn = accept.await.unwrap();
+
+        assert_eq!(client_conn.remote_address(), addr);
+    }
+
+    #[tokio::test]
+    async fn punch_handle_creation() {
+        let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let handle = server.clone_for_punch();
+        // Just verify it can be created without panicking.
+        // Actual hole-punching is tested via e2e tests.
+        drop(handle);
     }
 }
