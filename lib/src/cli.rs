@@ -168,6 +168,14 @@ fn send_ssp_frame(frame: &SspFrame, conn: &quinn::Connection) -> bool {
 /// COVERAGE: CLI server loop is tested via integration/e2e tests.
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn run_server(listen: SocketAddr, bootstrap: bool, ephemeral: bool) -> anyhow::Result<()> {
+    // In bootstrap mode, immediately ignore SIGHUP so the server survives
+    // when the SSH session that spawned it ends. This must happen before
+    // any I/O — OpenSSH may kill the process at any time after the channel
+    // closes. Like nohup, we set the handler up front.
+    if bootstrap {
+        detach_from_parent();
+    }
+
     let server = if bootstrap {
         // Bootstrap mode: read the client's public cert from stdin (sent by the client
         // over the authenticated SSH channel), then bind with mutual TLS requiring it.
@@ -259,36 +267,24 @@ async fn run_server(listen: SocketAddr, bootstrap: bool, ephemeral: bool) -> any
         // The SSH connection that spawned us is killed by the client after
         // the bootstrap handshake — we don't depend on it staying alive.
 
-        // In bootstrap mode, read commands from stdin (over SSH channel):
-        // - ROSE_STUN <ip> <port>: hole-punch request
-        // - ROSE_DETACH: detach from SSH session, reply with ROSE_DETACH_ACK
+        // In bootstrap mode, watch stdin for STUN hole-punch requests.
         if bootstrap {
             let punch_server = server.clone_for_punch();
             tokio::spawn(async move {
-                use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+                use tokio::io::AsyncBufReadExt;
                 let stdin = tokio::io::stdin();
-                let mut stdout = tokio::io::stdout();
                 let mut reader = tokio::io::BufReader::new(stdin);
-                loop {
-                    let mut line = String::new();
-                    match tokio::time::timeout(Duration::from_secs(30), reader.read_line(&mut line))
-                        .await
-                    {
-                        Ok(Ok(n)) if n > 0 => {
-                            let trimmed = line.trim();
-                            if let Ok(client_addr) = parse_stun_line(trimmed) {
-                                tracing::info!(%client_addr, "STUN hole-punch requested");
-                                punch_server.punch_hole(client_addr);
-                            } else if trimmed == "ROSE_DETACH" {
-                                tracing::info!("detach requested — daemonizing");
-                                detach_from_parent();
-                                let _ = stdout.write_all(b"ROSE_DETACH_ACK\n").await;
-                                let _ = stdout.flush().await;
-                                break;
-                            }
+                let mut line = String::new();
+                match tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut line))
+                    .await
+                {
+                    Ok(Ok(n)) if n > 0 => {
+                        if let Ok(client_addr) = parse_stun_line(line.trim()) {
+                            tracing::info!(%client_addr, "STUN hole-punch requested");
+                            punch_server.punch_hole(client_addr);
                         }
-                        _ => break, // Timeout or EOF
                     }
+                    _ => {}
                 }
             });
         }
@@ -1647,25 +1643,8 @@ async fn run_ssh_bootstrap(
         None
     };
 
-    // Ask the server to detach from SSH, then kill SSH.
-    // After this, the server runs independently and supports roaming.
-    {
-        let stdin = ssh
-            .stdin
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("lost SSH stdin handle"))?;
-        stdin.write_all(b"ROSE_DETACH\n").await?;
-        stdin.flush().await?;
-    }
-    let mut ack_line = String::new();
-    match tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut ack_line)).await {
-        Ok(Ok(n)) if n > 0 && ack_line.trim() == "ROSE_DETACH_ACK" => {
-            tracing::info!("server detached from SSH session");
-        }
-        other => {
-            tracing::warn!("expected ROSE_DETACH_ACK, got {other:?}: {ack_line:?}");
-        }
-    }
+    // Kill SSH — the server already ignored SIGHUP at startup (like nohup),
+    // so it will survive.
     let _ = ssh.kill().await;
 
     // Enter raw mode and start the session loop
