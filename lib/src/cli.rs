@@ -249,20 +249,16 @@ async fn run_server(listen: SocketAddr, bootstrap: bool, ephemeral: bool) -> any
     let store = SessionStore::new();
 
     if ephemeral {
-        // Ephemeral mode: accept one connection, exit when it disconnects and stdin closes.
-        // Also watches for an optional ROSE_STUN line from the client (for NAT hole-punching).
-        let punch_server = if bootstrap {
-            Some(server.clone_for_punch())
-        } else {
-            None
-        };
-        let stdin_closed = tokio::spawn(async move {
-            use tokio::io::{AsyncBufReadExt, AsyncReadExt};
-            let mut reader = tokio::io::BufReader::new(tokio::io::stdin());
+        // Ephemeral mode: accept one session and exit when the shell exits.
+        // The SSH connection that spawned us is killed by the client after
+        // the bootstrap handshake — we don't depend on it staying alive.
 
-            // In bootstrap mode, read one optional line for STUN hole-punching.
-            // The client sends "ROSE_STUN <ip> <port>" if direct UDP failed.
-            if let Some(server_ref) = punch_server {
+        // In bootstrap mode, watch stdin briefly for a STUN hole-punch request.
+        if bootstrap {
+            let punch_server = server.clone_for_punch();
+            tokio::spawn(async move {
+                use tokio::io::AsyncBufReadExt;
+                let mut reader = tokio::io::BufReader::new(tokio::io::stdin());
                 let mut line = String::new();
                 match tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut line))
                     .await
@@ -270,18 +266,13 @@ async fn run_server(listen: SocketAddr, bootstrap: bool, ephemeral: bool) -> any
                     Ok(Ok(n)) if n > 0 => {
                         if let Ok(client_addr) = parse_stun_line(line.trim()) {
                             tracing::info!(%client_addr, "STUN hole-punch requested");
-                            server_ref.punch_hole(client_addr);
+                            punch_server.punch_hole(client_addr);
                         }
-                        // If not a STUN line, ignore (could be empty or invalid)
                     }
-                    _ => {} // Timeout or EOF — client connected directly
+                    _ => {}
                 }
-            }
-
-            // Continue watching for EOF (SSH connection dying)
-            let mut buf = [0u8; 1];
-            let _ = reader.read(&mut buf).await;
-        });
+            });
+        }
 
         let Some(conn) = server.accept().await? else {
             return Ok(());
@@ -293,9 +284,6 @@ async fn run_server(listen: SocketAddr, bootstrap: bool, ephemeral: bool) -> any
         if let Err(e) = session_result {
             tracing::error!(%peer, "session error: {e}");
         }
-
-        // Wait for stdin to close (SSH died) before exiting
-        let _ = stdin_closed.await;
     } else {
         loop {
             let Some(conn) = server.accept().await? else {
@@ -792,15 +780,22 @@ async fn run_client(host: &str, port: u16, cert_path: Option<PathBuf>) -> anyhow
     client_session_loop(addr, &cert_der, None).await
 }
 
-/// Context for STUN-based reconnection.
-///
-/// When the initial connection required STUN hole-punching, this context is
-/// passed into the reconnection loop so it can redo STUN on each reconnect
-/// attempt (the NAT mapping is lost when the network interface changes).
-struct StunReconnectContext {
-    /// SSH stdin handle for sending `ROSE_STUN` lines to the server.
-    ssh_stdin: tokio::process::ChildStdin,
+/// Result of the SSH bootstrap handshake, before entering the session loop.
+enum SessionSetup {
+    /// Direct QUIC connection succeeded.
+    WithConn(quinn::Connection),
+    /// STUN hole-punch succeeded — use this client (preserves NAT mapping).
+    WithClient(QuicClient),
 }
+
+/// Marker that STUN was used for the initial connection.
+///
+/// When present in the reconnection loop, each reconnect attempt redoes
+/// STUN discovery (the NAT mapping is lost when the network changes).
+/// SSH is already killed at this point — STUN reconnection sends punch
+/// packets from the server's existing endpoint, which already has the
+/// firewall pinhole from the initial connection.
+struct StunReconnectContext {}
 
 /// Reconnection loop: connects/reconnects to the server with exponential backoff.
 ///
@@ -852,18 +847,16 @@ async fn client_session_loop_with_client(
     client_session_loop_inner(addr, cert_der, client_cert, Some(conn), Some(stun_ctx)).await
 }
 
-/// Performs STUN discovery and hole-punching, returning a connected [`QuicClient`].
+/// Performs STUN discovery for reconnection, returning a [`QuicClient`]
+/// with the STUN-mapped socket.
 ///
-/// 1. Creates a new UDP socket and discovers its public address via STUN.
-/// 2. Sends `ROSE_STUN` to the server over SSH stdin so the server can punch.
-/// 3. Waits briefly for the server's punch packets.
-/// 4. Returns a [`QuicClient`] wrapping the STUN socket.
+/// SSH is already dead at this point. The server's firewall pinhole from
+/// the initial connection (or previous reconnect) should still allow
+/// return traffic. We just need a fresh NAT mapping on the client side.
 ///
 /// COVERAGE: Requires real STUN server; tested via e2e.
 #[cfg_attr(coverage_nightly, coverage(off))]
-async fn stun_reconnect(stun_ctx: &mut StunReconnectContext) -> anyhow::Result<QuicClient> {
-    use tokio::io::AsyncWriteExt;
-
+async fn stun_reconnect() -> anyhow::Result<QuicClient> {
     // STUN discovery is blocking I/O
     let (socket, public_addr) = tokio::task::spawn_blocking(|| {
         let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
@@ -873,14 +866,6 @@ async fn stun_reconnect(stun_ctx: &mut StunReconnectContext) -> anyhow::Result<Q
     .await??;
 
     tracing::info!(%public_addr, "STUN rediscovered for reconnect");
-
-    // Tell server to punch a hole for our new address
-    let stun_msg = format!("ROSE_STUN {} {}\n", public_addr.ip(), public_addr.port());
-    let _ = stun_ctx.ssh_stdin.write_all(stun_msg.as_bytes()).await;
-    let _ = stun_ctx.ssh_stdin.flush().await;
-
-    // Wait for server's punch packets
-    tokio::time::sleep(Duration::from_millis(500)).await;
 
     QuicClient::from_socket(socket).map_err(Into::into)
 }
@@ -896,7 +881,7 @@ async fn client_session_loop_inner(
     cert_der: &rustls::pki_types::CertificateDer<'static>,
     client_cert: Option<&CertKeyPair>,
     first_conn: Option<quinn::Connection>,
-    mut stun_ctx: Option<StunReconnectContext>,
+    stun_ctx: Option<StunReconnectContext>,
 ) -> anyhow::Result<()> {
     let mut session_id: Option<[u8; 16]> = None;
     let mut backoff = Duration::from_millis(100);
@@ -946,9 +931,9 @@ async fn client_session_loop_inner(
         let conn = if let Some(conn) = initial_conn.take() {
             backoff = Duration::from_millis(100);
             conn
-        } else if let Some(ref mut ctx) = stun_ctx {
-            // STUN was required — redo STUN + hole-punch for reconnection
-            match stun_reconnect(ctx).await {
+        } else if stun_ctx.is_some() {
+            // STUN was required — redo STUN for reconnection
+            match stun_reconnect().await {
                 Ok(client) => {
                     let conn_result = tokio::time::timeout(Duration::from_secs(5), async {
                         if let Some(cc) = client_cert {
@@ -1593,23 +1578,19 @@ async fn run_ssh_bootstrap(
     terminal::enable_raw_mode()?;
     let _raw_guard = RawModeGuard;
 
-    let result = if use_stun {
+    let result: anyhow::Result<SessionSetup> = if use_stun {
         eprintln!("[RoSE: direct UDP failed, trying STUN hole-punch...]");
 
         match stun_handle.await {
             Ok(Ok((stun_socket, public_addr))) => {
                 eprintln!("[RoSE: STUN discovered {public_addr}]");
 
-                // Take SSH stdin for ongoing STUN reconnection
-                let mut ssh_stdin = ssh
-                    .stdin
-                    .take()
-                    .ok_or_else(|| anyhow::anyhow!("lost SSH stdin handle"))?;
-
                 // Tell server our public address so it can punch a hole
                 let stun_msg = format!("ROSE_STUN {} {}\n", public_addr.ip(), public_addr.port());
-                ssh_stdin.write_all(stun_msg.as_bytes()).await?;
-                ssh_stdin.flush().await?;
+                if let Some(stdin) = ssh.stdin.as_mut() {
+                    let _ = stdin.write_all(stun_msg.as_bytes()).await;
+                    let _ = stdin.flush().await;
+                }
 
                 // Wait for server to send punch packets
                 tokio::time::sleep(Duration::from_millis(500)).await;
@@ -1621,15 +1602,7 @@ async fn run_ssh_bootstrap(
 
                 // Create QUIC client from the STUN socket (preserves NAT mapping)
                 let client = QuicClient::from_socket(stun_socket)?;
-                let stun_ctx = StunReconnectContext { ssh_stdin };
-                client_session_loop_with_client(
-                    client,
-                    addr,
-                    &server_cert_der,
-                    Some(&client_cert),
-                    stun_ctx,
-                )
-                .await
+                Ok(SessionSetup::WithClient(client))
             }
             Ok(Err(e)) => {
                 eprintln!("[RoSE: STUN discovery failed: {e}]");
@@ -1640,16 +1613,30 @@ async fn run_ssh_bootstrap(
             }
         }
     } else {
-        // Direct connection succeeded — extract the connection and proceed.
         // Safety: use_stun is false only when direct_result is Some(Ok(Ok(_))).
         let conn = direct_result.unwrap().unwrap().unwrap();
-        client_session_loop_with_conn(conn, addr, &server_cert_der, Some(&client_cert)).await
+        Ok(SessionSetup::WithConn(conn))
     };
 
-    // Kill SSH process when done
+    // Bootstrap handshake is done — kill SSH. The QUIC connection is
+    // independent and supports roaming without SSH.
     let _ = ssh.kill().await;
 
-    result
+    match result? {
+        SessionSetup::WithConn(conn) => {
+            client_session_loop_with_conn(conn, addr, &server_cert_der, Some(&client_cert)).await
+        }
+        SessionSetup::WithClient(client) => {
+            client_session_loop_with_client(
+                client,
+                addr,
+                &server_cert_der,
+                Some(&client_cert),
+                StunReconnectContext {},
+            )
+            .await
+        }
+    }
 }
 
 /// Resolves an SSH host alias to the actual hostname using `ssh -G`.
