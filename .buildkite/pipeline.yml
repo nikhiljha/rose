@@ -8,6 +8,8 @@ steps:
       - label: ":memo: Format"
         command: cargo fmt --all -- --check
         plugins:
+          - docker#v5.11.0:
+              image: "ghcr.io/nikhiljha/rose-ci:latest"
           - cache#v1.4.0:
               manifest: Cargo.lock
               path: target
@@ -17,6 +19,8 @@ steps:
       - label: ":lint-roller: Clippy"
         command: cargo clippy --workspace --all-targets
         plugins:
+          - docker#v5.11.0:
+              image: "ghcr.io/nikhiljha/rose-ci:latest"
           - cache#v1.4.0:
               manifest: Cargo.lock
               path: target
@@ -28,6 +32,8 @@ steps:
           - cargo nextest run --all --no-fail-fast
           - cargo test --workspace --doc
         plugins:
+          - docker#v5.11.0:
+              image: "ghcr.io/nikhiljha/rose-ci:latest"
           - cache#v1.4.0:
               manifest: Cargo.lock
               path: target
@@ -37,6 +43,8 @@ steps:
       - label: ":bar_chart: Coverage"
         command: cargo +nightly llvm-cov-easy nextest --workspace --branch
         plugins:
+          - docker#v5.11.0:
+              image: "ghcr.io/nikhiljha/rose-ci:latest"
           - cache#v1.4.0:
               manifest: Cargo.lock
               path: target
@@ -46,6 +54,8 @@ steps:
       - label: ":shield: Security"
         command: cargo deny check
         plugins:
+          - docker#v5.11.0:
+              image: "ghcr.io/nikhiljha/rose-ci:latest"
           - cache#v1.4.0:
               manifest: Cargo.lock
               path: target
@@ -62,6 +72,8 @@ steps:
           - bash site/build.sh
           - npx wrangler pages deploy site/public --project-name=rose --branch=main
         plugins:
+          - docker#v5.11.0:
+              image: "ghcr.io/nikhiljha/rose-ci:latest"
           - cache#v1.4.0:
               manifest: Cargo.lock
               path: target
