@@ -364,7 +364,8 @@ impl SspSender {
     ///
     /// Returns `None` if the client already has the latest state or no states exist.
     /// Uses an optimization: if the init diff is smaller than the incremental diff,
-    /// sends the init diff instead.
+    /// sends the init diff instead. Skips the init diff computation when the
+    /// incremental diff is clearly shorter (few rows changed).
     #[must_use]
     pub fn generate_frame(&self) -> Option<SspFrame> {
         let (latest_num, latest_state) = self.states.back()?;
@@ -377,8 +378,22 @@ impl SspSender {
 
         if let Some((_, base_state)) = ack_state {
             let incremental = latest_state.diff_from(base_state);
-            let init = latest_state.diff_from_empty();
 
+            // When few rows changed, incremental is clearly shorter than init
+            // (which includes all non-empty rows). Skip the init computation.
+            let total = incremental.total_rows as usize;
+            if incremental.changed_rows.len() <= total / 2 {
+                return Some(SspFrame {
+                    old_num: self.ack_num,
+                    new_num: *latest_num,
+                    ack_num: 0,
+                    diff: Some(incremental),
+                });
+            }
+
+            // Many rows changed — init might be shorter (e.g. screen clear
+            // turns 24 filled rows into 1 non-empty row).
+            let init = latest_state.diff_from_empty();
             let inc_encoded = incremental.encode();
             let init_encoded = init.encode();
 

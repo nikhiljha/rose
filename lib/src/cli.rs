@@ -21,8 +21,8 @@ use crate::pty::PtySession;
 use crate::scrollback::{self, ScrollbackLine, ScrollbackReceiver, ScrollbackSender};
 use crate::session::{DetachedSession, SessionStore};
 use crate::ssp::{
-    DATAGRAM_KEYSTROKE, DATAGRAM_SSP_ACK, SspFrame, SspReceiver, SspSender, render_diff_ansi,
-    render_full_redraw,
+    DATAGRAM_KEYSTROKE, DATAGRAM_SSP_ACK, ScreenState, SspFrame, SspReceiver, SspSender,
+    render_diff_ansi, render_full_redraw,
 };
 use crate::terminal::RoseTerminal;
 use crate::transport::{QuicClient, QuicServer};
@@ -113,6 +113,34 @@ pub async fn run() -> anyhow::Result<()> {
             ephemeral,
         } => run_server(listen, bootstrap, ephemeral).await,
         Commands::Keygen => run_keygen(),
+    }
+}
+
+/// Sends an SSP frame as a QUIC datagram, falling back to a uni stream for
+/// oversized frames. Returns `false` if the datagram send failed (connection
+/// likely dead).
+///
+/// COVERAGE: CLI helper tested via integration/e2e tests.
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn send_ssp_frame(frame: &SspFrame, conn: &quinn::Connection) -> bool {
+    let data = frame.encode();
+    let max_dgram = conn.max_datagram_size().unwrap_or(1200);
+    if data.len() <= max_dgram {
+        conn.send_datagram(Bytes::from(data)).is_ok()
+    } else {
+        // Oversized frame: send via reliable uni stream
+        let stream_data = frame.encode_for_stream();
+        let conn = conn.clone();
+        tokio::spawn(async move {
+            if let Ok(mut stream) = conn.open_uni().await {
+                let _ = stream
+                    .write_all(&[scrollback::stream_type::SSP_FRAME])
+                    .await;
+                let _ = stream.write_all(&stream_data).await;
+                let _ = stream.finish();
+            }
+        });
+        true
     }
 }
 
@@ -398,43 +426,33 @@ async fn handle_server_session(conn: quinn::Connection, store: SessionStore) -> 
 
             // Send eagerly: snapshot and push state as soon as PTY output
             // arrives, rate-limited to avoid flooding during bursts.
+            // Advance and snapshot share one terminal lock; push_state and
+            // generate_frame share one sender lock (2 locks instead of 4).
             if dirty && last_send.elapsed() >= min_frame_interval {
                 dirty = false;
                 let state = terminal_out
                     .lock()
                     .expect("terminal lock poisoned")
                     .snapshot();
-                sender_out
-                    .lock()
-                    .expect("sender lock poisoned")
-                    .push_state(state);
                 last_send = tokio::time::Instant::now();
-            }
 
-            // Always try to send — retransmits if client hasn't ack'd
-            // (QUIC datagrams are unreliable, so frames can be lost)
-            let sender = sender_out.lock().expect("sender lock poisoned");
-            if let Some(frame) = sender.generate_frame() {
-                let data = frame.encode();
-                let max_dgram = session_conn.max_datagram_size().unwrap_or(1200);
-                if data.len() <= max_dgram {
-                    if session_conn.send_datagram(Bytes::from(data)).is_err() {
+                let mut sender = sender_out.lock().expect("sender lock poisoned");
+                sender.push_state(state);
+                let frame = sender.generate_frame();
+                drop(sender);
+                if let Some(ref f) = frame
+                    && !send_ssp_frame(f, &session_conn) {
                         break;
                     }
-                } else {
-                    // Oversized frame: send via reliable uni stream
-                    let stream_data = frame.encode_for_stream();
-                    let conn = session_conn.clone();
-                    tokio::spawn(async move {
-                        if let Ok(mut stream) = conn.open_uni().await {
-                            let _ = stream
-                                .write_all(&[scrollback::stream_type::SSP_FRAME])
-                                .await;
-                            let _ = stream.write_all(&stream_data).await;
-                            let _ = stream.finish();
-                        }
-                    });
-                }
+            } else {
+                // Retransmit unacked frames even without new PTY output
+                let sender = sender_out.lock().expect("sender lock poisoned");
+                let frame = sender.generate_frame();
+                drop(sender);
+                if let Some(ref f) = frame
+                    && !send_ssp_frame(f, &session_conn) {
+                        break;
+                    }
             }
         }
     });
@@ -823,15 +841,11 @@ async fn client_session_loop(
 
         // Fresh SSP state each connection (server resets SspSender on reconnect)
         let receiver = Arc::new(Mutex::new(SspReceiver::new(rows)));
-        // Client-side terminal tracks what's actually on the user's screen.
-        // We diff against this (not the network SSP state) to generate correct
-        // ANSI output regardless of scroll artifacts or clear-line padding.
-        let client_terminal = Arc::new(Mutex::new(RoseTerminal::new(rows, cols)));
-        // Initialize client terminal with same clear as the real terminal
-        client_terminal
-            .lock()
-            .expect("client terminal lock poisoned")
-            .advance(b"\x1b[3J\x1b[2J\x1b[H");
+        // Tracks what's on the user's screen as a plain ScreenState.
+        // We diff the incoming SSP state against this to generate minimal
+        // ANSI output. Using ScreenState instead of a wezterm terminal
+        // avoids an expensive snapshot + advance round-trip per frame.
+        let client_screen = Arc::new(Mutex::new(ScreenState::empty(rows)));
 
         // Scrollback state shared between stream reader and SSP renderer
         let scrollback_rx = Arc::new(Mutex::new(ScrollbackReceiver::new()));
@@ -840,7 +854,7 @@ async fn client_session_loop(
         // Task: receive SSP frames via datagrams → apply diff → render
         let output_conn = session.connection().clone();
         let recv_dgram = Arc::clone(&receiver);
-        let client_dgram = Arc::clone(&client_terminal);
+        let client_dgram = Arc::clone(&client_screen);
         let sb_rx_dgram = Arc::clone(&scrollback_rx);
         let sb_count_dgram = Arc::clone(&rendered_sb_count);
         let output_task = tokio::spawn(async move {
@@ -882,7 +896,7 @@ async fn client_session_loop(
         // Task: receive uni streams (oversized SSP frames and scrollback)
         let stream_conn = session.connection().clone();
         let recv_stream = Arc::clone(&receiver);
-        let client_stream = Arc::clone(&client_terminal);
+        let client_stream = Arc::clone(&client_screen);
         let sb_rx_stream = Arc::clone(&scrollback_rx);
         let sb_count_stream = Arc::clone(&rendered_sb_count);
         let stream_task = tokio::spawn(async move {
@@ -1320,8 +1334,8 @@ async fn wait_or_disconnect(
 fn do_full_redraw(
     scrollback_rx: &Mutex<ScrollbackReceiver>,
     rendered_sb_count: &Mutex<usize>,
-    new_state: &crate::ssp::ScreenState,
-    term: &mut RoseTerminal,
+    new_state: &ScreenState,
+    screen: &mut ScreenState,
 ) {
     let sb = scrollback_rx.lock().expect("scrollback lock poisoned");
     let mut count = rendered_sb_count
@@ -1333,30 +1347,12 @@ fn do_full_redraw(
     drop(sb);
     drop(count);
 
-    let mut out = std::io::stdout();
+    let mut out = std::io::BufWriter::new(std::io::stdout());
     let _ = out.write_all(&ansi);
     let _ = out.flush();
 
-    // Reset client terminal to match the new visible state.
-    // We can't advance() with the full redraw ANSI because it
-    // contains clear-scrollback + scrollback dumps that would
-    // confuse the wezterm emulator.
-    let cols = terminal::size().map_or(80, |(c, _)| c);
-    let rows = new_state.rows.len() as u16;
-    *term = RoseTerminal::new(rows, cols);
-    for (i, row) in new_state.rows.iter().enumerate() {
-        if !row.is_empty() {
-            term.advance(format!("\x1b[{};1H{row}", i + 1).as_bytes());
-        }
-    }
-    term.advance(
-        format!(
-            "\x1b[{};{}H",
-            new_state.cursor_y + 1,
-            new_state.cursor_x + 1
-        )
-        .as_bytes(),
-    );
+    // Update stored screen state to match what's now on the user's terminal.
+    *screen = new_state.clone();
 }
 
 /// Checks if scrollback changed and triggers a full redraw if needed.
@@ -1369,7 +1365,7 @@ fn do_full_redraw(
 #[cfg_attr(coverage_nightly, coverage(off))]
 fn maybe_render_scrollback(
     receiver: &Arc<Mutex<SspReceiver>>,
-    client_term: &Arc<Mutex<RoseTerminal>>,
+    client_screen: &Arc<Mutex<ScreenState>>,
     scrollback_rx: &Arc<Mutex<ScrollbackReceiver>>,
     rendered_sb_count: &Arc<Mutex<usize>>,
 ) {
@@ -1388,8 +1384,8 @@ fn maybe_render_scrollback(
     let state = recv.state().clone();
     drop(recv);
 
-    let mut term = client_term.lock().expect("client terminal lock poisoned");
-    do_full_redraw(scrollback_rx, rendered_sb_count, &state, &mut term);
+    let mut screen = client_screen.lock().expect("client screen lock poisoned");
+    do_full_redraw(scrollback_rx, rendered_sb_count, &state, &mut screen);
 }
 
 /// Processes an SSP frame: applies diff, renders to stdout, sends ACK.
@@ -1405,7 +1401,7 @@ fn maybe_render_scrollback(
 fn process_ssp_frame(
     frame: &SspFrame,
     receiver: &Arc<Mutex<SspReceiver>>,
-    client_term: &Arc<Mutex<RoseTerminal>>,
+    client_screen: &Arc<Mutex<ScreenState>>,
     conn: &quinn::Connection,
     scrollback_rx: &Arc<Mutex<ScrollbackReceiver>>,
     rendered_sb_count: &Arc<Mutex<usize>>,
@@ -1414,7 +1410,7 @@ fn process_ssp_frame(
     match recv.process_frame(frame) {
         Ok(Some(_)) => {
             let new_state = recv.state().clone();
-            let mut term = client_term.lock().expect("client terminal lock poisoned");
+            let mut screen = client_screen.lock().expect("client screen lock poisoned");
 
             // Determine if a full redraw is needed
             let needs_full_redraw = {
@@ -1422,19 +1418,18 @@ fn process_ssp_frame(
                 let count = rendered_sb_count
                     .lock()
                     .expect("rendered count lock poisoned");
-                sb.len() != *count || new_state.rows.len() != term.size().0
+                sb.len() != *count || new_state.rows.len() != screen.rows.len()
             };
 
             if needs_full_redraw {
-                do_full_redraw(scrollback_rx, rendered_sb_count, &new_state, &mut term);
+                do_full_redraw(scrollback_rx, rendered_sb_count, &new_state, &mut screen);
             } else {
-                let client_state = term.snapshot();
-                let ansi = render_diff_ansi(&client_state, &new_state);
-                let mut out = std::io::stdout();
+                let ansi = render_diff_ansi(&screen, &new_state);
+                let mut out = std::io::BufWriter::new(std::io::stdout());
                 let _ = out.write_all(&ansi);
                 let _ = out.flush();
-                // Advance client terminal with same ANSI so it tracks what's on screen
-                term.advance(&ansi);
+                // Update stored screen state to match what's on the user's terminal
+                *screen = new_state;
             }
 
             // Send ACK back to server
