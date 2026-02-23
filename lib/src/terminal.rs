@@ -196,6 +196,7 @@ impl RoseTerminal {
     }
 
     /// Feeds raw bytes (PTY output) into the terminal emulator.
+    #[tracing::instrument(level = "trace", skip_all, fields(data_len = data.len()))]
     pub fn advance(&mut self, data: &[u8]) {
         self.inner.advance_bytes(data);
     }
@@ -291,6 +292,7 @@ impl RoseTerminal {
     ///
     /// Each row includes ANSI SGR escape sequences for colors and attributes.
     #[must_use]
+    #[tracing::instrument(level = "trace", skip_all)]
     pub fn snapshot(&self) -> ScreenState {
         let size = self.inner.get_size();
         let mut rows = Vec::with_capacity(size.rows);

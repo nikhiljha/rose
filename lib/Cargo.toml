@@ -29,4 +29,10 @@ bytes = "1.11.1"
 criterion.workspace = true
 insta.workspace = true
 tokio = { workspace = true, features = ["full"] }
+tracing-chrome = "0.7.2"
+tracing-subscriber = { workspace = true, features = ["registry"] }
+
+[[bench]]
+name = "e2e_latency"
+harness = false
 

@@ -44,6 +44,7 @@ impl ScreenState {
 
     /// Computes a diff from `old` to `self`.
     #[must_use]
+    #[tracing::instrument(level = "trace", skip_all)]
     pub fn diff_from(&self, old: &Self) -> ScreenDiff {
         let mut changed_rows = Vec::new();
         let max_rows = self.rows.len().max(old.rows.len());
@@ -213,6 +214,7 @@ impl SspFrame {
     ///
     /// Format: `[frame_type: u8][old_num: u64][new_num: u64][ack_num: u64][diff bytes...]`
     #[must_use]
+    #[tracing::instrument(level = "trace", skip_all)]
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         if let Some(ref diff) = self.diff {
@@ -235,6 +237,7 @@ impl SspFrame {
     /// # Errors
     ///
     /// Returns `SspError::MalformedFrame` if the data is truncated or invalid.
+    #[tracing::instrument(level = "trace", skip_all)]
     pub fn decode(data: &[u8]) -> Result<Self, SspError> {
         if data.len() < 25 {
             return Err(SspError::MalformedFrame("SspFrame too short".to_string()));
@@ -338,6 +341,7 @@ impl SspSender {
 
     /// Pushes a new screen state, assigning it a sequence number.
     /// Returns the assigned sequence number.
+    #[tracing::instrument(level = "trace", skip_all)]
     pub fn push_state(&mut self, state: ScreenState) -> u64 {
         let num = self.next_num;
         self.next_num += 1;
@@ -367,6 +371,7 @@ impl SspSender {
     /// sends the init diff instead. Skips the init diff computation when the
     /// incremental diff is clearly shorter (few rows changed).
     #[must_use]
+    #[tracing::instrument(level = "trace", skip_all)]
     pub fn generate_frame(&self) -> Option<SspFrame> {
         let (latest_num, latest_state) = self.states.back()?;
 
@@ -479,6 +484,7 @@ impl SspReceiver {
     /// # Errors
     ///
     /// Returns `SspError::InvalidDiff` if the diff cannot be applied.
+    #[tracing::instrument(level = "trace", skip_all)]
     pub fn process_frame(&mut self, frame: &SspFrame) -> Result<Option<u64>, SspError> {
         let Some(ref diff) = frame.diff else {
             return Ok(None); // ack-only frame
@@ -549,6 +555,7 @@ fn detect_scroll_up(old: &ScreenState, new: &ScreenState) -> Option<usize> {
 /// up a scrollback buffer. Non-scroll changes use absolute cursor
 /// positioning to update individual rows in place.
 #[must_use]
+#[tracing::instrument(level = "trace", skip_all)]
 pub fn render_diff_ansi(old: &ScreenState, new: &ScreenState) -> Vec<u8> {
     let mut buf = Vec::new();
     let n = new.rows.len();
@@ -597,6 +604,7 @@ pub fn render_diff_ansi(old: &ScreenState, new: &ScreenState) -> Vec<u8> {
 // TODO: use terminal-specific scrollback editing OSCs (e.g., kitty's)
 // for smarter partial updates instead of full clear-and-redraw.
 #[must_use]
+#[tracing::instrument(level = "trace", skip_all)]
 pub fn render_full_redraw(scrollback: &[ScrollbackLine], visible: &ScreenState) -> Vec<u8> {
     let mut buf = Vec::new();
 
