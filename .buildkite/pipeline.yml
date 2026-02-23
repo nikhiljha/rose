@@ -55,6 +55,12 @@ steps:
 
   - label: ":zap: Build & Deploy Site"
     if: build.branch == "main" && build.pull_request.id == null
+    if_changed:
+      - "**.rs"
+      - "doc/**"
+      - "site/**"
+      - Cargo.toml
+      - Cargo.lock
     commands:
       - bash site/build.sh
       - wrangler pages deploy site/public --project-name=rose --branch=main
