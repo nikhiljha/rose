@@ -919,25 +919,16 @@ async fn scrollback_sync_over_reliable_stream() {
 // to QUIC.
 // ---------------------------------------------------------------------------
 
-/// SSH bootstrap e2e test using an in-process `russh` SSH server.
-///
-/// Spins up a minimal SSH server that accepts any auth and executes the
-/// requested command (which will be `rose server --bootstrap --ephemeral`).
-/// Then runs the bootstrap handshake to verify certificates are exchanged
-/// and the `ROSE_BOOTSTRAP` line is parsed correctly.
-///
-/// This does NOT test the full interactive session (that requires raw terminal
-/// mode), but verifies the bootstrap handshake and QUIC connection succeed.
-#[tokio::test]
-async fn ssh_bootstrap_mode() {
+mod ssh_bootstrap_helpers {
+    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
     use russh::ChannelId;
     use russh::server::{Auth, Config, Handler, Msg, Session};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
-    // --- Minimal SSH server handler ---
+    pub struct TestHandler;
 
-    struct TestHandler;
+    static STDIN_TX: Mutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>> = Mutex::new(None);
 
     impl Handler for TestHandler {
         type Error = russh::Error;
@@ -971,7 +962,6 @@ async fn ssh_bootstrap_mode() {
             let command = String::from_utf8_lossy(data).to_string();
             session.channel_success(channel)?;
 
-            // Parse command into program + args
             let parts: Vec<&str> = command.split_whitespace().collect();
             let (program, args) = parts.split_first().expect("empty command");
 
@@ -986,7 +976,6 @@ async fn ssh_bootstrap_mode() {
             let child_stdin = child.stdin.take().unwrap();
             let child_stdout = child.stdout.take().unwrap();
 
-            // Forward child stdout → SSH channel
             let handle = session.handle();
             tokio::spawn(async move {
                 let mut reader = tokio::io::BufReader::new(child_stdout);
@@ -999,9 +988,6 @@ async fn ssh_bootstrap_mode() {
                 let _ = handle.close(channel).await;
             });
 
-            // Store child stdin for data() calls
-            // We use a task-local approach: spawn a reader task that receives
-            // data via a channel
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
             STDIN_TX.lock().unwrap().replace(tx);
 
@@ -1031,188 +1017,315 @@ async fn ssh_bootstrap_mode() {
         }
     }
 
-    // Global stdin sender (one handler at a time in tests)
-    use std::sync::Mutex;
-    static STDIN_TX: Mutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>> = Mutex::new(None);
+    pub fn build_rose_binary() -> String {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let workspace_root = manifest_dir.parent().unwrap();
+        let build_output = std::process::Command::new("cargo")
+            .arg("build")
+            .arg("-p")
+            .arg("rose-cli")
+            .arg("--message-format=json")
+            .current_dir(workspace_root)
+            .output()
+            .expect("failed to run cargo build");
+        assert!(
+            build_output.status.success(),
+            "cargo build failed: {}",
+            String::from_utf8_lossy(&build_output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&build_output.stdout);
+        stdout
+            .lines()
+            .filter(|line| line.contains(r#""reason":"compiler-artifact""#))
+            .filter(|line| line.contains(r#""name":"rose""#))
+            .filter(|line| line.contains(r#""bin""#))
+            .find_map(|line| {
+                let marker = r#""executable":""#;
+                let start = line.find(marker)? + marker.len();
+                let end = line[start..].find('"')? + start;
+                Some(line[start..end].to_string())
+            })
+            .expect("could not find rose binary in cargo build output")
+    }
 
-    // --- Start SSH server on random port ---
+    pub async fn start_ssh_server() -> u16 {
+        use base64::Engine;
+        let key_pem = String::from_utf8(
+            base64::engine::general_purpose::STANDARD
+                .decode(concat!(
+                    "LS0tLS1CRUdJTiBPUEVOU1NIIFBSSVZBVEUgS0VZLS0tLS0K",
+                    "YjNCbGJuTnphQzFyWlhrdGRqRUFBQUFBQkc1dmJtVUFBQUFF",
+                    "Ym05dVpRQUFBQUFBQUFBQkFBQUFNd0FBQUF0emMyZ3RaVwpR",
+                    "eU5UVXhPUUFBQUNDQ0hSOXNZTHBteUYzNlFZaTdIWDViV2NK",
+                    "VXpUaThZRXVCcnNIdWdhbjNOQUFBQUpCQ1V2S29RbEx5CnFB",
+                    "QUFBQXR6YzJndFpXUXlOVFV4T1FBQUFDQ0NIUjlzWUxwbXlG",
+                    "MzZRWWk3SFg1YldjSlV6VGk4WUV1QnJzSHVnYW4zTkEKQUFB",
+                    "RUFWbEFMN3docTEyM2swTnllakEwcFMxcWxQSk8zd0FjcUFS",
+                    "WWVsMXF4K1dJSWRIMnhndW1iSVhmcEJpTHNkZmx0Wgp3bFRO",
+                    "T0x4Z1M0R3V3ZTZCcWZjMEFBQUFDWFJsYzNSQWNtOXpaUUVD",
+                    "QXdRPQotLS0tLUVORCBPUEVOU1NIIFBSSVZBVEUgS0VZLS0t",
+                    "LS0K",
+                ))
+                .unwrap(),
+        )
+        .unwrap();
+        let key = russh::keys::ssh_key::PrivateKey::from_openssh(&key_pem).unwrap();
+        let config = Arc::new(Config {
+            keys: vec![key],
+            auth_rejection_time: std::time::Duration::from_secs(0),
+            auth_rejection_time_initial: Some(std::time::Duration::from_secs(0)),
+            ..Config::default()
+        });
 
-    // Pre-generated Ed25519 test key, double-base64-encoded to avoid
-    // triggering security scanners on the OpenSSH PEM format.
-    // NOT USED FOR ANYTHING SENSITIVE — test-only.
-    use base64::Engine;
-    let key_pem = String::from_utf8(
-        base64::engine::general_purpose::STANDARD
-            .decode(concat!(
-                "LS0tLS1CRUdJTiBPUEVOU1NIIFBSSVZBVEUgS0VZLS0tLS0K",
-                "YjNCbGJuTnphQzFyWlhrdGRqRUFBQUFBQkc1dmJtVUFBQUFF",
-                "Ym05dVpRQUFBQUFBQUFBQkFBQUFNd0FBQUF0emMyZ3RaVwpR",
-                "eU5UVXhPUUFBQUNDQ0hSOXNZTHBteUYzNlFZaTdIWDViV2NK",
-                "VXpUaThZRXVCcnNIdWdhbjNOQUFBQUpCQ1V2S29RbEx5CnFB",
-                "QUFBQXR6YzJndFpXUXlOVFV4T1FBQUFDQ0NIUjlzWUxwbXlG",
-                "MzZRWWk3SFg1YldjSlV6VGk4WUV1QnJzSHVnYW4zTkEKQUFB",
-                "RUFWbEFMN3docTEyM2swTnllakEwcFMxcWxQSk8zd0FjcUFS",
-                "WWVsMXF4K1dJSWRIMnhndW1iSVhmcEJpTHNkZmx0Wgp3bFRO",
-                "T0x4Z1M0R3V3ZTZCcWZjMEFBQUFDWFJsYzNSQWNtOXpaUUVD",
-                "QXdRPQotLS0tLUVORCBPUEVOU1NIIFBSSVZBVEUgS0VZLS0t",
-                "LS0K",
-            ))
-            .unwrap(),
-    )
-    .unwrap();
-    let key = russh::keys::ssh_key::PrivateKey::from_openssh(&key_pem).unwrap();
-    let config = Arc::new(Config {
-        keys: vec![key],
-        auth_rejection_time: std::time::Duration::from_secs(0),
-        auth_rejection_time_initial: Some(std::time::Duration::from_secs(0)),
-        ..Config::default()
-    });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ssh_port = listener.local_addr().unwrap().port();
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let ssh_port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let cfg = config.clone();
+                tokio::spawn(async move {
+                    let _ = russh::server::run_stream(cfg, socket, TestHandler).await;
+                });
+            }
+        });
 
-    // Accept one SSH connection in the background and hand it to russh
-    let ssh_server_config = config.clone();
-    tokio::spawn(async move {
-        let (socket, _) = listener.accept().await.unwrap();
-        let _ = russh::server::run_stream(ssh_server_config, socket, TestHandler).await;
-    });
+        ssh_port
+    }
 
-    // --- Run the real rose binary end-to-end ---
+    pub struct PtyChild {
+        pub child: Box<dyn portable_pty::Child + Send + Sync>,
+        pub writer: Option<Box<dyn std::io::Write + Send>>,
+        pub output: Arc<Mutex<String>>,
+        pub reader_handle: Option<std::thread::JoinHandle<()>>,
+    }
 
-    // Build the rose binary and locate it.
-    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let workspace_root = manifest_dir.parent().unwrap();
-    let build_output = std::process::Command::new("cargo")
-        .arg("build")
-        .arg("-p")
-        .arg("rose-cli")
-        .arg("--message-format=json")
-        .current_dir(workspace_root)
-        .output()
-        .expect("failed to run cargo build");
-    assert!(
-        build_output.status.success(),
-        "cargo build failed: {}",
-        String::from_utf8_lossy(&build_output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&build_output.stdout);
-    let rose_bin = stdout
-        .lines()
-        .filter(|line| line.contains(r#""reason":"compiler-artifact""#))
-        .filter(|line| line.contains(r#""name":"rose""#))
-        .filter(|line| line.contains(r#""bin""#))
-        .find_map(|line| {
-            let marker = r#""executable":""#;
-            let start = line.find(marker)? + marker.len();
-            let end = line[start..].find('"')? + start;
-            Some(line[start..end].to_string())
-        })
-        .expect("could not find rose binary in cargo build output");
+    impl PtyChild {
+        pub fn captured_output(&self) -> String {
+            self.output.lock().unwrap().clone()
+        }
 
-    // Spawn the rose client in a real PTY so terminal::enable_raw_mode()
-    // works. This exercises the full code path including raw mode, the
-    // keystroke reader thread, and SSP rendering.
-    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+        pub fn finish(&mut self) -> String {
+            self.writer.take();
+            if let Some(h) = self.reader_handle.take() {
+                let _ = h.join();
+            }
+            self.captured_output()
+        }
+    }
 
-    let pty_system = native_pty_system();
-    let pty_pair = pty_system
-        .openpty(PtySize {
-            rows: 24,
-            cols: 80,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .expect("failed to open PTY");
+    pub fn spawn_in_pty(cmd: CommandBuilder) -> PtyChild {
+        let pty_system = native_pty_system();
+        let pty_pair = pty_system
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("failed to open PTY");
 
-    let mut cmd = CommandBuilder::new(&rose_bin);
-    cmd.args([
-        "connect",
-        "--ssh",
-        "--ssh-port",
-        &ssh_port.to_string(),
-        "--ssh-option",
-        "StrictHostKeyChecking=no",
-        "--ssh-option",
-        "UserKnownHostsFile=/dev/null",
-        "--ssh-option",
-        "PreferredAuthentications=none",
-        "127.0.0.1",
-        "--server-binary",
-        &rose_bin,
-    ]);
+        let child = pty_pair
+            .slave
+            .spawn_command(cmd)
+            .expect("failed to spawn command in PTY");
 
-    let mut child = pty_pair
-        .slave
-        .spawn_command(cmd)
-        .expect("failed to spawn rose connect in PTY");
+        let writer = pty_pair.master.take_writer().unwrap();
+        let mut reader = pty_pair.master.try_clone_reader().unwrap();
+        drop(pty_pair.slave);
 
-    // Get a writer to send keystrokes and a reader for output
-    let mut pty_writer = pty_pair.master.take_writer().unwrap();
-    let mut pty_reader = pty_pair.master.try_clone_reader().unwrap();
-    // Drop the slave so the PTY master sees EOF when the child exits
-    drop(pty_pair.slave);
-
-    // Read PTY output in a background thread (blocking I/O)
-    let output = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-    let output_clone = output.clone();
-    let reader_handle = std::thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        loop {
-            match std::io::Read::read(&mut pty_reader, &mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    let text = String::from_utf8_lossy(&buf[..n]);
-                    output_clone.lock().unwrap().push_str(&text);
+        let output = Arc::new(Mutex::new(String::new()));
+        let output_clone = output.clone();
+        let reader_handle = std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                match std::io::Read::read(&mut reader, &mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let text = String::from_utf8_lossy(&buf[..n]);
+                        output_clone.lock().unwrap().push_str(&text);
+                    }
                 }
             }
-        }
-    });
+        });
 
-    // Wait for the session to establish (bootstrap + QUIC connect)
+        PtyChild {
+            child,
+            writer: Some(writer),
+            output,
+            reader_handle: Some(reader_handle),
+        }
+    }
+
+    pub fn bootstrap_cmd(rose_bin: &str, ssh_port: u16) -> CommandBuilder {
+        let mut cmd = CommandBuilder::new(rose_bin);
+        cmd.args([
+            "connect",
+            "--ssh",
+            "--ssh-port",
+            &ssh_port.to_string(),
+            "--ssh-option",
+            "StrictHostKeyChecking=no",
+            "--ssh-option",
+            "UserKnownHostsFile=/dev/null",
+            "--ssh-option",
+            "PreferredAuthentications=none",
+            "127.0.0.1",
+            "--server-binary",
+            rose_bin,
+        ]);
+        cmd
+    }
+
+    pub async fn wait_for_exit(
+        child: &mut Box<dyn portable_pty::Child + Send + Sync>,
+        timeout_secs: u64,
+    ) -> Option<portable_pty::ExitStatus> {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            async {
+                loop {
+                    if let Ok(Some(status)) = child.try_wait() {
+                        return status;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            },
+        )
+        .await
+        .ok()
+    }
+}
+
+#[tokio::test]
+async fn ssh_bootstrap_mode() {
+    use ssh_bootstrap_helpers::*;
+
+    let ssh_port = start_ssh_server().await;
+    let rose_bin = build_rose_binary();
+
+    let cmd = bootstrap_cmd(&rose_bin, ssh_port);
+    let mut pty = spawn_in_pty(cmd);
+
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
-    // Send Ctrl-D to exit the shell
-    std::io::Write::write_all(&mut pty_writer, &[4]).unwrap();
-    std::io::Write::flush(&mut pty_writer).unwrap();
+    let w = pty.writer.as_mut().unwrap();
+    std::io::Write::write_all(w, &[4]).unwrap();
+    std::io::Write::flush(w).unwrap();
 
-    // Wait for the child to exit
-    let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        loop {
-            if let Ok(Some(status)) = child.try_wait() {
-                return status;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-    })
-    .await;
+    let status = wait_for_exit(&mut pty.child, 10).await;
+    let captured = pty.finish();
 
-    // Drop writer so the reader thread can exit
-    drop(pty_writer);
-    let _ = reader_handle.join();
-    let captured = output.lock().unwrap().clone();
-
-    match result {
-        Ok(status) => {
+    match status {
+        Some(s) => {
             assert!(
-                status.exit_code() == 0,
-                "rose client exited with {status:?}. output:\n{captured}"
+                s.exit_code() == 0,
+                "rose client exited with {s:?}. output:\n{captured}"
             );
             assert!(
                 captured.contains("Bootstrap: server on port"),
                 "bootstrap failed. output:\n{captured}"
             );
-            // Should see shell exited or at least no connection errors
             assert!(
                 !captured.contains("connection error") && !captured.contains("connection failed"),
                 "QUIC connection failed. output:\n{captured}"
             );
         }
-        Err(_) => {
-            child.kill().unwrap();
+        None => {
+            pty.child.kill().unwrap();
             panic!("rose client timed out — likely hung. output:\n{captured}");
         }
     }
+}
+
+#[tokio::test]
+async fn ssh_bootstrap_detach_reconnect() {
+    use portable_pty::CommandBuilder;
+    use ssh_bootstrap_helpers::*;
+
+    let ssh_port = start_ssh_server().await;
+    let rose_bin = build_rose_binary();
+
+    let cmd = bootstrap_cmd(&rose_bin, ssh_port);
+    let mut pty = spawn_in_pty(cmd);
+
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    // Send Enter ~ d to trigger detach
+    {
+        let w = pty.writer.as_mut().unwrap();
+        std::io::Write::write_all(w, b"\r").unwrap();
+        std::io::Write::flush(w).unwrap();
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    {
+        let w = pty.writer.as_mut().unwrap();
+        std::io::Write::write_all(w, b"~").unwrap();
+        std::io::Write::flush(w).unwrap();
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    {
+        let w = pty.writer.as_mut().unwrap();
+        std::io::Write::write_all(w, b"d").unwrap();
+        std::io::Write::flush(w).unwrap();
+    }
+
+    let status = wait_for_exit(&mut pty.child, 10).await;
+    let captured = pty.finish();
+
+    let status = status.unwrap_or_else(|| {
+        pty.child.kill().unwrap();
+        panic!("rose client timed out during detach. output:\n{captured}");
+    });
+    assert!(
+        status.exit_code() == 0,
+        "rose client exited with {status:?} during detach. output:\n{captured}"
+    );
+    assert!(
+        captured.contains("detached"),
+        "detach message not found. output:\n{captured}"
+    );
+
+    // Parse the QUIC port from the detach output
+    let port_line = captured
+        .lines()
+        .find(|l| l.contains("Bootstrap: server on port"))
+        .expect("bootstrap port line not found in output");
+    let port: u16 = port_line
+        .split("port ")
+        .nth(1)
+        .unwrap()
+        .trim()
+        .parse()
+        .expect("failed to parse port from bootstrap output");
+
+    // Reconnect using native mode (rose connect --port <port> 127.0.0.1)
+    let mut cmd = CommandBuilder::new(&rose_bin);
+    cmd.args(["connect", "127.0.0.1", "--port", &port.to_string()]);
+    let mut pty2 = spawn_in_pty(cmd);
+
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+    // Send Ctrl-D to exit the shell
+    {
+        let w = pty2.writer.as_mut().unwrap();
+        std::io::Write::write_all(w, &[4]).unwrap();
+        std::io::Write::flush(w).unwrap();
+    }
+
+    let status2 = wait_for_exit(&mut pty2.child, 10).await;
+    let captured2 = pty2.finish();
+
+    let status2 = status2.unwrap_or_else(|| {
+        pty2.child.kill().unwrap();
+        panic!("rose reconnect timed out. output:\n{captured2}");
+    });
+    assert!(
+        status2.exit_code() == 0,
+        "rose reconnect failed with {status2:?}. output:\n{captured2}"
+    );
 }
 
 // ---------------------------------------------------------------------------
