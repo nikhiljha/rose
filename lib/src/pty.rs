@@ -152,7 +152,10 @@ impl PtySession {
                     Err(_) => break,
                 }
             }
-            closed.notify_waiters();
+            // notify_one() stores a permit when no task is currently
+            // waiting, so the output_task sees the close even if it's
+            // busy doing work outside its select! loop.
+            closed.notify_one();
         });
 
         Ok(Self {
