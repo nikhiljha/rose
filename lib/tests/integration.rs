@@ -133,7 +133,7 @@ fn terminal_snapshot() {
 /// positioning which never caused the client terminal to scroll.
 #[test]
 fn ssp_render_scrollback_in_client_terminal() {
-    use rose::ssp::{ScreenState, SspReceiver, SspSender, render_diff_ansi};
+    use rose::ssp::{SspReceiver, SspSender, render_diff_ansi};
     use rose::terminal::RoseTerminal;
 
     let rows: u16 = 5;
@@ -147,37 +147,28 @@ fn ssp_render_scrollback_in_client_terminal() {
     // the ANSI output from render_diff_ansi (simulating the user's terminal)
     let mut receiver = SspReceiver::new(rows);
     let mut client_term = RoseTerminal::new(rows, cols);
-    let mut prev_state = ScreenState::empty(rows);
-
     // Clear client terminal (same as client_session_loop does)
     client_term.advance(b"\x1b[2J\x1b[H");
 
-    // Helper: run one SSP cycle
+    // Helper: run one SSP cycle (matches process_ssp_frame: diffs against
+    // the client terminal's actual screen, not the previous SSP state)
     let ssp_cycle = |server_term: &RoseTerminal,
                      sender: &mut SspSender,
                      receiver: &mut SspReceiver,
-                     client_term: &mut RoseTerminal,
-                     prev_state: &mut ScreenState| {
+                     client_term: &mut RoseTerminal| {
         let snap = server_term.snapshot();
         sender.push_state(snap);
         let frame = sender.generate_frame().expect("should have a frame");
         receiver.process_frame(&frame).expect("frame should apply");
         let new_state = receiver.state().clone();
-        let ansi = render_diff_ansi(prev_state, &new_state);
+        let ansi = render_diff_ansi(&client_term.snapshot(), &new_state);
         client_term.advance(&ansi);
-        *prev_state = new_state;
         sender.process_ack(receiver.ack_num());
     };
 
     // Fill the screen (5 lines in 5-row terminal)
     server_term.advance(b"line 1\r\nline 2\r\nline 3\r\nline 4\r\nline 5");
-    ssp_cycle(
-        &server_term,
-        &mut sender,
-        &mut receiver,
-        &mut client_term,
-        &mut prev_state,
-    );
+    ssp_cycle(&server_term, &mut sender, &mut receiver, &mut client_term);
 
     // No scrollback yet — screen isn't full enough to scroll
     assert!(
@@ -188,13 +179,7 @@ fn ssp_render_scrollback_in_client_terminal() {
     // Write 10 more lines — forces server terminal to scroll repeatedly
     for i in 6..=15 {
         server_term.advance(format!("\r\nline {i}").as_bytes());
-        ssp_cycle(
-            &server_term,
-            &mut sender,
-            &mut receiver,
-            &mut client_term,
-            &mut prev_state,
-        );
+        ssp_cycle(&server_term, &mut sender, &mut receiver, &mut client_term);
     }
 
     // Server terminal has scrolled — verify it has scrollback
@@ -233,13 +218,7 @@ fn ssp_render_scrollback_in_client_terminal() {
 
     // Simulate typing a character (non-scroll change: only bottom row changes)
     server_term.advance(b"$ ");
-    ssp_cycle(
-        &server_term,
-        &mut sender,
-        &mut receiver,
-        &mut client_term,
-        &mut prev_state,
-    );
+    ssp_cycle(&server_term, &mut sender, &mut receiver, &mut client_term);
 
     let server_text = server_term.screen_text();
     let client_text = client_term.screen_text();
@@ -253,13 +232,7 @@ fn ssp_render_scrollback_in_client_terminal() {
     // Type more characters — simulates user typing after ls output
     for ch in ['h', 'e', 'l', 'l', 'o'] {
         server_term.advance(format!("{ch}").as_bytes());
-        ssp_cycle(
-            &server_term,
-            &mut sender,
-            &mut receiver,
-            &mut client_term,
-            &mut prev_state,
-        );
+        ssp_cycle(&server_term, &mut sender, &mut receiver, &mut client_term);
     }
 
     let server_text = server_term.screen_text();
@@ -278,13 +251,7 @@ fn ssp_render_scrollback_in_client_terminal() {
 
     // Phase 3: another scroll after non-scroll updates
     server_term.advance(b"\r\nmore output\r\nand more\r\nkeep going\r\nstill more\r\nfinal");
-    ssp_cycle(
-        &server_term,
-        &mut sender,
-        &mut receiver,
-        &mut client_term,
-        &mut prev_state,
-    );
+    ssp_cycle(&server_term, &mut sender, &mut receiver, &mut client_term);
 
     let server_text = server_term.screen_text();
     let client_text = client_term.screen_text();

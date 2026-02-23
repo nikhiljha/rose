@@ -490,36 +490,28 @@ async fn handle_server_session(conn: quinn::Connection, store: SessionStore) -> 
         }
     });
 
+    // Clone connection for clean close on shell exit
+    let close_conn = session.connection().clone();
+
     // Task: control messages (resize, goodbye) — returns PTY for detaching
     let terminal_ctrl = Arc::clone(&terminal);
-    let shell_exited = Arc::new(tokio::sync::Notify::new());
-    let shell_exited_ctrl = Arc::clone(&shell_exited);
     let control_task = tokio::spawn(async move {
         loop {
-            tokio::select! {
-                msg = session.recv_control() => {
-                    match msg {
-                        Ok(Some(ControlMessage::Resize { rows, cols })) => {
-                            tracing::info!(rows, cols, "resize");
-                            let _ = pty.resize(rows, cols);
-                            terminal_ctrl
-                                .lock()
-                                .expect("terminal lock poisoned")
-                                .resize(rows, cols);
-                        }
-                        Ok(Some(ControlMessage::Goodbye) | None) => break,
-                        Ok(Some(msg)) => {
-                            tracing::warn!(?msg, "unexpected control message");
-                        }
-                        Err(e) => {
-                            tracing::debug!("control stream ended: {e}");
-                            break;
-                        }
-                    }
+            match session.recv_control().await {
+                Ok(Some(ControlMessage::Resize { rows, cols })) => {
+                    tracing::info!(rows, cols, "resize");
+                    let _ = pty.resize(rows, cols);
+                    terminal_ctrl
+                        .lock()
+                        .expect("terminal lock poisoned")
+                        .resize(rows, cols);
                 }
-                () = shell_exited_ctrl.notified() => {
-                    tracing::info!("shell exited, sending Goodbye");
-                    let _ = session.send_control(&ControlMessage::Goodbye).await;
+                Ok(Some(ControlMessage::Goodbye) | None) => break,
+                Ok(Some(msg)) => {
+                    tracing::warn!(?msg, "unexpected control message");
+                }
+                Err(e) => {
+                    tracing::debug!("control stream ended: {e}");
                     break;
                 }
             }
@@ -528,46 +520,30 @@ async fn handle_server_session(conn: quinn::Connection, store: SessionStore) -> 
     });
 
     // Wait for any task to finish (connection lost or session ended)
-    enum SessionEnd {
-        ShellExited,
-        ClientDisconnected,
-        Detach(PtySession),
-    }
-
-    let end = tokio::select! {
-        _ = output_task => SessionEnd::ShellExited,
-        _ = input_task => SessionEnd::ClientDisconnected,
-        _ = scrollback_task => SessionEnd::ClientDisconnected,
+    tokio::select! {
+        _ = output_task => {
+            // Shell exited — close QUIC connection so client gets a clean signal
+            close_conn.close(0u32.into(), b"shell exited");
+        }
+        _ = input_task => {}
+        _ = scrollback_task => {}
         pty_result = control_task => {
-            match pty_result {
-                Ok(pty) => SessionEnd::Detach(pty),
-                Err(_) => SessionEnd::ClientDisconnected,
+            // Client sent Goodbye — detach session for reconnection
+            if let Ok(pty) = pty_result {
+                let _ = store.insert(
+                    session_id,
+                    DetachedSession {
+                        pty,
+                        terminal,
+                        ssp_sender,
+                        rows,
+                        cols,
+                    },
+                );
+                tracing::info!("session detached, awaiting reconnection");
             }
         }
     };
-
-    match end {
-        SessionEnd::ShellExited => {
-            // Notify control_task to send Goodbye, then wait for it
-            shell_exited.notify_one();
-            // Give the control task a moment to send Goodbye before dropping
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        SessionEnd::Detach(pty) => {
-            let _ = store.insert(
-                session_id,
-                DetachedSession {
-                    pty,
-                    terminal,
-                    ssp_sender,
-                    rows,
-                    cols,
-                },
-            );
-            tracing::info!("session detached, awaiting reconnection");
-        }
-        SessionEnd::ClientDisconnected => {}
-    }
 
     Ok(())
 }
@@ -753,10 +729,10 @@ async fn client_session_loop(
             let _ = stdout.flush();
         }
 
-        // Clear screen so SSP rendering starts clean
+        // Clear screen + scrollback so SSP rendering starts clean
         {
             let mut stdout = std::io::stdout();
-            let _ = stdout.write_all(b"\x1b[2J\x1b[H");
+            let _ = stdout.write_all(b"\x1b[3J\x1b[2J\x1b[H");
             let _ = stdout.flush();
         }
 
@@ -770,18 +746,23 @@ async fn client_session_loop(
         client_terminal
             .lock()
             .expect("client terminal lock poisoned")
-            .advance(b"\x1b[2J\x1b[H");
+            .advance(b"\x1b[3J\x1b[2J\x1b[H");
 
         // Task: receive SSP frames via datagrams → apply diff → render
         let output_conn = session.connection().clone();
         let recv_dgram = Arc::clone(&receiver);
         let client_dgram = Arc::clone(&client_terminal);
         let output_task = tokio::spawn(async move {
-            while let Ok(data) = output_conn.read_datagram().await {
-                let Ok(frame) = SspFrame::decode(&data) else {
-                    continue;
-                };
-                process_ssp_frame(&frame, &recv_dgram, &client_dgram, &output_conn);
+            loop {
+                match output_conn.read_datagram().await {
+                    Ok(data) => {
+                        let Ok(frame) = SspFrame::decode(&data) else {
+                            continue;
+                        };
+                        process_ssp_frame(&frame, &recv_dgram, &client_dgram, &output_conn);
+                    }
+                    Err(e) => return e,
+                }
             }
         });
 
@@ -989,24 +970,59 @@ async fn client_session_loop(
             false
         });
 
-        let user_disconnect = tokio::select! {
-            _ = output_task => false,
-            _ = stream_task => false,
-            result = input_task => result.unwrap_or(false),
-            result = control_task => result.unwrap_or(false),
-        };
-
-        if user_disconnect {
-            let mut stdout = std::io::stdout();
-            let _ = stdout.write_all(b"\r\n[RoSE: disconnected]\r\n");
-            let _ = stdout.flush();
-            break Ok(());
+        enum SessionExit {
+            ShellExited,
+            UserDisconnect,
+            ConnectionLost,
         }
 
-        // Connection lost — show message and retry
-        let mut stdout = std::io::stdout();
-        let _ = stdout.write_all(b"\r\n[RoSE: connection lost, reconnecting...]\r\n");
-        let _ = stdout.flush();
+        let exit = tokio::select! {
+            result = output_task => {
+                match result {
+                    Ok(quinn::ConnectionError::ApplicationClosed(ref close))
+                        if close.error_code == quinn::VarInt::from_u32(0) =>
+                    {
+                        SessionExit::ShellExited
+                    }
+                    _ => SessionExit::ConnectionLost,
+                }
+            },
+            _ = stream_task => SessionExit::ConnectionLost,
+            result = input_task => {
+                if result.unwrap_or(false) {
+                    SessionExit::UserDisconnect
+                } else {
+                    SessionExit::ConnectionLost
+                }
+            },
+            result = control_task => {
+                if result.unwrap_or(false) {
+                    SessionExit::UserDisconnect
+                } else {
+                    SessionExit::ConnectionLost
+                }
+            },
+        };
+
+        match exit {
+            SessionExit::ShellExited => {
+                let mut stdout = std::io::stdout();
+                let _ = stdout.write_all(b"\r\n[RoSE: shell exited]\r\n");
+                let _ = stdout.flush();
+                break Ok(());
+            }
+            SessionExit::UserDisconnect => {
+                let mut stdout = std::io::stdout();
+                let _ = stdout.write_all(b"\r\n[RoSE: disconnected]\r\n");
+                let _ = stdout.flush();
+                break Ok(());
+            }
+            SessionExit::ConnectionLost => {
+                let mut stdout = std::io::stdout();
+                let _ = stdout.write_all(b"\r\n[RoSE: connection lost, reconnecting...]\r\n");
+                let _ = stdout.flush();
+            }
+        }
     }
 }
 
