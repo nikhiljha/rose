@@ -872,17 +872,32 @@ async fn client_session_loop(
                     result = output_conn.read_datagram() => {
                         match result {
                             Ok(data) => {
-                                let Ok(frame) = SspFrame::decode(&data) else {
-                                    continue;
-                                };
-                                process_ssp_frame(
-                                    &frame,
-                                    &recv_dgram,
-                                    &client_dgram,
-                                    &output_conn,
-                                    &sb_rx_dgram,
-                                    &sb_count_dgram,
-                                );
+                                // Drain all queued datagrams and keep only the
+                                // newest frame (highest new_num). Each frame from
+                                // the server diffs from the last ACK'd state, so
+                                // a newer frame subsumes all older ones.
+                                let mut best = SspFrame::decode(&data).ok();
+                                while let Ok(Ok(more)) = tokio::time::timeout(
+                                    Duration::ZERO,
+                                    output_conn.read_datagram(),
+                                ).await {
+                                    if let Ok(frame) = SspFrame::decode(&more) {
+                                        match &best {
+                                            Some(b) if frame.new_num <= b.new_num => {}
+                                            _ => best = Some(frame),
+                                        }
+                                    }
+                                }
+                                if let Some(ref frame) = best {
+                                    process_ssp_frame(
+                                        frame,
+                                        &recv_dgram,
+                                        &client_dgram,
+                                        &output_conn,
+                                        &sb_rx_dgram,
+                                        &sb_count_dgram,
+                                    );
+                                }
                             }
                             Err(e) => return e,
                         }
