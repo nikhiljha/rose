@@ -176,64 +176,98 @@ fn keystroke_roundtrip(c: &mut Criterion) {
     });
 }
 
-/// Microbenchmark: terminal advance + snapshot (no network, no SSP).
+/// Fills a terminal with colorful ANSI content to simulate realistic screen
+/// state (colored compiler output, syntax-highlighted code, etc.).
+fn fill_with_ansi(term: &mut RoseTerminal, rows: u16, cols: u16) {
+    let colors = [31, 32, 33, 34, 35, 36, 91, 92, 93, 94, 95, 96];
+    for r in 0..rows {
+        let color = colors[r as usize % colors.len()];
+        // Mix of colored and plain text, bold, reset — typical compiler/editor output
+        let content: String = (0..cols)
+            .map(|c| {
+                if c % 20 == 0 {
+                    format!("\x1b[{color};1m")
+                } else if c % 20 == 10 {
+                    "\x1b[0m".to_string()
+                } else {
+                    String::from((b'A' + (c % 26) as u8) as char)
+                }
+            })
+            .collect();
+        term.advance(format!("{content}\r\n").as_bytes());
+    }
+}
+
+/// Microbenchmark: terminal advance + snapshot across terminal sizes.
 ///
 /// Isolates the wezterm terminal emulation cost: feeding raw bytes and
 /// extracting screen state with ANSI color information.
 fn terminal_pipeline(c: &mut Criterion) {
-    let mut term = RoseTerminal::new(24, 80);
-    // Pre-fill the terminal with realistic content
-    for i in 0..20 {
-        term.advance(format!("line {i}: some content here\r\n").as_bytes());
-    }
+    let sizes: &[(u16, u16, &str)] = &[
+        (24, 80, "24x80"),
+        (50, 120, "50x120"),
+        (200, 200, "200x200"),
+    ];
 
-    c.bench_function("terminal_advance_snapshot", |b| {
-        b.iter(|| {
-            term.advance(b"x");
-            term.snapshot()
+    let mut group = c.benchmark_group("terminal_advance_snapshot");
+    for &(rows, cols, label) in sizes {
+        let mut term = RoseTerminal::new(rows, cols);
+        fill_with_ansi(&mut term, rows, cols);
+
+        group.bench_function(label, |b| {
+            b.iter(|| {
+                term.advance(b"x");
+                term.snapshot()
+            });
         });
-    });
+    }
+    group.finish();
 }
 
-/// Microbenchmark: full SSP pipeline without network.
+/// Microbenchmark: full SSP pipeline without network, across terminal sizes.
 ///
 /// Measures: terminal advance -> snapshot -> `push_state` -> `generate_frame`
 /// -> encode -> decode -> `process_frame` -> `render_diff_ansi`. This is the
 /// pure computation cost per keystroke, excluding QUIC and PTY overhead.
 fn ssp_pipeline(c: &mut Criterion) {
-    let mut term = RoseTerminal::new(24, 80);
-    for i in 0..20 {
-        term.advance(format!("line {i}: some content here\r\n").as_bytes());
-    }
-    let mut sender = SspSender::new();
-    let initial = term.snapshot();
-    sender.push_state(initial);
-    sender.process_ack(1);
+    let sizes: &[(u16, u16, &str)] = &[
+        (24, 80, "24x80"),
+        (50, 120, "50x120"),
+        (200, 200, "200x200"),
+    ];
 
-    let mut receiver = SspReceiver::new(24);
-    let mut old_screen = ScreenState::empty(24);
+    let mut group = c.benchmark_group("ssp_diff_render_cycle");
+    for &(rows, cols, label) in sizes {
+        let mut term = RoseTerminal::new(rows, cols);
+        fill_with_ansi(&mut term, rows, cols);
 
-    c.bench_function("ssp_diff_render_cycle", |b| {
-        b.iter(|| {
-            // Simulate a keystroke changing the terminal
-            term.advance(b"x");
-            let snap = term.snapshot();
-            sender.push_state(snap);
-            let frame = sender.generate_frame().unwrap();
+        let mut sender = SspSender::new();
+        let initial = term.snapshot();
+        sender.push_state(initial);
+        sender.process_ack(1);
 
-            // Client side: encode -> decode -> apply -> render
-            let encoded = frame.encode();
-            let decoded = SspFrame::decode(&encoded).unwrap();
-            let _ = receiver.process_frame(&decoded);
-            let new_state = receiver.state().clone();
-            let _ansi = render_diff_ansi(&old_screen, &new_state);
+        let mut receiver = SspReceiver::new(rows);
+        let mut old_screen = ScreenState::empty(rows);
 
-            // Track client-side screen for incremental rendering
-            old_screen = new_state;
-            // ACK so sender can do incremental diff next time
-            sender.process_ack(receiver.ack_num());
+        group.bench_function(label, |b| {
+            b.iter(|| {
+                term.advance(b"x");
+                let snap = term.snapshot();
+                sender.push_state(snap);
+                let frame = sender.generate_frame().unwrap();
+
+                let encoded = frame.encode();
+                let decoded = SspFrame::decode(&encoded).unwrap();
+                let _ = receiver.process_frame(&decoded);
+                let new_state = receiver.state().clone();
+                let _ansi = render_diff_ansi(&old_screen, &new_state);
+
+                old_screen = new_state;
+                sender.process_ack(receiver.ack_num());
+            });
         });
-    });
+    }
+    group.finish();
 }
 
 criterion_group!(
