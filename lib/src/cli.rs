@@ -520,31 +520,38 @@ async fn handle_server_session(conn: quinn::Connection, store: SessionStore) -> 
         pty
     });
 
-    // Wait for any task to finish (connection lost or session ended)
-    tokio::select! {
-        _ = output_task => {
-            // Shell exited — close QUIC connection so client gets a clean signal
-            close_conn.close(0u32.into(), b"shell exited");
-        }
-        _ = input_task => {}
-        _ = scrollback_task => {}
-        pty_result = control_task => {
-            // Client sent Goodbye — detach session for reconnection
-            if let Ok(pty) = pty_result {
-                let _ = store.insert(
-                    session_id,
-                    DetachedSession {
-                        pty,
-                        terminal,
-                        ssp_sender,
-                        rows,
-                        cols,
-                    },
-                );
-                tracing::info!("session detached, awaiting reconnection");
-            }
-        }
+    // Wait for any task to finish (connection lost or session ended).
+    // Every exit path except shell exit detaches the session so the client
+    // can reconnect later — even if the network just dropped without a
+    // Goodbye. The control_task holds the PTY, so we keep its handle
+    // alive via `&mut` and await it afterwards to extract the PTY.
+    let mut control_task = control_task;
+    let shell_exited = tokio::select! {
+        _ = output_task => true,
+        _ = input_task => false,
+        _ = scrollback_task => false,
+        _ = &mut control_task => false,
     };
+
+    if shell_exited {
+        close_conn.close(0u32.into(), b"shell exited");
+    } else {
+        // Await control_task to get the PTY back for detaching.
+        // It will finish quickly since the connection is dead.
+        if let Ok(Ok(pty)) = tokio::time::timeout(Duration::from_secs(2), control_task).await {
+            let _ = store.insert(
+                session_id,
+                DetachedSession {
+                    pty,
+                    terminal,
+                    ssp_sender,
+                    rows,
+                    cols,
+                },
+            );
+            tracing::info!("session detached, awaiting reconnection");
+        }
+    }
 
     Ok(())
 }
