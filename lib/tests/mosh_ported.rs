@@ -1183,17 +1183,14 @@ mod ssh_bootstrap_helpers {
         child: &mut Box<dyn portable_pty::Child + Send + Sync>,
         timeout_secs: u64,
     ) -> Option<portable_pty::ExitStatus> {
-        tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs),
-            async {
-                loop {
-                    if let Ok(Some(status)) = child.try_wait() {
-                        return status;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async {
+            loop {
+                if let Ok(Some(status)) = child.try_wait() {
+                    return status;
                 }
-            },
-        )
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        })
         .await
         .ok()
     }

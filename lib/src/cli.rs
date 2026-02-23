@@ -293,8 +293,13 @@ async fn run_server(listen: SocketAddr, bootstrap: bool) -> anyhow::Result<()> {
     }
 
     loop {
-        let Some(conn) = server.accept().await? else {
-            break;
+        let conn = match server.accept().await {
+            Ok(Some(conn)) => conn,
+            Ok(None) => break,
+            Err(e) => {
+                tracing::warn!("accept failed: {e}");
+                continue;
+            }
         };
         let peer = conn.remote_address();
         tracing::info!(%peer, "new connection");
@@ -674,26 +679,34 @@ async fn handle_server_session(conn: quinn::Connection, store: SessionStore) -> 
     // Clone connection for clean close on shell exit
     let close_conn = session.connection().clone();
 
-    // Task: control messages (resize, goodbye) — returns PTY for detaching
+    // Task: control messages (resize, goodbye) — returns PTY for detaching.
+    // A shutdown signal lets us recover the PTY immediately when some other
+    // task ends first (e.g. abrupt client detach).
+    let (control_shutdown_tx, mut control_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let terminal_ctrl = Arc::clone(&terminal);
     let control_task = tokio::spawn(async move {
         loop {
-            match session.recv_control().await {
-                Ok(Some(ControlMessage::Resize { rows, cols })) => {
-                    tracing::info!(rows, cols, "resize");
-                    let _ = pty.resize(rows, cols);
-                    terminal_ctrl
-                        .lock()
-                        .expect("terminal lock poisoned")
-                        .resize(rows, cols);
-                }
-                Ok(Some(ControlMessage::Goodbye) | None) => break,
-                Ok(Some(msg)) => {
-                    tracing::warn!(?msg, "unexpected control message");
-                }
-                Err(e) => {
-                    tracing::debug!("control stream ended: {e}");
-                    break;
+            tokio::select! {
+                _ = &mut control_shutdown_rx => break,
+                msg = session.recv_control() => {
+                    match msg {
+                        Ok(Some(ControlMessage::Resize { rows, cols })) => {
+                            tracing::info!(rows, cols, "resize");
+                            let _ = pty.resize(rows, cols);
+                            terminal_ctrl
+                                .lock()
+                                .expect("terminal lock poisoned")
+                                .resize(rows, cols);
+                        }
+                        Ok(Some(ControlMessage::Goodbye) | None) => break,
+                        Ok(Some(msg)) => {
+                            tracing::warn!(?msg, "unexpected control message");
+                        }
+                        Err(e) => {
+                            tracing::debug!("control stream ended: {e}");
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -703,11 +716,9 @@ async fn handle_server_session(conn: quinn::Connection, store: SessionStore) -> 
     // Wait for any task to finish (connection lost or session ended).
     // Every exit path except shell exit detaches the session so the client
     // can reconnect later — even if the network just dropped without a
-    // Goodbye. The control_task holds the PTY, so we keep its handle
-    // alive via `&mut` and await it afterwards to extract the PTY.
-    // When control_task itself wins the race, we extract the PTY directly
-    // since a JoinHandle cannot be polled after completion.
+    // Goodbye.
     let mut control_task = control_task;
+    let mut control_shutdown_tx = Some(control_shutdown_tx);
     let shell_exited;
     let pty_from_control;
     tokio::select! {
@@ -729,25 +740,19 @@ async fn handle_server_session(conn: quinn::Connection, store: SessionStore) -> 
         },
     };
 
-    eprintln!("[RoSE server: select finished, shell_exited={shell_exited}]");
-
     if shell_exited {
         close_conn.close(0u32.into(), b"shell exited");
     } else {
-        // Get PTY for detaching: either already extracted from control_task
-        // (if it won the select race), or await it now (it will finish
-        // quickly since the connection is dead).
+        close_conn.close(0u32.into(), b"detaching session");
         let pty = match pty_from_control {
             Some(pty) => Some(pty),
             None => {
-                eprintln!("[RoSE server: waiting for control_task to finish...]");
-                tokio::time::timeout(Duration::from_secs(2), control_task)
-                    .await
-                    .ok()
-                    .and_then(Result::ok)
+                if let Some(tx) = control_shutdown_tx.take() {
+                    let _ = tx.send(());
+                }
+                control_task.await.ok()
             }
         };
-        eprintln!("[RoSE server: pty for detach: {}]", pty.is_some());
         if let Some(pty) = pty {
             let _ = store.insert(
                 session_id,
@@ -759,7 +764,6 @@ async fn handle_server_session(conn: quinn::Connection, store: SessionStore) -> 
                     cols,
                 },
             );
-            eprintln!("[RoSE server: session detached to store]");
         }
     }
 
@@ -1031,6 +1035,10 @@ async fn client_session_loop_inner(
         // If we have a pre-established connection (first iteration after
         // bootstrap), use it directly. Otherwise, create a fresh endpoint
         // so the UDP socket survives network interface changes.
+        // Keep the endpoint alive for the lifetime of this session iteration.
+        // Dropping `QuicClient` closes all connections on that endpoint.
+        let mut _live_client: Option<QuicClient> = None;
+
         let conn = if let Some(conn) = initial_conn.take() {
             backoff = Duration::from_millis(100);
             conn
@@ -1051,6 +1059,7 @@ async fn client_session_loop_inner(
                     match conn_result {
                         Ok(Ok(c)) => {
                             backoff = Duration::from_millis(100);
+                            _live_client = Some(client);
                             c
                         }
                         Ok(Err(e)) => {
@@ -1117,6 +1126,7 @@ async fn client_session_loop_inner(
             match conn_result {
                 Ok(Ok(c)) => {
                     backoff = Duration::from_millis(100);
+                    _live_client = Some(client);
                     c
                 }
                 Ok(Err(e)) => {
@@ -1565,10 +1575,7 @@ async fn client_session_loop_inner(
                     .as_bytes(),
                 );
                 let _ = stdout.flush();
-                // Exit immediately without dropping the QuicClient — a
-                // graceful close would send CONNECTION_CLOSE to the server,
-                // which would end the session instead of detaching it.
-                std::process::exit(0);
+                break Ok(());
             }
             SessionExit::ConnectionLost => {
                 tracing::debug!("connection lost, reconnecting");
