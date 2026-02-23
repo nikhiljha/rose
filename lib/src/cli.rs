@@ -649,20 +649,36 @@ async fn client_session_loop(
     let mut backoff = Duration::from_millis(100);
     let client = QuicClient::new()?;
 
+    // Long-lived stdin reader: sends crossterm events through a channel
+    // that survives across reconnection attempts, so the user can always
+    // type Enter~. to quit — even during backoff or connection attempts.
+    let (key_tx, key_rx) = tokio::sync::mpsc::unbounded_channel();
+    let key_rx = Arc::new(tokio::sync::Mutex::new(key_rx));
+    std::thread::spawn(move || {
+        while let Ok(event) = crossterm::event::read() {
+            if key_tx.send(event).is_err() {
+                break;
+            }
+        }
+    });
+
     loop {
-        let conn_result = if let Some(cc) = client_cert {
-            client
-                .connect_with_cert(addr, "localhost", cert_der, cc)
-                .await
-        } else {
-            client.connect(addr, "localhost", cert_der).await
-        };
+        let conn_result = tokio::time::timeout(Duration::from_secs(5), async {
+            if let Some(cc) = client_cert {
+                client
+                    .connect_with_cert(addr, "localhost", cert_der, cc)
+                    .await
+            } else {
+                client.connect(addr, "localhost", cert_der).await
+            }
+        })
+        .await;
         let conn = match conn_result {
-            Ok(c) => {
+            Ok(Ok(c)) => {
                 backoff = Duration::from_millis(100);
                 c
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 let mut stdout = std::io::stdout();
                 let _ = stdout.write_all(
                     format!(
@@ -671,7 +687,28 @@ async fn client_session_loop(
                     .as_bytes(),
                 );
                 let _ = stdout.flush();
-                tokio::time::sleep(backoff).await;
+                if wait_or_disconnect(&key_rx, backoff).await {
+                    let mut stdout = std::io::stdout();
+                    let _ = stdout.write_all(b"\r\n[RoSE: disconnected]\r\n");
+                    let _ = stdout.flush();
+                    break Ok(());
+                }
+                backoff = (backoff * 2).min(Duration::from_secs(5));
+                continue;
+            }
+            Err(_) => {
+                let mut stdout = std::io::stdout();
+                let _ = stdout.write_all(
+                    format!("\r\n[RoSE: connection timed out, reconnecting in {backoff:?}...]\r\n")
+                        .as_bytes(),
+                );
+                let _ = stdout.flush();
+                if wait_or_disconnect(&key_rx, backoff).await {
+                    let mut stdout = std::io::stdout();
+                    let _ = stdout.write_all(b"\r\n[RoSE: disconnected]\r\n");
+                    let _ = stdout.flush();
+                    break Ok(());
+                }
                 backoff = (backoff * 2).min(Duration::from_secs(5));
                 continue;
             }
@@ -685,11 +722,18 @@ async fn client_session_loop(
                 Err(e) => {
                     let mut stdout = std::io::stdout();
                     let _ = stdout.write_all(
-                        format!("\r\n[RoSE: reconnect handshake failed ({e}), retrying...]\r\n")
-                            .as_bytes(),
+                        format!(
+                            "\r\n[RoSE: reconnect handshake failed ({e}), retrying in {backoff:?}...]\r\n"
+                        )
+                        .as_bytes(),
                     );
                     let _ = stdout.flush();
-                    tokio::time::sleep(backoff).await;
+                    if wait_or_disconnect(&key_rx, backoff).await {
+                        let mut stdout = std::io::stdout();
+                        let _ = stdout.write_all(b"\r\n[RoSE: disconnected]\r\n");
+                        let _ = stdout.flush();
+                        break Ok(());
+                    }
                     backoff = (backoff * 2).min(Duration::from_secs(5));
                     continue;
                 }
@@ -698,19 +742,32 @@ async fn client_session_loop(
             ClientSession::connect(conn, rows, cols, env).await?
         };
 
-        // Read SessionInfo from server
-        match session.recv_control().await? {
-            Some(ControlMessage::SessionInfo {
+        // Read SessionInfo from server (with timeout to avoid hanging)
+        match tokio::time::timeout(Duration::from_secs(5), session.recv_control()).await {
+            Ok(Ok(Some(ControlMessage::SessionInfo {
                 version: _,
                 session_id: sid,
-            }) => {
+            }))) => {
                 session_id = Some(sid);
             }
-            Some(other) => {
+            Ok(Ok(Some(other))) => {
                 anyhow::bail!("expected SessionInfo, got {other:?}");
             }
-            None => {
-                anyhow::bail!("server closed control stream before SessionInfo");
+            Ok(Ok(None) | Err(_)) | Err(_) => {
+                let mut stdout = std::io::stdout();
+                let _ = stdout.write_all(
+                    format!("\r\n[RoSE: handshake timed out, retrying in {backoff:?}...]\r\n")
+                        .as_bytes(),
+                );
+                let _ = stdout.flush();
+                if wait_or_disconnect(&key_rx, backoff).await {
+                    let mut stdout = std::io::stdout();
+                    let _ = stdout.write_all(b"\r\n[RoSE: disconnected]\r\n");
+                    let _ = stdout.flush();
+                    break Ok(());
+                }
+                backoff = (backoff * 2).min(Duration::from_secs(5));
+                continue;
             }
         }
 
@@ -870,7 +927,10 @@ async fn client_session_loop(
 
         // Task: stdin → prefix with 0x00 → send input datagrams
         // Includes SSH-style escape sequence detection: Enter ~ .
+        // Reads from the long-lived stdin channel (not spawn_blocking)
+        // so the reader thread survives across reconnections.
         let input_conn = session.connection().clone();
+        let input_key_rx = Arc::clone(&key_rx);
         let input_task = tokio::spawn(async move {
             let mut escape = EscapeState::Normal;
 
@@ -883,9 +943,9 @@ async fn client_session_loop(
             }
 
             loop {
-                let event = tokio::task::spawn_blocking(crossterm::event::read).await;
+                let event = input_key_rx.lock().await.recv().await;
                 match event {
-                    Ok(Ok(Event::Key(key))) => {
+                    Some(Event::Key(key)) => {
                         let key_bytes = key_event_to_bytes(&key);
                         if key_bytes.is_empty() {
                             continue;
@@ -959,10 +1019,10 @@ async fn client_session_loop(
                             }
                         }
                     }
-                    Ok(Ok(Event::Resize(_, _))) => {
+                    Some(Event::Resize(_, _)) => {
                         // Resize handled separately below
                     }
-                    Ok(Err(_)) | Err(_) => break,
+                    None => break, // channel closed
                     _ => {}
                 }
             }
@@ -1175,6 +1235,54 @@ async fn resolve_ssh_hostname(host: &str) -> anyhow::Result<String> {
 
     // If ssh -G doesn't have a hostname field, fall back to the original
     Ok(host.to_string())
+}
+
+/// Waits for `duration` but returns early if the user types Enter~.
+///
+/// Used during reconnection backoff so the user can quit even when
+/// disconnected. Returns `true` if the user typed Enter~.
+///
+/// COVERAGE: CLI helper tested via integration/e2e tests.
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn wait_or_disconnect(
+    key_rx: &Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Event>>>,
+    duration: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + duration;
+    let mut escape = EscapeState::Normal;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        tokio::select! {
+            event = async { key_rx.lock().await.recv().await } => {
+                if let Some(Event::Key(key)) = event {
+                    match escape {
+                        EscapeState::Normal => {
+                            if key.code == KeyCode::Enter {
+                                escape = EscapeState::AfterEnter;
+                            }
+                        }
+                        EscapeState::AfterEnter => match key.code {
+                            KeyCode::Char('~') => escape = EscapeState::AfterTilde,
+                            KeyCode::Enter => {}
+                            _ => escape = EscapeState::Normal,
+                        },
+                        EscapeState::AfterTilde => {
+                            if key.code == KeyCode::Char('.') {
+                                return true;
+                            }
+                            escape = EscapeState::Normal;
+                        }
+                    }
+                }
+            }
+            () = tokio::time::sleep(remaining) => {
+                return false;
+            }
+        }
+    }
 }
 
 /// Performs a full terminal redraw (scrollback + visible) and resets the
