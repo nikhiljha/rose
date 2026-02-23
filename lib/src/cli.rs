@@ -66,6 +66,11 @@ enum Commands {
         /// SSH port to connect to (for `--ssh` mode). Defaults to SSH's own default (22).
         #[arg(long)]
         ssh_port: Option<u16>,
+
+        /// Extra options to pass to the SSH command (for `--ssh` mode).
+        /// Can be specified multiple times, e.g. `--ssh-option StrictHostKeyChecking=no`.
+        #[arg(long)]
+        ssh_option: Vec<String>,
     },
     /// Run the `RoSE` server daemon.
     Server {
@@ -115,9 +120,10 @@ pub async fn run() -> anyhow::Result<()> {
             server_binary,
             force_stun,
             ssh_port,
+            ssh_option,
         } => {
             if ssh {
-                run_ssh_bootstrap(&host, &server_binary, force_stun, ssh_port).await
+                run_ssh_bootstrap(&host, &server_binary, force_stun, ssh_port, &ssh_option).await
             } else {
                 run_client(&host, port, cert).await
             }
@@ -253,23 +259,36 @@ async fn run_server(listen: SocketAddr, bootstrap: bool, ephemeral: bool) -> any
         // The SSH connection that spawned us is killed by the client after
         // the bootstrap handshake — we don't depend on it staying alive.
 
-        // In bootstrap mode, watch stdin briefly for a STUN hole-punch request.
+        // In bootstrap mode, read commands from stdin (over SSH channel):
+        // - ROSE_STUN <ip> <port>: hole-punch request
+        // - ROSE_DETACH: detach from SSH session, reply with ROSE_DETACH_ACK
         if bootstrap {
             let punch_server = server.clone_for_punch();
             tokio::spawn(async move {
-                use tokio::io::AsyncBufReadExt;
-                let mut reader = tokio::io::BufReader::new(tokio::io::stdin());
-                let mut line = String::new();
-                match tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut line))
-                    .await
-                {
-                    Ok(Ok(n)) if n > 0 => {
-                        if let Ok(client_addr) = parse_stun_line(line.trim()) {
-                            tracing::info!(%client_addr, "STUN hole-punch requested");
-                            punch_server.punch_hole(client_addr);
+                use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+                let stdin = tokio::io::stdin();
+                let mut stdout = tokio::io::stdout();
+                let mut reader = tokio::io::BufReader::new(stdin);
+                loop {
+                    let mut line = String::new();
+                    match tokio::time::timeout(Duration::from_secs(30), reader.read_line(&mut line))
+                        .await
+                    {
+                        Ok(Ok(n)) if n > 0 => {
+                            let trimmed = line.trim();
+                            if let Ok(client_addr) = parse_stun_line(trimmed) {
+                                tracing::info!(%client_addr, "STUN hole-punch requested");
+                                punch_server.punch_hole(client_addr);
+                            } else if trimmed == "ROSE_DETACH" {
+                                tracing::info!("detach requested — daemonizing");
+                                detach_from_parent();
+                                let _ = stdout.write_all(b"ROSE_DETACH_ACK\n").await;
+                                let _ = stdout.flush().await;
+                                break;
+                            }
                         }
+                        _ => break, // Timeout or EOF
                     }
-                    _ => {}
                 }
             });
         }
@@ -644,17 +663,6 @@ async fn handle_server_session(conn: quinn::Connection, store: SessionStore) -> 
                         .expect("terminal lock poisoned")
                         .resize(rows, cols);
                 }
-                Ok(Some(ControlMessage::Detach)) => {
-                    tracing::info!("detach requested — daemonizing");
-                    detach_from_parent();
-                    if session
-                        .send_control(&ControlMessage::DetachAck)
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
                 Ok(Some(ControlMessage::Goodbye) | None) => break,
                 Ok(Some(msg)) => {
                     tracing::warn!(?msg, "unexpected control message");
@@ -813,14 +821,6 @@ async fn run_client(host: &str, port: u16, cert_path: Option<PathBuf>) -> anyhow
     client_session_loop(addr, &cert_der, None).await
 }
 
-/// Result of the SSH bootstrap handshake, before entering the session loop.
-enum SessionSetup {
-    /// Direct QUIC connection succeeded.
-    WithConn(quinn::Connection),
-    /// STUN hole-punch succeeded — use this client (preserves NAT mapping).
-    WithClient(QuicClient),
-}
-
 /// Marker that STUN was used for the initial connection.
 ///
 /// When present in the reconnection loop, each reconnect attempt redoes
@@ -841,7 +841,7 @@ async fn client_session_loop(
     cert_der: &rustls::pki_types::CertificateDer<'static>,
     client_cert: Option<&CertKeyPair>,
 ) -> anyhow::Result<()> {
-    client_session_loop_inner(addr, cert_der, client_cert, None, None, None).await
+    client_session_loop_inner(addr, cert_der, client_cert, None, None).await
 }
 
 /// Like [`client_session_loop`] but uses a pre-established connection for the
@@ -854,17 +854,8 @@ async fn client_session_loop_with_conn(
     addr: SocketAddr,
     cert_der: &rustls::pki_types::CertificateDer<'static>,
     client_cert: Option<&CertKeyPair>,
-    ssh_process: Option<tokio::process::Child>,
 ) -> anyhow::Result<()> {
-    client_session_loop_inner(
-        addr,
-        cert_der,
-        client_cert,
-        Some(first_conn),
-        None,
-        ssh_process,
-    )
-    .await
+    client_session_loop_inner(addr, cert_der, client_cert, Some(first_conn), None).await
 }
 
 /// Like [`client_session_loop`] but uses a pre-created [`QuicClient`] for the
@@ -878,7 +869,6 @@ async fn client_session_loop_with_client(
     cert_der: &rustls::pki_types::CertificateDer<'static>,
     client_cert: Option<&CertKeyPair>,
     stun_ctx: StunReconnectContext,
-    ssh_process: Option<tokio::process::Child>,
 ) -> anyhow::Result<()> {
     let conn = if let Some(cc) = client_cert {
         first_client
@@ -887,15 +877,7 @@ async fn client_session_loop_with_client(
     } else {
         first_client.connect(addr, "localhost", cert_der).await?
     };
-    client_session_loop_inner(
-        addr,
-        cert_der,
-        client_cert,
-        Some(conn),
-        Some(stun_ctx),
-        ssh_process,
-    )
-    .await
+    client_session_loop_inner(addr, cert_der, client_cert, Some(conn), Some(stun_ctx)).await
 }
 
 /// Performs STUN discovery for reconnection, returning a [`QuicClient`]
@@ -933,7 +915,6 @@ async fn client_session_loop_inner(
     client_cert: Option<&CertKeyPair>,
     first_conn: Option<quinn::Connection>,
     stun_ctx: Option<StunReconnectContext>,
-    mut ssh_process: Option<tokio::process::Child>,
 ) -> anyhow::Result<()> {
     let mut session_id: Option<[u8; 16]> = None;
     let mut backoff = Duration::from_millis(100);
@@ -1136,25 +1117,6 @@ async fn client_session_loop_inner(
                 backoff = (backoff * 2).min(Duration::from_secs(5));
                 continue;
             }
-        }
-
-        // On first connect with an SSH process, ask the server to detach
-        // from SSH, then kill the SSH process. This allows the QUIC session
-        // to survive independently and support roaming.
-        if let Some(mut ssh) = ssh_process.take() {
-            session
-                .send_control(&ControlMessage::Detach)
-                .await
-                .map_err(|e| anyhow::anyhow!("failed to send Detach: {e}"))?;
-            match tokio::time::timeout(Duration::from_secs(5), session.recv_control()).await {
-                Ok(Ok(Some(ControlMessage::DetachAck))) => {
-                    tracing::info!("server detached — killing SSH");
-                }
-                other => {
-                    tracing::warn!("expected DetachAck, got {other:?}");
-                }
-            }
-            let _ = ssh.kill().await;
         }
 
         if session_id.is_some() && backoff > Duration::from_millis(100) {
@@ -1531,6 +1493,7 @@ async fn run_ssh_bootstrap(
     server_binary: &str,
     force_stun: bool,
     ssh_port: Option<u16>,
+    ssh_options: &[String],
 ) -> anyhow::Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
@@ -1542,6 +1505,9 @@ async fn run_ssh_bootstrap(
     let mut cmd = tokio::process::Command::new("ssh");
     if let Some(port) = ssh_port {
         cmd.arg("-p").arg(port.to_string());
+    }
+    for opt in ssh_options {
+        cmd.arg("-o").arg(opt);
     }
     let mut ssh = cmd
         .arg(host)
@@ -1645,18 +1611,14 @@ async fn run_ssh_bootstrap(
         None => true, // --force-stun
     };
 
-    // Enter raw mode before the session loop
-    terminal::enable_raw_mode()?;
-    let _raw_guard = RawModeGuard;
-
-    let result: anyhow::Result<SessionSetup> = if use_stun {
+    // If STUN is needed, send ROSE_STUN to the server over SSH stdin.
+    let stun_socket = if use_stun {
         eprintln!("[RoSE: direct UDP failed, trying STUN hole-punch...]");
 
         match stun_handle.await {
             Ok(Ok((stun_socket, public_addr))) => {
                 eprintln!("[RoSE: STUN discovered {public_addr}]");
 
-                // Tell server our public address so it can punch a hole
                 let stun_msg = format!("ROSE_STUN {} {}\n", public_addr.ip(), public_addr.port());
                 if let Some(stdin) = ssh.stdin.as_mut() {
                     let _ = stdin.write_all(stun_msg.as_bytes()).await;
@@ -1671,9 +1633,7 @@ async fn run_ssh_bootstrap(
                      consider forwarding UDP 60000-61000]"
                 );
 
-                // Create QUIC client from the STUN socket (preserves NAT mapping)
-                let client = QuicClient::from_socket(stun_socket)?;
-                Ok(SessionSetup::WithClient(client))
+                Some(stun_socket)
             }
             Ok(Err(e)) => {
                 eprintln!("[RoSE: STUN discovery failed: {e}]");
@@ -1684,35 +1644,49 @@ async fn run_ssh_bootstrap(
             }
         }
     } else {
-        // Safety: use_stun is false only when direct_result is Some(Ok(Ok(_))).
-        let conn = direct_result.unwrap().unwrap().unwrap();
-        Ok(SessionSetup::WithConn(conn))
+        None
     };
 
-    // Pass SSH process to the session loop — it will send Detach,
-    // wait for DetachAck, then kill SSH before starting the session.
-    match result? {
-        SessionSetup::WithConn(conn) => {
-            client_session_loop_with_conn(
-                conn,
-                addr,
-                &server_cert_der,
-                Some(&client_cert),
-                Some(ssh),
-            )
-            .await
+    // Ask the server to detach from SSH, then kill SSH.
+    // After this, the server runs independently and supports roaming.
+    {
+        let stdin = ssh
+            .stdin
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("lost SSH stdin handle"))?;
+        stdin.write_all(b"ROSE_DETACH\n").await?;
+        stdin.flush().await?;
+    }
+    let mut ack_line = String::new();
+    match tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut ack_line)).await {
+        Ok(Ok(n)) if n > 0 && ack_line.trim() == "ROSE_DETACH_ACK" => {
+            tracing::info!("server detached from SSH session");
         }
-        SessionSetup::WithClient(client) => {
-            client_session_loop_with_client(
-                client,
-                addr,
-                &server_cert_der,
-                Some(&client_cert),
-                StunReconnectContext {},
-                Some(ssh),
-            )
-            .await
+        other => {
+            tracing::warn!("expected ROSE_DETACH_ACK, got {other:?}: {ack_line:?}");
         }
+    }
+    let _ = ssh.kill().await;
+
+    // Enter raw mode and start the session loop
+    terminal::enable_raw_mode()?;
+    let _raw_guard = RawModeGuard;
+
+    if let Some(stun_socket) = stun_socket {
+        let client = QuicClient::from_socket(stun_socket)?;
+        client_session_loop_with_client(
+            client,
+            addr,
+            &server_cert_der,
+            Some(&client_cert),
+            StunReconnectContext {},
+        )
+        .await
+    } else if let Some(Ok(Ok(conn))) = direct_result {
+        client_session_loop_with_conn(conn, addr, &server_cert_der, Some(&client_cert)).await
+    } else {
+        // Direct failed but STUN wasn't available — already bailed above
+        unreachable!()
     }
 }
 

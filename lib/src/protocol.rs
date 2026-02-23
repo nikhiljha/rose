@@ -78,12 +78,6 @@ pub enum ControlMessage {
         /// Unique session identifier.
         session_id: [u8; 16],
     },
-    /// Client requests the server to detach from its parent process
-    /// (SSH session). Used during SSH bootstrap so the server survives
-    /// when the client kills SSH after the handshake.
-    Detach,
-    /// Server confirms it has detached from the parent process.
-    DetachAck,
 }
 
 // Wire format constants
@@ -92,8 +86,6 @@ const MSG_RESIZE: u8 = 2;
 const MSG_GOODBYE: u8 = 3;
 const MSG_RECONNECT: u8 = 4;
 const MSG_SESSION_INFO: u8 = 5;
-const MSG_DETACH: u8 = 6;
-const MSG_DETACH_ACK: u8 = 7;
 
 /// Encodes a list of key-value pairs as `[num: u16][key_len: u16][key][val_len: u16][val]...`.
 fn encode_env_vars(vars: &[(String, String)], buf: &mut Vec<u8>) {
@@ -204,8 +196,6 @@ impl ControlMessage {
                 buf.extend_from_slice(session_id);
                 buf
             }
-            Self::Detach => vec![MSG_DETACH],
-            Self::DetachAck => vec![MSG_DETACH_ACK],
         }
     }
 
@@ -280,8 +270,6 @@ impl ControlMessage {
                     session_id,
                 })
             }
-            MSG_DETACH => Ok(Self::Detach),
-            MSG_DETACH_ACK => Ok(Self::DetachAck),
             other => Err(ProtocolError::InvalidMessage(format!(
                 "unknown message type: {other}"
             ))),

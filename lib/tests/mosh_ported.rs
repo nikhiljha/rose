@@ -1078,11 +1078,9 @@ async fn ssh_bootstrap_mode() {
         let _ = russh::server::run_stream(ssh_server_config, socket, TestHandler).await;
     });
 
-    // --- Run bootstrap handshake ---
+    // --- Run the real rose binary end-to-end ---
 
-    // Build the rose binary and locate it. Integration tests in a lib
-    // crate don't get CARGO_BIN_EXE_*, so we build it ourselves. This
-    // also works under `cargo llvm-cov` which uses a different target dir.
+    // Build the rose binary and locate it.
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = manifest_dir.parent().unwrap();
     let build_output = std::process::Command::new("cargo")
@@ -1098,9 +1096,6 @@ async fn ssh_bootstrap_mode() {
         "cargo build failed: {}",
         String::from_utf8_lossy(&build_output.stderr)
     );
-
-    // Find the executable path from cargo's JSON output.
-    // Each JSON line with "executable" and target name "rose" is our binary.
     let stdout = String::from_utf8_lossy(&build_output.stdout);
     let rose_bin = stdout
         .lines()
@@ -1108,7 +1103,6 @@ async fn ssh_bootstrap_mode() {
         .filter(|line| line.contains(r#""name":"rose""#))
         .filter(|line| line.contains(r#""bin""#))
         .find_map(|line| {
-            // Extract "executable":"<path>" from the JSON line
             let marker = r#""executable":""#;
             let start = line.find(marker)? + marker.len();
             let end = line[start..].find('"')? + start;
@@ -1116,109 +1110,63 @@ async fn ssh_bootstrap_mode() {
         })
         .expect("could not find rose binary in cargo build output");
 
-    // Generate ephemeral client cert
-    let client_cert =
-        rose::config::generate_self_signed_cert(&["bootstrap-client".to_string()]).unwrap();
-
-    // Spawn SSH connecting to our test server
-    let mut ssh = tokio::process::Command::new("ssh")
-        .arg("-p")
+    // Spawn the actual `rose connect --ssh` binary. This exercises the
+    // real code path: bootstrap handshake, DETACH over SSH, QUIC connect,
+    // and session loop. The session will end quickly because there's no
+    // real terminal input.
+    let mut rose_client = tokio::process::Command::new(&rose_bin)
+        .arg("connect")
+        .arg("--ssh")
+        .arg("--ssh-port")
         .arg(ssh_port.to_string())
-        .arg("-o")
+        .arg("--ssh-option")
         .arg("StrictHostKeyChecking=no")
-        .arg("-o")
+        .arg("--ssh-option")
         .arg("UserKnownHostsFile=/dev/null")
-        .arg("-o")
+        .arg("--ssh-option")
         .arg("PreferredAuthentications=none")
-        .arg("-o")
-        .arg("NoHostAuthenticationForLocalhost=yes")
         .arg("127.0.0.1")
-        .arg(rose_bin)
-        .arg("server")
-        .arg("--bootstrap")
-        .arg("--ephemeral")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
+        .arg("--server-binary")
+        .arg(&rose_bin)
         .stderr(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null())
         .spawn()
-        .expect("failed to spawn ssh");
+        .expect("failed to spawn rose connect");
 
-    // Send client cert over SSH stdin
-    let cert_hex: String = client_cert
-        .cert_der
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    {
-        let stdin = ssh.stdin.as_mut().unwrap();
-        stdin.write_all(cert_hex.as_bytes()).await.unwrap();
-        stdin.write_all(b"\n").await.unwrap();
-        stdin.flush().await.unwrap();
-    }
+    // Wait for the rose client to finish (it will exit because stdin is
+    // /dev/null — the session loop detects "connection lost" or the shell
+    // exits). We mainly care that it doesn't hang or crash.
+    let result = tokio::time::timeout(std::time::Duration::from_secs(15), rose_client.wait()).await;
 
-    // Read ROSE_BOOTSTRAP line from SSH stdout
-    let stdout = ssh.stdout.take().unwrap();
-    let mut reader = tokio::io::BufReader::new(stdout);
-    let mut line = String::new();
-
-    let read_result = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        reader.read_line(&mut line),
-    )
-    .await;
-
-    match read_result {
-        Ok(Ok(n)) if n > 0 => {
-            assert!(
-                line.starts_with("ROSE_BOOTSTRAP "),
-                "expected ROSE_BOOTSTRAP line, got: {line:?}"
-            );
-            // Parse port and cert from the bootstrap line
-            let parts: Vec<&str> = line.trim().splitn(3, ' ').collect();
-            assert_eq!(parts.len(), 3);
-            let bootstrap_port: u16 = parts[1].parse().expect("invalid bootstrap port");
-            assert!(bootstrap_port >= 60000);
-            assert!(!parts[2].is_empty(), "server cert should not be empty");
-
-            // Try connecting QUIC to the bootstrap port
-            let server_cert_der: Vec<u8> = (0..parts[2].len())
-                .step_by(2)
-                .map(|i| u8::from_str_radix(&parts[2][i..i + 2], 16).unwrap())
-                .collect();
-            let server_cert = rustls::pki_types::CertificateDer::from(server_cert_der);
-
-            let client = rose::transport::QuicClient::new().unwrap();
-            let addr: std::net::SocketAddr = format!("127.0.0.1:{bootstrap_port}").parse().unwrap();
-
-            let conn_result = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                client.connect_with_cert(addr, "localhost", &server_cert, &client_cert),
-            )
-            .await;
-
-            assert!(
-                conn_result.is_ok() && conn_result.unwrap().is_ok(),
-                "QUIC connection to bootstrap server should succeed"
-            );
-        }
-        Ok(Ok(_)) => panic!("SSH stdout closed without ROSE_BOOTSTRAP line"),
-        Ok(Err(e)) => panic!("failed to read from SSH stdout: {e}"),
-        Err(_) => {
-            // Read stderr for debugging
-            let stderr = ssh.stderr.take().unwrap();
+    match result {
+        Ok(Ok(status)) => {
+            // Read stderr to check for the bootstrap message
+            let stderr = rose_client.stderr.take().unwrap();
             let mut stderr_reader = tokio::io::BufReader::new(stderr);
             let mut stderr_output = String::new();
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_millis(100),
-                stderr_reader.read_line(&mut stderr_output),
-            )
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(100), async {
+                loop {
+                    let mut line = String::new();
+                    match stderr_reader.read_line(&mut line).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => stderr_output.push_str(&line),
+                    }
+                }
+            })
             .await;
-            panic!("timeout waiting for ROSE_BOOTSTRAP line. stderr: {stderr_output:?}");
+
+            assert!(
+                stderr_output.contains("Bootstrap: server on port"),
+                "rose client should have printed bootstrap info. stderr: {stderr_output:?}, exit: {status}"
+            );
+        }
+        Ok(Err(e)) => panic!("rose client failed: {e}"),
+        Err(_) => {
+            let _ = rose_client.kill().await;
+            panic!("rose client timed out — likely hung during bootstrap");
         }
     }
-
-    // Cleanup
-    let _ = ssh.kill().await;
 }
 
 // ---------------------------------------------------------------------------

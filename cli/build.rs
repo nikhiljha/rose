@@ -42,6 +42,10 @@ enum Commands {
         /// SSH port to connect to (for `--ssh` mode). Defaults to SSH's own default (22).
         #[arg(long)]
         ssh_port: Option<u16>,
+
+        /// Extra options to pass to the SSH command (for `--ssh` mode).
+        #[arg(long)]
+        ssh_option: Vec<String>,
     },
     /// Run the `RoSE` server daemon.
     Server {
