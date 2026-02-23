@@ -1549,6 +1549,7 @@ async fn run_ssh_bootstrap(
         Ok::<_, anyhow::Error>((socket, public_addr))
     });
 
+    eprintln!("[RoSE debug: attempting direct QUIC to {addr}]");
     // Try direct QUIC connection first (3s timeout), unless --force-stun
     let direct_result = if force_stun {
         eprintln!("[RoSE: --force-stun: skipping direct attempt]");
@@ -1566,13 +1567,16 @@ async fn run_ssh_bootstrap(
     };
 
     let use_stun = match &direct_result {
-        Some(Ok(Ok(_))) => false,
+        Some(Ok(Ok(_))) => {
+            eprintln!("[RoSE debug: direct QUIC succeeded]");
+            false
+        }
         Some(Ok(Err(e))) => {
-            tracing::debug!("direct connection failed: {e}");
+            eprintln!("[RoSE debug: direct QUIC failed: {e}]");
             true
         }
         Some(Err(_)) => {
-            tracing::debug!("direct connection timed out");
+            eprintln!("[RoSE debug: direct QUIC timed out]");
             true
         }
         None => true, // --force-stun
@@ -1614,9 +1618,10 @@ async fn run_ssh_bootstrap(
         None
     };
 
-    // Kill SSH — the server already ignored SIGHUP at startup (like nohup),
-    // so it will survive.
+    // Kill SSH — nohup keeps the server alive.
+    eprintln!("[RoSE debug: killing SSH, use_stun={use_stun}]");
     let _ = ssh.kill().await;
+    eprintln!("[RoSE debug: SSH killed]");
 
     // Enter raw mode and start the session loop
     terminal::enable_raw_mode()?;
@@ -1633,6 +1638,7 @@ async fn run_ssh_bootstrap(
         )
         .await
     } else if let Some(Ok(Ok(conn))) = direct_result {
+        eprintln!("[RoSE debug: entering session loop with direct conn]");
         client_session_loop_with_conn(conn, addr, &server_cert_der, Some(&client_cert)).await
     } else {
         // Direct failed but STUN wasn't available — already bailed above
