@@ -385,4 +385,22 @@ mod tests {
         let result = server.accept().await.unwrap();
         assert!(result.is_none());
     }
+
+    #[tokio::test]
+    async fn punch_hole_sends_packets() {
+        let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        // Punch toward a dummy address — the connection will fail but
+        // the function should not panic.
+        server.punch_hole("127.0.0.1:1".parse().unwrap());
+        // Give the spawned task time to execute
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    #[tokio::test]
+    async fn punch_handle_sends_packets() {
+        let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let handle = server.clone_for_punch();
+        handle.punch_hole("127.0.0.1:1".parse().unwrap());
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }

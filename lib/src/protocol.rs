@@ -1001,6 +1001,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accept_rejects_reconnect() {
+        // ServerSession::accept expects Hello only — Reconnect should be rejected
+        let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = server.local_addr().unwrap();
+        let cert = server.server_cert_der().clone();
+        let client = QuicClient::new().unwrap();
+
+        let accept = tokio::spawn({
+            let endpoint = server.endpoint.clone();
+            async move {
+                let incoming = endpoint.accept().await.unwrap();
+                let conn = incoming.await.unwrap();
+                ServerSession::accept(conn).await
+            }
+        });
+        let client_conn = client.connect(addr, "localhost", &cert).await.unwrap();
+
+        // Send a Reconnect with correct version — valid for accept_any but not accept
+        let (mut send, _recv) = client_conn.open_bi().await.unwrap();
+        let reconnect = ControlMessage::Reconnect {
+            version: PROTOCOL_VERSION,
+            rows: 24,
+            cols: 80,
+            session_id: [0u8; 16],
+            env_vars: vec![],
+        };
+        write_control(&mut send, &reconnect).await.unwrap();
+
+        let result = accept.await.unwrap();
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn accept_any_stream_closed_before_handshake() {
+        // accept_any should return error when stream closes before any message
+        let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = server.local_addr().unwrap();
+        let cert = server.server_cert_der().clone();
+        let client = QuicClient::new().unwrap();
+
+        let accept = tokio::spawn({
+            let endpoint = server.endpoint.clone();
+            async move {
+                let incoming = endpoint.accept().await.unwrap();
+                let conn = incoming.await.unwrap();
+                ServerSession::accept_any(conn).await
+            }
+        });
+        let client_conn = client.connect(addr, "localhost", &cert).await.unwrap();
+
+        // Open bi-stream and immediately close it — no message sent
+        let (mut send, _recv) = client_conn.open_bi().await.unwrap();
+        send.finish().unwrap();
+
+        let result = accept.await.unwrap();
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn client_session_connection_accessor() {
+        let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = server.local_addr().unwrap();
+        let cert = server.server_cert_der().clone();
+        let client = QuicClient::new().unwrap();
+
+        let accept = tokio::spawn({
+            let endpoint = server.endpoint.clone();
+            async move {
+                let incoming = endpoint.accept().await.unwrap();
+                incoming.await.unwrap()
+            }
+        });
+        let client_conn = client.connect(addr, "localhost", &cert).await.unwrap();
+        let _server_conn = accept.await.unwrap();
+
+        let session = ClientSession::connect(client_conn, 24, 80, vec![])
+            .await
+            .unwrap();
+        // connection() should return a reference to the underlying connection
+        assert_eq!(session.connection().remote_address(), addr);
+    }
+
+    #[tokio::test]
     async fn accept_any_non_hello_non_reconnect_rejected() {
         // ServerSession::accept_any should reject non-Hello/Reconnect messages
         let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();

@@ -180,13 +180,27 @@ fn parse_mapped_address(value: &[u8]) -> Option<SocketAddrV4> {
 /// [`StunError::Io`] on network errors.
 ///
 pub fn stun_discover(socket: &UdpSocket) -> Result<SocketAddr, StunError> {
+    stun_discover_from(socket, STUN_SERVERS)
+}
+
+/// Like [`stun_discover`] but accepts a custom list of STUN server addresses.
+///
+/// Used internally so tests can point at a local fake STUN server.
+///
+/// # Errors
+///
+/// Returns [`StunError::NoResponse`] if no server responds.
+pub(crate) fn stun_discover_from(
+    socket: &UdpSocket,
+    servers: &[&str],
+) -> Result<SocketAddr, StunError> {
     let txn_id = random_txn_id();
     let request = build_binding_request(&txn_id);
 
     // Set a per-attempt timeout
     socket.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
 
-    for server in STUN_SERVERS {
+    for server in servers {
         let Some(addr) = server.to_socket_addrs().ok().and_then(|mut a| a.next()) else {
             continue;
         };
@@ -446,5 +460,170 @@ mod tests {
     fn parse_mapped_short_value() {
         let value = [0x00, FAMILY_IPV4, 0x00, 0x00];
         assert!(parse_mapped_address(&value).is_none());
+    }
+
+    /// Spawns a local UDP server that responds with a crafted STUN Binding
+    /// Response, then calls `stun_discover_from` against it.
+    #[test]
+    fn stun_discover_from_local_server() {
+        let fake_server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server_addr = fake_server.local_addr().unwrap();
+        let server_str = server_addr.to_string();
+
+        // Spawn a thread that reads one request and sends a valid response
+        let handle = std::thread::spawn(move || {
+            let mut buf = [0u8; 64];
+            let (n, client_addr) = fake_server.recv_from(&mut buf).unwrap();
+            assert_eq!(n, 20); // STUN Binding Request is 20 bytes
+
+            // Extract transaction ID from request
+            let txn_id: [u8; 12] = buf[8..20].try_into().unwrap();
+
+            // Build a response with XOR-MAPPED-ADDRESS
+            let mapped_ip = std::net::Ipv4Addr::new(203, 0, 113, 42);
+            let mapped_port: u16 = 54321;
+
+            let xor_port = mapped_port ^ (MAGIC_COOKIE >> 16) as u16;
+            let cookie_bytes = MAGIC_COOKIE.to_be_bytes();
+            let ip_octets = mapped_ip.octets();
+            let xor_ip = [
+                ip_octets[0] ^ cookie_bytes[0],
+                ip_octets[1] ^ cookie_bytes[1],
+                ip_octets[2] ^ cookie_bytes[2],
+                ip_octets[3] ^ cookie_bytes[3],
+            ];
+
+            let mut response = Vec::new();
+            response.extend_from_slice(&BINDING_RESPONSE.to_be_bytes());
+            response.extend_from_slice(&12u16.to_be_bytes());
+            response.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
+            response.extend_from_slice(&txn_id);
+            response.extend_from_slice(&ATTR_XOR_MAPPED_ADDRESS.to_be_bytes());
+            response.extend_from_slice(&8u16.to_be_bytes());
+            response.push(0x00);
+            response.push(FAMILY_IPV4);
+            response.extend_from_slice(&xor_port.to_be_bytes());
+            response.extend_from_slice(&xor_ip);
+
+            fake_server.send_to(&response, client_addr).unwrap();
+        });
+
+        let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let result = stun_discover_from(&client, &[&server_str]);
+        handle.join().unwrap();
+
+        let addr = result.unwrap();
+        assert_eq!(addr, "203.0.113.42:54321".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn stun_discover_no_servers_respond() {
+        let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        // Point at a server that won't respond (bind but don't read)
+        let dead_server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dead_addr = dead_server.local_addr().unwrap().to_string();
+        // Set a very short timeout so the test doesn't take 2s per server
+        client
+            .set_read_timeout(Some(std::time::Duration::from_millis(50)))
+            .unwrap();
+        let result = stun_discover_from(&client, &[&dead_addr]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn stun_discover_invalid_server_name() {
+        let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        // DNS name that won't resolve
+        let result = stun_discover_from(&client, &["this.host.definitely.does.not.exist:19302"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn stun_discover_bad_response_tries_next() {
+        // First server sends garbage, second sends valid response
+        let bad_server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let bad_addr = bad_server.local_addr().unwrap().to_string();
+        let good_server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let good_addr = good_server.local_addr().unwrap().to_string();
+
+        let handle = std::thread::spawn(move || {
+            // Bad server: respond with garbage
+            let mut buf = [0u8; 64];
+            let (_, client_addr) = bad_server.recv_from(&mut buf).unwrap();
+            bad_server
+                .send_to(b"not a stun response", client_addr)
+                .unwrap();
+
+            // Good server: respond with valid STUN
+            let (_, client_addr) = good_server.recv_from(&mut buf).unwrap();
+            let txn_id: [u8; 12] = buf[8..20].try_into().unwrap();
+
+            let mapped_port: u16 = 9999;
+            let xor_port = mapped_port ^ (MAGIC_COOKIE >> 16) as u16;
+            let cookie_bytes = MAGIC_COOKIE.to_be_bytes();
+            let xor_ip = [
+                10 ^ cookie_bytes[0],
+                cookie_bytes[1],
+                cookie_bytes[2],
+                1 ^ cookie_bytes[3],
+            ];
+
+            let mut response = Vec::new();
+            response.extend_from_slice(&BINDING_RESPONSE.to_be_bytes());
+            response.extend_from_slice(&12u16.to_be_bytes());
+            response.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
+            response.extend_from_slice(&txn_id);
+            response.extend_from_slice(&ATTR_XOR_MAPPED_ADDRESS.to_be_bytes());
+            response.extend_from_slice(&8u16.to_be_bytes());
+            response.push(0x00);
+            response.push(FAMILY_IPV4);
+            response.extend_from_slice(&xor_port.to_be_bytes());
+            response.extend_from_slice(&xor_ip);
+
+            good_server.send_to(&response, client_addr).unwrap();
+        });
+
+        let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let result = stun_discover_from(&client, &[&bad_addr, &good_addr]);
+        handle.join().unwrap();
+
+        let addr = result.unwrap();
+        assert_eq!(addr, "10.0.0.1:9999".parse::<SocketAddr>().unwrap());
+    }
+
+    /// Tests the MAPPED-ADDRESS fallback when XOR-MAPPED-ADDRESS is absent.
+    #[test]
+    fn stun_discover_mapped_address_fallback() {
+        let fake_server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server_addr = fake_server.local_addr().unwrap();
+        let server_str = server_addr.to_string();
+
+        let handle = std::thread::spawn(move || {
+            let mut buf = [0u8; 64];
+            let (_, client_addr) = fake_server.recv_from(&mut buf).unwrap();
+            let txn_id: [u8; 12] = buf[8..20].try_into().unwrap();
+
+            // Respond with MAPPED-ADDRESS only (no XOR)
+            let mut response = Vec::new();
+            response.extend_from_slice(&BINDING_RESPONSE.to_be_bytes());
+            response.extend_from_slice(&12u16.to_be_bytes());
+            response.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
+            response.extend_from_slice(&txn_id);
+            response.extend_from_slice(&ATTR_MAPPED_ADDRESS.to_be_bytes());
+            response.extend_from_slice(&8u16.to_be_bytes());
+            response.push(0x00);
+            response.push(FAMILY_IPV4);
+            response.extend_from_slice(&8080u16.to_be_bytes());
+            response.extend_from_slice(&[192, 168, 1, 100]);
+
+            fake_server.send_to(&response, client_addr).unwrap();
+        });
+
+        let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let result = stun_discover_from(&client, &[&server_str]);
+        handle.join().unwrap();
+
+        let addr = result.unwrap();
+        assert_eq!(addr, "192.168.1.100:8080".parse::<SocketAddr>().unwrap());
     }
 }
