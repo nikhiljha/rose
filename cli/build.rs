@@ -46,6 +46,10 @@ enum Commands {
         /// Extra options to pass to the SSH command (for `--ssh` mode).
         #[arg(long)]
         ssh_option: Vec<String>,
+
+        /// Path to a client certificate for mutual TLS (DER format).
+        #[arg(long)]
+        client_cert: Option<PathBuf>,
     },
     /// Run the `RoSE` server daemon.
     Server {

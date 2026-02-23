@@ -71,6 +71,11 @@ enum Commands {
         /// Can be specified multiple times, e.g. `--ssh-option StrictHostKeyChecking=no`.
         #[arg(long)]
         ssh_option: Vec<String>,
+
+        /// Path to a client certificate for mutual TLS (PEM format).
+        /// Used for reattaching to a bootstrapped session after detach.
+        #[arg(long)]
+        client_cert: Option<PathBuf>,
     },
     /// Run the `RoSE` server daemon.
     Server {
@@ -121,11 +126,12 @@ pub async fn run() -> anyhow::Result<()> {
             force_stun,
             ssh_port,
             ssh_option,
+            client_cert,
         } => {
             if ssh {
                 run_ssh_bootstrap(&host, &server_binary, force_stun, ssh_port, &ssh_option).await
             } else {
-                run_client(&host, port, cert).await
+                run_client(&host, port, cert, client_cert).await
             }
         }
         Commands::Server {
@@ -181,7 +187,26 @@ async fn run_server(listen: SocketAddr, bootstrap: bool, ephemeral: bool) -> any
             .map_err(|e| anyhow::anyhow!("failed to read client cert from stdin: {e}"))?;
         let client_cert_der = hex_decode(client_cert_hex.trim())?;
 
-        let server_cert = config::generate_self_signed_cert(&["localhost".to_string()])?;
+        // Use persistent server cert (same as native mode).
+        let paths = RosePaths::resolve();
+        std::fs::create_dir_all(&paths.config_dir)?;
+        let cert_path = paths.config_dir.join("server.crt");
+        let key_path = paths.config_dir.join("server.key");
+        let server_cert = if cert_path.exists() && key_path.exists() {
+            let cert_der_bytes = std::fs::read(&cert_path)?;
+            let key_der = std::fs::read(&key_path)?;
+            CertKeyPair {
+                cert_pem: String::new(),
+                key_pem: String::new(),
+                cert_der: rustls::pki_types::CertificateDer::from(cert_der_bytes),
+                key_der,
+            }
+        } else {
+            let cert = config::generate_self_signed_cert(&["localhost".to_string()])?;
+            std::fs::write(&cert_path, cert.cert_der.as_ref())?;
+            std::fs::write(&key_path, &cert.key_der)?;
+            cert
+        };
 
         // Write the client cert to a temp dir for mutual TLS authorization
         let auth_dir = std::env::temp_dir().join(format!("rose-bootstrap-{}", std::process::id()));
@@ -309,6 +334,46 @@ async fn run_server(listen: SocketAddr, bootstrap: bool, ephemeral: bool) -> any
     }
 
     Ok(())
+}
+
+/// Loads the persistent client certificate from `~/.config/rose/`, or
+/// generates one if it doesn't exist yet. The same cert is used for all
+/// connection modes (native, bootstrap, reattach).
+///
+/// Cert and key are stored as DER files alongside the PEM files that
+/// `rose keygen` generates.
+///
+/// COVERAGE: CLI helper tested via integration/e2e tests.
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn load_or_generate_client_cert() -> anyhow::Result<CertKeyPair> {
+    let paths = RosePaths::resolve();
+    std::fs::create_dir_all(&paths.config_dir)?;
+    let cert_der_path = paths.config_dir.join("client.crt.der");
+    let key_der_path = paths.config_dir.join("client.key.der");
+
+    if cert_der_path.exists() && key_der_path.exists() {
+        let cert_der_bytes = std::fs::read(&cert_der_path)?;
+        let key_der = std::fs::read(&key_der_path)?;
+        Ok(CertKeyPair {
+            cert_pem: String::new(),
+            key_pem: String::new(),
+            cert_der: rustls::pki_types::CertificateDer::from(cert_der_bytes),
+            key_der,
+        })
+    } else {
+        let cert = config::generate_self_signed_cert(&["localhost".to_string()])?;
+        // Save DER for fast loading
+        std::fs::write(&cert_der_path, cert.cert_der.as_ref())?;
+        std::fs::write(&key_der_path, &cert.key_der)?;
+        // Also save PEM for human readability / interop
+        std::fs::write(paths.config_dir.join("client.crt"), &cert.cert_pem)?;
+        std::fs::write(paths.config_dir.join("client.key"), &cert.key_pem)?;
+        eprintln!(
+            "Generated client certificate at {}",
+            cert_der_path.display()
+        );
+        Ok(cert)
+    }
 }
 
 /// Generates a pseudo-random u16 for port selection.
@@ -753,7 +818,12 @@ fn collect_env_vars() -> Vec<(String, String)> {
 
 /// COVERAGE: CLI client loop is tested via integration/e2e tests.
 #[cfg_attr(coverage_nightly, coverage(off))]
-async fn run_client(host: &str, port: u16, cert_path: Option<PathBuf>) -> anyhow::Result<()> {
+async fn run_client(
+    host: &str,
+    port: u16,
+    cert_path: Option<PathBuf>,
+    client_cert_path: Option<PathBuf>,
+) -> anyhow::Result<()> {
     // Load server certificate
     let cert_path = cert_path.unwrap_or_else(|| {
         let paths = RosePaths::resolve();
@@ -766,6 +836,39 @@ async fn run_client(host: &str, port: u16, cert_path: Option<PathBuf>) -> anyhow
         )
     })?;
     let cert_der = rustls::pki_types::CertificateDer::from(cert_der);
+
+    // Load client cert for mutual TLS if specified, or auto-load if
+    // the persistent client cert exists (for reattaching to bootstrap sessions).
+    let client_cert = if let Some(ref path) = client_cert_path {
+        let cert_der_bytes = std::fs::read(path)?;
+        let key_path = path.with_extension("key.der");
+        let key_der = std::fs::read(&key_path).map_err(|e| {
+            anyhow::anyhow!("failed to read client key at {}: {e}", key_path.display())
+        })?;
+        Some(CertKeyPair {
+            cert_pem: String::new(),
+            key_pem: String::new(),
+            cert_der: rustls::pki_types::CertificateDer::from(cert_der_bytes),
+            key_der,
+        })
+    } else {
+        // Auto-detect: if persistent client cert exists, use it for mutual TLS
+        let paths = RosePaths::resolve();
+        let auto_cert = paths.config_dir.join("client.crt.der");
+        let auto_key = paths.config_dir.join("client.key.der");
+        if auto_cert.exists() && auto_key.exists() {
+            let cert_der_bytes = std::fs::read(&auto_cert)?;
+            let key_der = std::fs::read(&auto_key)?;
+            Some(CertKeyPair {
+                cert_pem: String::new(),
+                key_pem: String::new(),
+                cert_der: rustls::pki_types::CertificateDer::from(cert_der_bytes),
+                key_der,
+            })
+        } else {
+            None
+        }
+    };
 
     let addr: SocketAddr = format!("{host}:{port}").parse().unwrap_or_else(|_| {
         // If host isn't a direct IP, try resolving
@@ -784,7 +887,7 @@ async fn run_client(host: &str, port: u16, cert_path: Option<PathBuf>) -> anyhow
     terminal::enable_raw_mode()?;
     let _raw_guard = RawModeGuard;
 
-    client_session_loop(addr, &cert_der, None).await
+    client_session_loop(addr, &cert_der, client_cert.as_ref()).await
 }
 
 /// Marker that STUN was used for the initial connection.
@@ -1491,8 +1594,9 @@ async fn run_ssh_bootstrap(
 ) -> anyhow::Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
-    // Generate ephemeral client cert — private key stays local
-    let client_cert = config::generate_self_signed_cert(&["bootstrap-client".to_string()])?;
+    // Load or generate persistent client cert from ~/.config/rose/.
+    // The same cert is used for all connections (bootstrap, native, reattach).
+    let client_cert = load_or_generate_client_cert()?;
 
     eprintln!("Starting SSH bootstrap to {host}...");
 
@@ -1567,6 +1671,14 @@ async fn run_ssh_bootstrap(
                 )
             })?
     };
+
+    // Save server cert to known_hosts so direct reconnection (reattach) works.
+    let paths = RosePaths::resolve();
+    std::fs::create_dir_all(&paths.known_hosts_dir)?;
+    std::fs::write(
+        paths.known_hosts_dir.join(format!("{}.crt", addr.ip())),
+        server_cert_der.as_ref(),
+    )?;
 
     // Start STUN discovery in parallel with direct connect attempt.
     // If direct succeeds, we discard the STUN result. If direct fails,
@@ -1879,14 +1991,23 @@ fn run_keygen() -> anyhow::Result<()> {
 
     let cert = config::generate_self_signed_cert(&["localhost".to_string()])?;
 
-    let cert_path = paths.config_dir.join("client.crt");
-    let key_path = paths.config_dir.join("client.key");
+    // Save PEM (human readable) and DER (fast loading)
+    std::fs::write(paths.config_dir.join("client.crt"), &cert.cert_pem)?;
+    std::fs::write(paths.config_dir.join("client.key"), &cert.key_pem)?;
+    std::fs::write(
+        paths.config_dir.join("client.crt.der"),
+        cert.cert_der.as_ref(),
+    )?;
+    std::fs::write(paths.config_dir.join("client.key.der"), &cert.key_der)?;
 
-    std::fs::write(&cert_path, &cert.cert_pem)?;
-    std::fs::write(&key_path, &cert.key_pem)?;
-
-    eprintln!("Certificate: {}", cert_path.display());
-    eprintln!("Private key: {}", key_path.display());
+    eprintln!(
+        "Certificate: {}",
+        paths.config_dir.join("client.crt").display()
+    );
+    eprintln!(
+        "Private key: {}",
+        paths.config_dir.join("client.key").display()
+    );
 
     Ok(())
 }
