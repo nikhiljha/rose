@@ -25,6 +25,7 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 wezterm-term = { git = "https://github.com/wezterm/wezterm", branch = "main", version = "0.1.0" }
 
 [dev-dependencies]
+base64 = "0.22.1"
 bytes = "1.11.1"
 criterion.workspace = true
 insta.workspace = true
