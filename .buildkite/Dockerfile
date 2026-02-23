@@ -22,7 +22,8 @@ RUN cargo install --locked cargo-nextest \
 RUN curl -sL https://github.com/getzola/zola/releases/download/v0.22.1/zola-v0.22.1-x86_64-unknown-linux-gnu.tar.gz \
     | tar xz -C /usr/local/bin
 
-# Node (for wrangler)
+# Node + wrangler
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && npm install -g wrangler

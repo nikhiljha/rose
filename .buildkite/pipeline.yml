@@ -23,17 +23,10 @@ steps:
               image: "ghcr.io/nikhiljha/rose-ci:latest"
               mount-checkout: true
 
-      - label: ":test_tube: Test"
-        commands:
-          - cargo nextest run --all --no-fail-fast
-          - cargo test --workspace --doc
-        plugins:
-          - docker#v5.11.0:
-              image: "ghcr.io/nikhiljha/rose-ci:latest"
-              mount-checkout: true
-
       - label: ":bar_chart: Coverage"
-        command: cargo +nightly llvm-cov-easy nextest --workspace --branch
+        commands:
+          - cargo +nightly llvm-cov-easy nextest --workspace --branch
+          - cargo test --workspace --doc
         plugins:
           - docker#v5.11.0:
               image: "ghcr.io/nikhiljha/rose-ci:latest"
@@ -54,7 +47,7 @@ steps:
         if: build.branch == "main" && build.pull_request.id == null
         commands:
           - bash site/build.sh
-          - npx wrangler pages deploy site/public --project-name=rose --branch=main
+          - wrangler pages deploy site/public --project-name=rose --branch=main
         plugins:
           - docker#v5.11.0:
               image: "ghcr.io/nikhiljha/rose-ci:latest"
