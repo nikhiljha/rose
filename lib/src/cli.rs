@@ -306,15 +306,26 @@ async fn run_server(listen: SocketAddr, bootstrap: bool, ephemeral: bool) -> any
             });
         }
 
-        let Some(conn) = server.accept().await? else {
-            return Ok(());
-        };
-        let peer = conn.remote_address();
-        tracing::info!(%peer, "bootstrap connection");
+        // Accept connections in a loop: the initial connection and any
+        // reconnections after detach. Exit when the shell exits (store
+        // is empty after handle_server_session returns).
+        loop {
+            let Some(conn) = server.accept().await? else {
+                break;
+            };
+            let peer = conn.remote_address();
+            tracing::info!(%peer, "connection");
 
-        let session_result = handle_server_session(conn, store).await;
-        if let Err(e) = session_result {
-            tracing::error!(%peer, "session error: {e}");
+            let session_result = handle_server_session(conn, store.clone()).await;
+            if let Err(e) = session_result {
+                tracing::error!(%peer, "session error: {e}");
+            }
+
+            // If no detached sessions remain, the shell exited — stop.
+            if store.is_empty() {
+                break;
+            }
+            tracing::info!("session detached, waiting for reconnection");
         }
     } else {
         loop {
@@ -1551,6 +1562,8 @@ async fn client_session_loop_inner(
                 break Ok(());
             }
             SessionExit::UserDetach => {
+                // Restore terminal mode before printing
+                let _ = terminal::disable_raw_mode();
                 let mut stdout = std::io::stdout();
                 let _ = stdout.write_all(
                     format!(
@@ -1562,7 +1575,10 @@ async fn client_session_loop_inner(
                     .as_bytes(),
                 );
                 let _ = stdout.flush();
-                break Ok(());
+                // Exit immediately without dropping the QuicClient — a
+                // graceful close would send CONNECTION_CLOSE to the server,
+                // which would end the session instead of detaching it.
+                std::process::exit(0);
             }
             SessionExit::ConnectionLost => {
                 tracing::debug!("connection lost, reconnecting");
