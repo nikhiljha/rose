@@ -7,6 +7,8 @@
 
 use std::collections::VecDeque;
 
+use crate::scrollback::ScrollbackLine;
+
 /// Errors in the SSP layer.
 #[derive(Debug, thiserror::Error)]
 pub enum SspError {
@@ -567,6 +569,59 @@ pub fn render_diff_ansi(old: &ScreenState, new: &ScreenState) -> Vec<u8> {
     buf
 }
 
+/// Generates ANSI output for a full terminal redraw including scrollback.
+///
+/// Wraps output in synchronized-output markers to prevent flicker.
+/// Clears the terminal's screen and scrollback buffer, prints all scrollback
+/// lines (which naturally scroll into the terminal's native scrollback as
+/// more content is printed), then renders the visible screen state and
+/// positions the cursor.
+///
+/// Used when scrollback changes, the terminal resizes, or the client
+/// reconnects — cases where incremental [`render_diff_ansi`] is insufficient.
+// TODO: use terminal-specific scrollback editing OSCs (e.g., kitty's)
+// for smarter partial updates instead of full clear-and-redraw.
+#[must_use]
+pub fn render_full_redraw(scrollback: &[ScrollbackLine], visible: &ScreenState) -> Vec<u8> {
+    let mut buf = Vec::new();
+
+    // Begin synchronized output (prevents flicker during redraw)
+    buf.extend_from_slice(b"\x1b[?2026h");
+
+    // Clear scrollback + screen + cursor home
+    buf.extend_from_slice(b"\x1b[3J\x1b[2J\x1b[H");
+
+    // Print scrollback lines — they naturally scroll off the top into the
+    // terminal's native scrollback buffer as more content is printed below
+    for line in scrollback {
+        buf.extend_from_slice(line.text.as_bytes());
+        buf.extend_from_slice(b"\r\n");
+    }
+
+    // Flush any remaining scrollback lines off the visible area by emitting
+    // enough newlines to push them all into the scrollback buffer
+    if !scrollback.is_empty() {
+        let visible_rows = visible.rows.len();
+        buf.extend(std::iter::repeat_n(b'\n', visible_rows));
+    }
+
+    // Render visible rows with absolute positioning
+    for (i, row) in visible.rows.iter().enumerate() {
+        buf.extend_from_slice(format!("\x1b[{};1H\x1b[0m\x1b[2K", i + 1).as_bytes());
+        buf.extend_from_slice(row.as_bytes());
+    }
+
+    // Position cursor at final location (1-indexed)
+    buf.extend_from_slice(
+        format!("\x1b[{};{}H", visible.cursor_y + 1, visible.cursor_x + 1).as_bytes(),
+    );
+
+    // End synchronized output
+    buf.extend_from_slice(b"\x1b[?2026l");
+
+    buf
+}
+
 /// Client-side keystroke predictor.
 ///
 /// Maintains a local terminal emulator that processes keystrokes immediately,
@@ -1097,6 +1152,116 @@ mod tests {
         let s = String::from_utf8(ansi).unwrap();
         // No row changes, but cursor should be positioned at (0, 4) → CSI 1;5 H
         assert!(s.contains("\x1b[1;5H"));
+    }
+
+    // -- Full redraw -----------------------------------------------------------
+
+    #[test]
+    fn render_full_redraw_no_scrollback() {
+        let state = ScreenState {
+            rows: vec!["hello".into(), "world".into()],
+            cursor_x: 5,
+            cursor_y: 0,
+        };
+        let ansi = render_full_redraw(&[], &state);
+        let s = String::from_utf8(ansi).unwrap();
+
+        // Synchronized output markers
+        assert!(s.starts_with("\x1b[?2026h"));
+        assert!(s.ends_with("\x1b[?2026l"));
+
+        // Clear sequence
+        assert!(s.contains("\x1b[3J\x1b[2J\x1b[H"));
+
+        // No extra newlines when there's no scrollback
+        let clear_end = s.find("\x1b[H").unwrap() + 3;
+        let first_row = s.find("\x1b[1;1H").unwrap();
+        assert_eq!(
+            &s[clear_end..first_row],
+            "",
+            "no newlines between clear and first row when no scrollback"
+        );
+
+        // Visible rows rendered
+        assert!(s.contains("hello"));
+        assert!(s.contains("world"));
+
+        // Cursor positioned
+        assert!(s.contains("\x1b[1;6H"));
+    }
+
+    #[test]
+    fn render_full_redraw_with_scrollback() {
+        use crate::scrollback::ScrollbackLine;
+
+        let scrollback = vec![
+            ScrollbackLine {
+                stable_row: 0,
+                text: "sb line 0".into(),
+            },
+            ScrollbackLine {
+                stable_row: 1,
+                text: "sb line 1".into(),
+            },
+            ScrollbackLine {
+                stable_row: 2,
+                text: "sb line 2".into(),
+            },
+        ];
+        let state = ScreenState {
+            rows: vec!["visible A".into(), "visible B".into()],
+            cursor_x: 3,
+            cursor_y: 1,
+        };
+        let ansi = render_full_redraw(&scrollback, &state);
+        let s = String::from_utf8(ansi).unwrap();
+
+        // Sync markers
+        assert!(s.starts_with("\x1b[?2026h"));
+        assert!(s.ends_with("\x1b[?2026l"));
+
+        // Scrollback lines present in order
+        let pos0 = s.find("sb line 0\r\n").unwrap();
+        let pos1 = s.find("sb line 1\r\n").unwrap();
+        let pos2 = s.find("sb line 2\r\n").unwrap();
+        assert!(pos0 < pos1);
+        assert!(pos1 < pos2);
+
+        // Flush newlines present (2 for 2 visible rows)
+        let after_sb = pos2 + "sb line 2\r\n".len();
+        let flush_region = &s[after_sb..s.find("\x1b[1;1H").unwrap()];
+        assert_eq!(flush_region.matches('\n').count(), 2);
+
+        // Visible rows rendered
+        assert!(s.contains("visible A"));
+        assert!(s.contains("visible B"));
+
+        // Cursor at (3, 1) → CSI 2;4H
+        assert!(s.contains("\x1b[2;4H"));
+    }
+
+    #[test]
+    fn render_full_redraw_scrollback_text_preserved() {
+        use crate::scrollback::ScrollbackLine;
+
+        let scrollback = vec![
+            ScrollbackLine {
+                stable_row: 0,
+                text: "$ ls -la".into(),
+            },
+            ScrollbackLine {
+                stable_row: 1,
+                text: "total 42".into(),
+            },
+        ];
+        let state = ScreenState::empty(3);
+        let ansi = render_full_redraw(&scrollback, &state);
+        let s = String::from_utf8(ansi).unwrap();
+
+        assert!(s.contains("$ ls -la\r\n"));
+        assert!(s.contains("total 42\r\n"));
+        // Order preserved
+        assert!(s.find("$ ls -la").unwrap() < s.find("total 42").unwrap());
     }
 
     // -- Wire format edge cases -----------------------------------------------

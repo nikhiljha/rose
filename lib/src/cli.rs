@@ -22,6 +22,7 @@ use crate::scrollback::{self, ScrollbackLine, ScrollbackReceiver, ScrollbackSend
 use crate::session::{DetachedSession, SessionStore};
 use crate::ssp::{
     DATAGRAM_KEYSTROKE, DATAGRAM_SSP_ACK, SspFrame, SspReceiver, SspSender, render_diff_ansi,
+    render_full_redraw,
 };
 use crate::terminal::RoseTerminal;
 use crate::transport::{QuicClient, QuicServer};
@@ -748,10 +749,16 @@ async fn client_session_loop(
             .expect("client terminal lock poisoned")
             .advance(b"\x1b[3J\x1b[2J\x1b[H");
 
+        // Scrollback state shared between stream reader and SSP renderer
+        let scrollback_rx = Arc::new(Mutex::new(ScrollbackReceiver::new()));
+        let rendered_sb_count = Arc::new(Mutex::new(0usize));
+
         // Task: receive SSP frames via datagrams → apply diff → render
         let output_conn = session.connection().clone();
         let recv_dgram = Arc::clone(&receiver);
         let client_dgram = Arc::clone(&client_terminal);
+        let sb_rx_dgram = Arc::clone(&scrollback_rx);
+        let sb_count_dgram = Arc::clone(&rendered_sb_count);
         let output_task = tokio::spawn(async move {
             loop {
                 match output_conn.read_datagram().await {
@@ -759,7 +766,14 @@ async fn client_session_loop(
                         let Ok(frame) = SspFrame::decode(&data) else {
                             continue;
                         };
-                        process_ssp_frame(&frame, &recv_dgram, &client_dgram, &output_conn);
+                        process_ssp_frame(
+                            &frame,
+                            &recv_dgram,
+                            &client_dgram,
+                            &output_conn,
+                            &sb_rx_dgram,
+                            &sb_count_dgram,
+                        );
                     }
                     Err(e) => return e,
                 }
@@ -770,7 +784,8 @@ async fn client_session_loop(
         let stream_conn = session.connection().clone();
         let recv_stream = Arc::clone(&receiver);
         let client_stream = Arc::clone(&client_terminal);
-        let scrollback_rx = Arc::new(Mutex::new(ScrollbackReceiver::new()));
+        let sb_rx_stream = Arc::clone(&scrollback_rx);
+        let sb_count_stream = Arc::clone(&rendered_sb_count);
         let stream_task = tokio::spawn(async move {
             while let Ok(mut uni) = stream_conn.accept_uni().await {
                 // Read type prefix byte
@@ -794,6 +809,8 @@ async fn client_session_loop(
                                         &recv_stream,
                                         &client_stream,
                                         &stream_conn,
+                                        &sb_rx_stream,
+                                        &sb_count_stream,
                                     );
                                 }
                             }
@@ -1149,10 +1166,9 @@ async fn resolve_ssh_hostname(host: &str) -> anyhow::Result<String> {
 ///
 /// Shared by both the datagram and stream receive paths.
 ///
-/// Diffs the new SSP state against the client terminal's actual content
-/// (not the previous network state) to generate correct ANSI output.
-/// The client terminal is then advanced with the same ANSI, keeping it
-/// in sync with what's on the user's screen.
+/// Uses incremental diff when only the visible screen changed, or a full
+/// redraw (with scrollback) when scrollback lines arrived, the terminal
+/// resized, or the client reconnected.
 ///
 /// COVERAGE: CLI helper tested via integration/e2e tests.
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -1161,19 +1177,68 @@ fn process_ssp_frame(
     receiver: &Arc<Mutex<SspReceiver>>,
     client_term: &Arc<Mutex<RoseTerminal>>,
     conn: &quinn::Connection,
+    scrollback_rx: &Arc<Mutex<ScrollbackReceiver>>,
+    rendered_sb_count: &Arc<Mutex<usize>>,
 ) {
     let mut recv = receiver.lock().expect("receiver lock poisoned");
     match recv.process_frame(frame) {
         Ok(Some(_)) => {
             let new_state = recv.state().clone();
             let mut term = client_term.lock().expect("client terminal lock poisoned");
-            let client_state = term.snapshot();
-            let ansi = render_diff_ansi(&client_state, &new_state);
-            let mut out = std::io::stdout();
-            let _ = out.write_all(&ansi);
-            let _ = out.flush();
-            // Advance client terminal with same ANSI so it tracks what's on screen
-            term.advance(&ansi);
+
+            // Determine if a full redraw is needed
+            let sb = scrollback_rx.lock().expect("scrollback lock poisoned");
+            let mut count = rendered_sb_count
+                .lock()
+                .expect("rendered count lock poisoned");
+            let needs_full_redraw = sb.len() != *count || new_state.rows.len() != term.size().0;
+
+            let ansi = if needs_full_redraw {
+                let ansi = render_full_redraw(sb.lines(), &new_state);
+                *count = sb.len();
+                drop(sb);
+                drop(count);
+
+                let mut out = std::io::stdout();
+                let _ = out.write_all(&ansi);
+                let _ = out.flush();
+
+                // Reset client terminal to match the new visible state.
+                // We can't advance() with the full redraw ANSI because it
+                // contains clear-scrollback + scrollback dumps that would
+                // confuse the wezterm emulator.
+                let cols = terminal::size().map_or(80, |(c, _)| c);
+                let rows = new_state.rows.len() as u16;
+                *term = RoseTerminal::new(rows, cols);
+                for (i, row) in new_state.rows.iter().enumerate() {
+                    if !row.is_empty() {
+                        term.advance(format!("\x1b[{};1H{row}", i + 1).as_bytes());
+                    }
+                }
+                term.advance(
+                    format!(
+                        "\x1b[{};{}H",
+                        new_state.cursor_y + 1,
+                        new_state.cursor_x + 1
+                    )
+                    .as_bytes(),
+                );
+
+                ansi
+            } else {
+                drop(sb);
+                drop(count);
+
+                let client_state = term.snapshot();
+                let ansi = render_diff_ansi(&client_state, &new_state);
+                let mut out = std::io::stdout();
+                let _ = out.write_all(&ansi);
+                let _ = out.flush();
+                // Advance client terminal with same ANSI so it tracks what's on screen
+                term.advance(&ansi);
+                ansi
+            };
+            drop(ansi);
 
             // Send ACK back to server
             let ack = SspFrame::ack_only(recv.ack_num());
