@@ -168,14 +168,6 @@ fn send_ssp_frame(frame: &SspFrame, conn: &quinn::Connection) -> bool {
 /// COVERAGE: CLI server loop is tested via integration/e2e tests.
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn run_server(listen: SocketAddr, bootstrap: bool, ephemeral: bool) -> anyhow::Result<()> {
-    // In bootstrap mode, immediately ignore SIGHUP so the server survives
-    // when the SSH session that spawned it ends. This must happen before
-    // any I/O — OpenSSH may kill the process at any time after the channel
-    // closes. Like nohup, we set the handler up front.
-    if bootstrap {
-        detach_from_parent();
-    }
-
     let server = if bootstrap {
         // Bootstrap mode: read the client's public cert from stdin (sent by the client
         // over the authenticated SSH channel), then bind with mutual TLS requiring it.
@@ -317,28 +309,6 @@ async fn run_server(listen: SocketAddr, bootstrap: bool, ephemeral: bool) -> any
     }
 
     Ok(())
-}
-
-/// Detaches the server process from its parent (SSH session).
-///
-/// Calls `setsid()` to create a new session and ignores `SIGHUP` so
-/// the process survives when the SSH session that spawned it ends.
-///
-/// COVERAGE: Only exercised in bootstrap mode via SSH; tested via
-/// the `ssh_bootstrap_mode` integration test.
-#[cfg_attr(coverage_nightly, coverage(off))]
-fn detach_from_parent() {
-    #[cfg(unix)]
-    {
-        use nix::sys::signal::{SigHandler, Signal, signal};
-        use nix::unistd::setsid;
-        let _ = setsid();
-        // nix::sys::signal::signal() requires unsafe because POSIX signal
-        // handlers have strict requirements. SigIgn is always safe — it
-        // just tells the kernel to discard the signal.
-        #[allow(unsafe_code)]
-        let _ = unsafe { signal(Signal::SIGHUP, SigHandler::SigIgn) };
-    }
 }
 
 /// Generates a pseudo-random u16 for port selection.
@@ -1507,6 +1477,7 @@ async fn run_ssh_bootstrap(
     }
     let mut ssh = cmd
         .arg(host)
+        .arg("nohup")
         .arg(server_binary)
         .arg("server")
         .arg("--bootstrap")
