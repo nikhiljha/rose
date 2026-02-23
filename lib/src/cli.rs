@@ -492,51 +492,81 @@ async fn handle_server_session(conn: quinn::Connection, store: SessionStore) -> 
 
     // Task: control messages (resize, goodbye) — returns PTY for detaching
     let terminal_ctrl = Arc::clone(&terminal);
+    let shell_exited = Arc::new(tokio::sync::Notify::new());
+    let shell_exited_ctrl = Arc::clone(&shell_exited);
     let control_task = tokio::spawn(async move {
         loop {
-            match session.recv_control().await {
-                Ok(Some(ControlMessage::Resize { rows, cols })) => {
-                    tracing::info!(rows, cols, "resize");
-                    let _ = pty.resize(rows, cols);
-                    terminal_ctrl
-                        .lock()
-                        .expect("terminal lock poisoned")
-                        .resize(rows, cols);
+            tokio::select! {
+                msg = session.recv_control() => {
+                    match msg {
+                        Ok(Some(ControlMessage::Resize { rows, cols })) => {
+                            tracing::info!(rows, cols, "resize");
+                            let _ = pty.resize(rows, cols);
+                            terminal_ctrl
+                                .lock()
+                                .expect("terminal lock poisoned")
+                                .resize(rows, cols);
+                        }
+                        Ok(Some(ControlMessage::Goodbye) | None) => break,
+                        Ok(Some(msg)) => {
+                            tracing::warn!(?msg, "unexpected control message");
+                        }
+                        Err(e) => {
+                            tracing::debug!("control stream ended: {e}");
+                            break;
+                        }
+                    }
                 }
-                Ok(Some(ControlMessage::Goodbye) | None) => break,
-                Ok(Some(msg)) => {
-                    tracing::warn!(?msg, "unexpected control message");
-                }
-                Err(e) => {
-                    tracing::debug!("control stream ended: {e}");
+                () = shell_exited_ctrl.notified() => {
+                    tracing::info!("shell exited, sending Goodbye");
+                    let _ = session.send_control(&ControlMessage::Goodbye).await;
                     break;
                 }
             }
         }
-        pty // Return ownership of PTY for detaching
+        pty
     });
 
     // Wait for any task to finish (connection lost or session ended)
-    tokio::select! {
-        _ = output_task => {}
-        _ = input_task => {}
-        _ = scrollback_task => {}
+    enum SessionEnd {
+        ShellExited,
+        ClientDisconnected,
+        Detach(PtySession),
+    }
+
+    let end = tokio::select! {
+        _ = output_task => SessionEnd::ShellExited,
+        _ = input_task => SessionEnd::ClientDisconnected,
+        _ = scrollback_task => SessionEnd::ClientDisconnected,
         pty_result = control_task => {
-            // Control task finished — detach session with PTY
-            if let Ok(pty) = pty_result {
-                let _ = store.insert(
-                    session_id,
-                    DetachedSession {
-                        pty,
-                        terminal,
-                        ssp_sender,
-                        rows,
-                        cols,
-                    },
-                );
-                tracing::info!("session detached, awaiting reconnection");
+            match pty_result {
+                Ok(pty) => SessionEnd::Detach(pty),
+                Err(_) => SessionEnd::ClientDisconnected,
             }
         }
+    };
+
+    match end {
+        SessionEnd::ShellExited => {
+            // Notify control_task to send Goodbye, then wait for it
+            shell_exited.notify_one();
+            // Give the control task a moment to send Goodbye before dropping
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        SessionEnd::Detach(pty) => {
+            let _ = store.insert(
+                session_id,
+                DetachedSession {
+                    pty,
+                    terminal,
+                    ssp_sender,
+                    rows,
+                    cols,
+                },
+            );
+            tracing::info!("session detached, awaiting reconnection");
+        }
+        SessionEnd::ClientDisconnected => {}
     }
 
     Ok(())
@@ -926,31 +956,44 @@ async fn client_session_loop(
             false // connection lost, not user-initiated
         });
 
-        // Task: resize events -> control messages
-        let resize_task = tokio::spawn(async move {
+        // Task: resize events + server control messages (Goodbye)
+        // Returns true if the server sent Goodbye (shell exited).
+        let control_task = tokio::spawn(async move {
             let mut last_size = (cols, rows);
+            let mut resize_interval = tokio::time::interval(Duration::from_millis(100));
             loop {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                if let Ok(new_size) = terminal::size()
-                    && new_size != last_size
-                {
-                    last_size = new_size;
-                    let msg = ControlMessage::Resize {
-                        rows: new_size.1,
-                        cols: new_size.0,
-                    };
-                    if session.send_control(&msg).await.is_err() {
-                        break;
+                tokio::select! {
+                    _ = resize_interval.tick() => {
+                        if let Ok(new_size) = terminal::size()
+                            && new_size != last_size
+                        {
+                            last_size = new_size;
+                            let msg = ControlMessage::Resize {
+                                rows: new_size.1,
+                                cols: new_size.0,
+                            };
+                            if session.send_control(&msg).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    msg = session.recv_control() => {
+                        match msg {
+                            Ok(Some(ControlMessage::Goodbye)) => return true,
+                            Ok(None) | Err(_) => break,
+                            Ok(Some(_)) => {}
+                        }
                     }
                 }
             }
+            false
         });
 
         let user_disconnect = tokio::select! {
             _ = output_task => false,
             _ = stream_task => false,
             result = input_task => result.unwrap_or(false),
-            _ = resize_task => false,
+            result = control_task => result.unwrap_or(false),
         };
 
         if user_disconnect {
