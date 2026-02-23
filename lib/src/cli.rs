@@ -768,6 +768,16 @@ async fn run_client(host: &str, port: u16, cert_path: Option<PathBuf>) -> anyhow
     client_session_loop(addr, &cert_der, None).await
 }
 
+/// Context for STUN-based reconnection.
+///
+/// When the initial connection required STUN hole-punching, this context is
+/// passed into the reconnection loop so it can redo STUN on each reconnect
+/// attempt (the NAT mapping is lost when the network interface changes).
+struct StunReconnectContext {
+    /// SSH stdin handle for sending `ROSE_STUN` lines to the server.
+    ssh_stdin: tokio::process::ChildStdin,
+}
+
 /// Reconnection loop: connects/reconnects to the server with exponential backoff.
 ///
 /// When `client_cert` is `Some`, mutual TLS is used (for SSH bootstrap mode).
@@ -779,7 +789,7 @@ async fn client_session_loop(
     cert_der: &rustls::pki_types::CertificateDer<'static>,
     client_cert: Option<&CertKeyPair>,
 ) -> anyhow::Result<()> {
-    client_session_loop_inner(addr, cert_der, client_cert, None).await
+    client_session_loop_inner(addr, cert_der, client_cert, None, None).await
 }
 
 /// Like [`client_session_loop`] but uses a pre-established connection for the
@@ -793,12 +803,11 @@ async fn client_session_loop_with_conn(
     cert_der: &rustls::pki_types::CertificateDer<'static>,
     client_cert: Option<&CertKeyPair>,
 ) -> anyhow::Result<()> {
-    client_session_loop_inner(addr, cert_der, client_cert, Some(first_conn)).await
+    client_session_loop_inner(addr, cert_der, client_cert, Some(first_conn), None).await
 }
 
 /// Like [`client_session_loop`] but uses a pre-created [`QuicClient`] for the
-/// first connection. Used for STUN hole-punching where the client's socket
-/// must preserve its NAT mapping.
+/// first connection and enables STUN-based reconnection via `stun_ctx`.
 ///
 /// COVERAGE: CLI client session loop is tested via integration/e2e tests.
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -807,6 +816,7 @@ async fn client_session_loop_with_client(
     addr: SocketAddr,
     cert_der: &rustls::pki_types::CertificateDer<'static>,
     client_cert: Option<&CertKeyPair>,
+    stun_ctx: StunReconnectContext,
 ) -> anyhow::Result<()> {
     let conn = if let Some(cc) = client_cert {
         first_client
@@ -815,11 +825,45 @@ async fn client_session_loop_with_client(
     } else {
         first_client.connect(addr, "localhost", cert_der).await?
     };
-    client_session_loop_inner(addr, cert_der, client_cert, Some(conn)).await
+    client_session_loop_inner(addr, cert_der, client_cert, Some(conn), Some(stun_ctx)).await
+}
+
+/// Performs STUN discovery and hole-punching, returning a connected [`QuicClient`].
+///
+/// 1. Creates a new UDP socket and discovers its public address via STUN.
+/// 2. Sends `ROSE_STUN` to the server over SSH stdin so the server can punch.
+/// 3. Waits briefly for the server's punch packets.
+/// 4. Returns a [`QuicClient`] wrapping the STUN socket.
+///
+/// COVERAGE: Requires real STUN server; tested via e2e.
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn stun_reconnect(stun_ctx: &mut StunReconnectContext) -> anyhow::Result<QuicClient> {
+    use tokio::io::AsyncWriteExt;
+
+    // STUN discovery is blocking I/O
+    let (socket, public_addr) = tokio::task::spawn_blocking(|| {
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+        let public_addr = crate::stun::stun_discover(&socket)?;
+        Ok::<_, anyhow::Error>((socket, public_addr))
+    })
+    .await??;
+
+    tracing::info!(%public_addr, "STUN rediscovered for reconnect");
+
+    // Tell server to punch a hole for our new address
+    let stun_msg = format!("ROSE_STUN {} {}\n", public_addr.ip(), public_addr.port());
+    let _ = stun_ctx.ssh_stdin.write_all(stun_msg.as_bytes()).await;
+    let _ = stun_ctx.ssh_stdin.flush().await;
+
+    // Wait for server's punch packets
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    QuicClient::from_socket(socket).map_err(Into::into)
 }
 
 /// Core reconnection loop. If `first_conn` is provided, skips the connect
-/// phase for the first iteration.
+/// phase for the first iteration. If `stun_ctx` is provided, uses STUN
+/// hole-punching for reconnection instead of direct connect.
 ///
 /// COVERAGE: CLI client session loop is tested via integration/e2e tests.
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -828,6 +872,7 @@ async fn client_session_loop_inner(
     cert_der: &rustls::pki_types::CertificateDer<'static>,
     client_cert: Option<&CertKeyPair>,
     first_conn: Option<quinn::Connection>,
+    mut stun_ctx: Option<StunReconnectContext>,
 ) -> anyhow::Result<()> {
     let mut session_id: Option<[u8; 16]> = None;
     let mut backoff = Duration::from_millis(100);
@@ -853,6 +898,61 @@ async fn client_session_loop_inner(
         let conn = if let Some(conn) = initial_conn.take() {
             backoff = Duration::from_millis(100);
             conn
+        } else if let Some(ref mut ctx) = stun_ctx {
+            // STUN was required — redo STUN + hole-punch for reconnection
+            match stun_reconnect(ctx).await {
+                Ok(client) => {
+                    let conn_result = tokio::time::timeout(Duration::from_secs(5), async {
+                        if let Some(cc) = client_cert {
+                            client
+                                .connect_with_cert(addr, "localhost", cert_der, cc)
+                                .await
+                        } else {
+                            client.connect(addr, "localhost", cert_der).await
+                        }
+                    })
+                    .await;
+                    match conn_result {
+                        Ok(Ok(c)) => {
+                            backoff = Duration::from_millis(100);
+                            c
+                        }
+                        Ok(Err(e)) => {
+                            tracing::debug!(?backoff, "STUN reconnect failed: {e}");
+                            if wait_or_disconnect(&key_rx, backoff).await {
+                                let mut stdout = std::io::stdout();
+                                let _ = stdout.write_all(b"\r\n[RoSE: disconnected]\r\n");
+                                let _ = stdout.flush();
+                                break Ok(());
+                            }
+                            backoff = (backoff * 2).min(Duration::from_secs(5));
+                            continue;
+                        }
+                        Err(_) => {
+                            tracing::debug!(?backoff, "STUN reconnect timed out");
+                            if wait_or_disconnect(&key_rx, backoff).await {
+                                let mut stdout = std::io::stdout();
+                                let _ = stdout.write_all(b"\r\n[RoSE: disconnected]\r\n");
+                                let _ = stdout.flush();
+                                break Ok(());
+                            }
+                            backoff = (backoff * 2).min(Duration::from_secs(5));
+                            continue;
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(?backoff, "STUN rediscovery failed: {e}");
+                    if wait_or_disconnect(&key_rx, backoff).await {
+                        let mut stdout = std::io::stdout();
+                        let _ = stdout.write_all(b"\r\n[RoSE: disconnected]\r\n");
+                        let _ = stdout.flush();
+                        break Ok(());
+                    }
+                    backoff = (backoff * 2).min(Duration::from_secs(5));
+                    continue;
+                }
+            }
         } else {
             let client = match QuicClient::new() {
                 Ok(c) => c,
@@ -1447,20 +1547,36 @@ async fn run_ssh_bootstrap(
             Ok(Ok((stun_socket, public_addr))) => {
                 eprintln!("[RoSE: STUN discovered {public_addr}]");
 
+                // Take SSH stdin for ongoing STUN reconnection
+                let mut ssh_stdin = ssh
+                    .stdin
+                    .take()
+                    .ok_or_else(|| anyhow::anyhow!("lost SSH stdin handle"))?;
+
                 // Tell server our public address so it can punch a hole
                 let stun_msg = format!("ROSE_STUN {} {}\n", public_addr.ip(), public_addr.port());
-                if let Some(stdin) = ssh.stdin.as_mut() {
-                    let _ = stdin.write_all(stun_msg.as_bytes()).await;
-                    let _ = stdin.flush().await;
-                }
+                ssh_stdin.write_all(stun_msg.as_bytes()).await?;
+                ssh_stdin.flush().await?;
 
                 // Wait for server to send punch packets
                 tokio::time::sleep(Duration::from_millis(500)).await;
 
+                eprintln!(
+                    "[RoSE: connected via STUN — roaming may be limited, \
+                     consider forwarding UDP 60000-61000]"
+                );
+
                 // Create QUIC client from the STUN socket (preserves NAT mapping)
                 let client = QuicClient::from_socket(stun_socket)?;
-                client_session_loop_with_client(client, addr, &server_cert_der, Some(&client_cert))
-                    .await
+                let stun_ctx = StunReconnectContext { ssh_stdin };
+                client_session_loop_with_client(
+                    client,
+                    addr,
+                    &server_cert_der,
+                    Some(&client_cert),
+                    stun_ctx,
+                )
+                .await
             }
             Ok(Err(e)) => {
                 eprintln!("[RoSE: STUN discovery failed: {e}]");
