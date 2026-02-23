@@ -45,6 +45,26 @@ impl PtySession {
         Self::open_internal(rows, cols, CommandBuilder::new_default_prog())
     }
 
+    /// Opens a PTY with the user's default login shell and additional
+    /// environment variables (e.g. `TERM`, locale settings forwarded from
+    /// the client).
+    ///
+    /// # Errors
+    ///
+    /// Returns `PtyError::Open` if the PTY cannot be created, or
+    /// `PtyError::Spawn` if the shell cannot be started.
+    pub fn open_with_env(
+        rows: u16,
+        cols: u16,
+        env_vars: &[(String, String)],
+    ) -> Result<Self, PtyError> {
+        let mut builder = CommandBuilder::new_default_prog();
+        for (key, val) in env_vars {
+            builder.env(key, val);
+        }
+        Self::open_internal(rows, cols, builder)
+    }
+
     /// Opens a PTY running a specific command with arguments.
     ///
     /// # Errors
@@ -54,6 +74,28 @@ impl PtySession {
     pub fn open_command(rows: u16, cols: u16, cmd: &str, args: &[&str]) -> Result<Self, PtyError> {
         let mut builder = CommandBuilder::new(cmd);
         builder.args(args);
+        Self::open_internal(rows, cols, builder)
+    }
+
+    /// Opens a PTY running a specific command with arguments and extra
+    /// environment variables.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PtyError::Open` if the PTY cannot be created, or
+    /// `PtyError::Spawn` if the command cannot be started.
+    pub fn open_command_with_env(
+        rows: u16,
+        cols: u16,
+        cmd: &str,
+        args: &[&str],
+        env_vars: &[(String, String)],
+    ) -> Result<Self, PtyError> {
+        let mut builder = CommandBuilder::new(cmd);
+        builder.args(args);
+        for (key, val) in env_vars {
+            builder.env(key, val);
+        }
         Self::open_internal(rows, cols, builder)
     }
 
@@ -317,5 +359,41 @@ mod tests {
         // Just verify that opening a default shell doesn't error
         let _session = PtySession::open(24, 80).unwrap();
         // Drop immediately kills it
+    }
+
+    #[test]
+    fn open_with_env_spawns_shell() {
+        let env = vec![("TERM".into(), "xterm-256color".into())];
+        let _session = PtySession::open_with_env(24, 80, &env).unwrap();
+        // Drop immediately kills it — just verify it doesn't error
+    }
+
+    #[test]
+    fn open_with_env_sets_term() {
+        let env = vec![("TERM".into(), "xterm-256color".into())];
+        let mut session = PtySession::open_command_with_env(24, 80, "env", &[], &env).unwrap();
+        let mut rx = session.subscribe_output();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut collected = String::new();
+        while std::time::Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok(chunk) => {
+                    collected.push_str(&String::from_utf8_lossy(&chunk));
+                    if collected.contains("TERM=xterm-256color") {
+                        break;
+                    }
+                }
+                Err(broadcast::error::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+        assert!(
+            collected.contains("TERM=xterm-256color"),
+            "env command should show TERM=xterm-256color, got: {collected:?}"
+        );
+        session.wait().unwrap();
     }
 }

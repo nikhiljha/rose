@@ -68,7 +68,9 @@ async fn transport_protocol_handshake_and_datagram() {
 
     // Client: connect and handshake
     let client_conn = client.connect(addr, "localhost", &cert).await.unwrap();
-    let client_session = ClientSession::connect(client_conn, 24, 80).await.unwrap();
+    let client_session = ClientSession::connect(client_conn, 24, 80, vec![])
+        .await
+        .unwrap();
 
     let ((server_session, rows, cols), _server) = server_accept.await.unwrap();
     assert_eq!(rows, 24);
@@ -256,7 +258,9 @@ async fn ssp_over_quic() {
     // Client: connect, receive frame, verify state
     let client = QuicClient::new().unwrap();
     let client_conn = client.connect(addr, "localhost", &cert).await.unwrap();
-    let client_session = ClientSession::connect(client_conn, 24, 80).await.unwrap();
+    let client_session = ClientSession::connect(client_conn, 24, 80, vec![])
+        .await
+        .unwrap();
 
     let data = tokio::time::timeout(Duration::from_secs(5), client_session.recv_output())
         .await
@@ -318,7 +322,9 @@ async fn e2e_echo_command() {
     // Client: connect, send hello, read output
     let client = QuicClient::new().unwrap();
     let client_conn = client.connect(addr, "localhost", &cert).await.unwrap();
-    let client_session = ClientSession::connect(client_conn, 24, 80).await.unwrap();
+    let client_session = ClientSession::connect(client_conn, 24, 80, vec![])
+        .await
+        .unwrap();
 
     // Read output until we find our marker
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -401,7 +407,7 @@ async fn ssp_oversized_frame_via_stream() {
     // Client: connect, accept uni stream, decode frame
     let client = QuicClient::new().unwrap();
     let client_conn = client.connect(addr, "localhost", &cert).await.unwrap();
-    let _client_session = ClientSession::connect(client_conn.clone(), 24, 80)
+    let _client_session = ClientSession::connect(client_conn.clone(), 24, 80, vec![])
         .await
         .unwrap();
 

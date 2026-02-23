@@ -46,6 +46,8 @@ pub enum ControlMessage {
         rows: u16,
         /// Terminal columns.
         cols: u16,
+        /// Environment variables to forward (e.g. TERM, LANG, LC_*).
+        env_vars: Vec<(String, String)>,
     },
     /// Terminal resize notification.
     Resize {
@@ -66,6 +68,8 @@ pub enum ControlMessage {
         cols: u16,
         /// Session identifier from a previous `SessionInfo`.
         session_id: [u8; 16],
+        /// Environment variables to forward (e.g. TERM, LANG, LC_*).
+        env_vars: Vec<(String, String)>,
     },
     /// Session metadata sent by the server after accepting a connection.
     SessionInfo {
@@ -83,6 +87,62 @@ const MSG_GOODBYE: u8 = 3;
 const MSG_RECONNECT: u8 = 4;
 const MSG_SESSION_INFO: u8 = 5;
 
+/// Encodes a list of key-value pairs as `[num: u16][key_len: u16][key][val_len: u16][val]...`.
+fn encode_env_vars(vars: &[(String, String)], buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&(vars.len() as u16).to_be_bytes());
+    for (key, val) in vars {
+        buf.extend_from_slice(&(key.len() as u16).to_be_bytes());
+        buf.extend_from_slice(key.as_bytes());
+        buf.extend_from_slice(&(val.len() as u16).to_be_bytes());
+        buf.extend_from_slice(val.as_bytes());
+    }
+}
+
+/// Decodes a list of key-value pairs from a byte slice starting at `offset`.
+fn decode_env_vars(payload: &[u8], offset: usize) -> Result<Vec<(String, String)>, ProtocolError> {
+    if offset + 2 > payload.len() {
+        // No env section present — treat as empty (forward compatibility).
+        return Ok(vec![]);
+    }
+    let num = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
+    let mut pos = offset + 2;
+    let mut vars = Vec::with_capacity(num);
+    for _ in 0..num {
+        if pos + 2 > payload.len() {
+            return Err(ProtocolError::InvalidMessage(
+                "truncated env var key length".into(),
+            ));
+        }
+        let key_len = u16::from_be_bytes([payload[pos], payload[pos + 1]]) as usize;
+        pos += 2;
+        if pos + key_len > payload.len() {
+            return Err(ProtocolError::InvalidMessage(
+                "truncated env var key".into(),
+            ));
+        }
+        let key = String::from_utf8(payload[pos..pos + key_len].to_vec())
+            .map_err(|e| ProtocolError::InvalidMessage(format!("invalid UTF-8 in env key: {e}")))?;
+        pos += key_len;
+        if pos + 2 > payload.len() {
+            return Err(ProtocolError::InvalidMessage(
+                "truncated env var value length".into(),
+            ));
+        }
+        let val_len = u16::from_be_bytes([payload[pos], payload[pos + 1]]) as usize;
+        pos += 2;
+        if pos + val_len > payload.len() {
+            return Err(ProtocolError::InvalidMessage(
+                "truncated env var value".into(),
+            ));
+        }
+        let val = String::from_utf8(payload[pos..pos + val_len].to_vec())
+            .map_err(|e| ProtocolError::InvalidMessage(format!("invalid UTF-8 in env val: {e}")))?;
+        pos += val_len;
+        vars.push((key, val));
+    }
+    Ok(vars)
+}
+
 impl ControlMessage {
     /// Serializes this message to bytes (type byte + payload).
     #[must_use]
@@ -92,12 +152,14 @@ impl ControlMessage {
                 version,
                 rows,
                 cols,
+                env_vars,
             } => {
-                let mut buf = Vec::with_capacity(7);
+                let mut buf = Vec::with_capacity(9);
                 buf.push(MSG_HELLO);
                 buf.extend_from_slice(&version.to_be_bytes());
                 buf.extend_from_slice(&rows.to_be_bytes());
                 buf.extend_from_slice(&cols.to_be_bytes());
+                encode_env_vars(env_vars, &mut buf);
                 buf
             }
             Self::Resize { rows, cols } => {
@@ -113,13 +175,15 @@ impl ControlMessage {
                 rows,
                 cols,
                 session_id,
+                env_vars,
             } => {
-                let mut buf = Vec::with_capacity(23);
+                let mut buf = Vec::with_capacity(25);
                 buf.push(MSG_RECONNECT);
                 buf.extend_from_slice(&version.to_be_bytes());
                 buf.extend_from_slice(&rows.to_be_bytes());
                 buf.extend_from_slice(&cols.to_be_bytes());
                 buf.extend_from_slice(session_id);
+                encode_env_vars(env_vars, &mut buf);
                 buf
             }
             Self::SessionInfo {
@@ -153,10 +217,12 @@ impl ControlMessage {
                 let version = u16::from_be_bytes([payload[0], payload[1]]);
                 let rows = u16::from_be_bytes([payload[2], payload[3]]);
                 let cols = u16::from_be_bytes([payload[4], payload[5]]);
+                let env_vars = decode_env_vars(payload, 6)?;
                 Ok(Self::Hello {
                     version,
                     rows,
                     cols,
+                    env_vars,
                 })
             }
             MSG_RESIZE => {
@@ -181,11 +247,13 @@ impl ControlMessage {
                 let cols = u16::from_be_bytes([payload[4], payload[5]]);
                 let mut session_id = [0u8; 16];
                 session_id.copy_from_slice(&payload[6..22]);
+                let env_vars = decode_env_vars(payload, 22)?;
                 Ok(Self::Reconnect {
                     version,
                     rows,
                     cols,
                     session_id,
+                    env_vars,
                 })
             }
             MSG_SESSION_INFO => {
@@ -221,7 +289,6 @@ pub async fn write_control(
     msg: &ControlMessage,
 ) -> Result<(), ProtocolError> {
     let encoded = msg.encode();
-    // Control messages are at most 5 bytes, always fits in u32.
     let len = encoded.len() as u32;
     send.write_all(&len.to_be_bytes()).await?;
     send.write_all(&encoded).await?;
@@ -273,6 +340,7 @@ impl ServerSession {
             version: _,
             rows,
             cols,
+            ..
         } = handshake
         else {
             return Err(ProtocolError::InvalidMessage(format!(
@@ -383,7 +451,12 @@ impl ClientSession {
     /// # Errors
     ///
     /// Returns `ProtocolError` if the handshake fails.
-    pub async fn connect(conn: Connection, rows: u16, cols: u16) -> Result<Self, ProtocolError> {
+    pub async fn connect(
+        conn: Connection,
+        rows: u16,
+        cols: u16,
+        env_vars: Vec<(String, String)>,
+    ) -> Result<Self, ProtocolError> {
         let (mut control_send, control_recv) = conn.open_bi().await?;
         write_control(
             &mut control_send,
@@ -391,6 +464,7 @@ impl ClientSession {
                 version: PROTOCOL_VERSION,
                 rows,
                 cols,
+                env_vars,
             },
         )
         .await?;
@@ -412,6 +486,7 @@ impl ClientSession {
         rows: u16,
         cols: u16,
         session_id: [u8; 16],
+        env_vars: Vec<(String, String)>,
     ) -> Result<Self, ProtocolError> {
         let (mut control_send, control_recv) = conn.open_bi().await?;
         write_control(
@@ -421,6 +496,7 @@ impl ClientSession {
                 rows,
                 cols,
                 session_id,
+                env_vars,
             },
         )
         .await?;
@@ -490,6 +566,23 @@ mod tests {
             version: PROTOCOL_VERSION,
             rows: 24,
             cols: 80,
+            env_vars: vec![],
+        };
+        let encoded = msg.encode();
+        let decoded = ControlMessage::decode(&encoded).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn encode_decode_hello_with_env() {
+        let msg = ControlMessage::Hello {
+            version: PROTOCOL_VERSION,
+            rows: 24,
+            cols: 80,
+            env_vars: vec![
+                ("TERM".into(), "xterm-256color".into()),
+                ("LANG".into(), "en_US.UTF-8".into()),
+            ],
         };
         let encoded = msg.encode();
         let decoded = ControlMessage::decode(&encoded).unwrap();
@@ -523,6 +616,22 @@ mod tests {
             rows: 30,
             cols: 100,
             session_id,
+            env_vars: vec![],
+        };
+        let encoded = msg.encode();
+        let decoded = ControlMessage::decode(&encoded).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn encode_decode_reconnect_with_env() {
+        let session_id = [42u8; 16];
+        let msg = ControlMessage::Reconnect {
+            version: PROTOCOL_VERSION,
+            rows: 30,
+            cols: 100,
+            session_id,
+            env_vars: vec![("TERM".into(), "screen-256color".into())],
         };
         let encoded = msg.encode();
         let decoded = ControlMessage::decode(&encoded).unwrap();
@@ -569,6 +678,79 @@ mod tests {
         assert!(ControlMessage::decode(&[MSG_HELLO, 0, 1, 0, 24]).is_err());
     }
 
+    #[test]
+    fn decode_env_vars_truncated_key_length() {
+        // Valid Hello header (7 bytes) + num_vars=1 but no key data
+        let mut data = vec![MSG_HELLO, 0, 1, 0, 24, 0, 80];
+        data.extend_from_slice(&1u16.to_be_bytes()); // num_vars = 1
+        // No key length/data follows → truncated
+        assert!(ControlMessage::decode(&data).is_err());
+    }
+
+    #[test]
+    fn decode_env_vars_truncated_key_data() {
+        let mut data = vec![MSG_HELLO, 0, 1, 0, 24, 0, 80];
+        data.extend_from_slice(&1u16.to_be_bytes()); // num_vars = 1
+        data.extend_from_slice(&10u16.to_be_bytes()); // key_len = 10
+        data.extend_from_slice(b"AB"); // only 2 bytes of key (need 10)
+        assert!(ControlMessage::decode(&data).is_err());
+    }
+
+    #[test]
+    fn decode_env_vars_truncated_val_length() {
+        let mut data = vec![MSG_HELLO, 0, 1, 0, 24, 0, 80];
+        data.extend_from_slice(&1u16.to_be_bytes()); // num_vars = 1
+        data.extend_from_slice(&4u16.to_be_bytes()); // key_len = 4
+        data.extend_from_slice(b"TERM"); // key
+        // No val length follows
+        assert!(ControlMessage::decode(&data).is_err());
+    }
+
+    #[test]
+    fn decode_env_vars_truncated_val_data() {
+        let mut data = vec![MSG_HELLO, 0, 1, 0, 24, 0, 80];
+        data.extend_from_slice(&1u16.to_be_bytes()); // num_vars = 1
+        data.extend_from_slice(&4u16.to_be_bytes());
+        data.extend_from_slice(b"TERM");
+        data.extend_from_slice(&20u16.to_be_bytes()); // val_len = 20
+        data.extend_from_slice(b"xt"); // only 2 bytes (need 20)
+        assert!(ControlMessage::decode(&data).is_err());
+    }
+
+    #[test]
+    fn decode_env_vars_invalid_utf8_key() {
+        let mut data = vec![MSG_HELLO, 0, 1, 0, 24, 0, 80];
+        data.extend_from_slice(&1u16.to_be_bytes());
+        data.extend_from_slice(&2u16.to_be_bytes()); // key_len = 2
+        data.extend_from_slice(&[0xFF, 0xFE]); // invalid UTF-8
+        data.extend_from_slice(&1u16.to_be_bytes()); // val_len = 1
+        data.push(b'x');
+        assert!(ControlMessage::decode(&data).is_err());
+    }
+
+    #[test]
+    fn decode_env_vars_invalid_utf8_val() {
+        let mut data = vec![MSG_HELLO, 0, 1, 0, 24, 0, 80];
+        data.extend_from_slice(&1u16.to_be_bytes());
+        data.extend_from_slice(&1u16.to_be_bytes());
+        data.push(b'K');
+        data.extend_from_slice(&2u16.to_be_bytes());
+        data.extend_from_slice(&[0xFF, 0xFE]); // invalid UTF-8 value
+        assert!(ControlMessage::decode(&data).is_err());
+    }
+
+    #[test]
+    fn decode_hello_without_env_section() {
+        // A Hello with exactly 6 bytes payload (no env section) should
+        // decode with empty env_vars for forward compatibility.
+        let data = [MSG_HELLO, 0, 1, 0, 24, 0, 80];
+        let msg = ControlMessage::decode(&data).unwrap();
+        let ControlMessage::Hello { env_vars, .. } = msg else {
+            panic!("expected Hello");
+        };
+        assert!(env_vars.is_empty());
+    }
+
     /// Helper: create connected QUIC pair for protocol tests.
     async fn quic_pair() -> (Connection, Connection, QuicServer, QuicClient) {
         let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
@@ -596,7 +778,9 @@ mod tests {
 
         let server_task = tokio::spawn(async move { ServerSession::accept(server_conn).await });
 
-        let _client_session = ClientSession::connect(client_conn, 24, 80).await.unwrap();
+        let _client_session = ClientSession::connect(client_conn, 24, 80, vec![])
+            .await
+            .unwrap();
         let (server_session, rows, cols) = server_task.await.unwrap().unwrap();
         assert_eq!(rows, 24);
         assert_eq!(cols, 80);
@@ -617,6 +801,7 @@ mod tests {
             version: 999,
             rows: 24,
             cols: 80,
+            env_vars: vec![],
         };
         write_control(&mut send, &bad_hello).await.unwrap();
 
@@ -644,6 +829,7 @@ mod tests {
             rows: 24,
             cols: 80,
             session_id: [1u8; 16],
+            env_vars: vec![],
         };
         write_control(&mut send, &bad_reconnect).await.unwrap();
 
@@ -666,7 +852,9 @@ mod tests {
         let server_task =
             tokio::spawn(async move { ServerSession::accept(server_conn).await.unwrap() });
 
-        let client_session = ClientSession::connect(client_conn, 24, 80).await.unwrap();
+        let client_session = ClientSession::connect(client_conn, 24, 80, vec![])
+            .await
+            .unwrap();
         let (server_session, _, _) = server_task.await.unwrap();
 
         // Client sends input, server receives
@@ -691,7 +879,9 @@ mod tests {
         let server_task =
             tokio::spawn(async move { ServerSession::accept(server_conn).await.unwrap() });
 
-        let mut client_session = ClientSession::connect(client_conn, 24, 80).await.unwrap();
+        let mut client_session = ClientSession::connect(client_conn, 24, 80, vec![])
+            .await
+            .unwrap();
         let (mut server_session, _, _) = server_task.await.unwrap();
 
         // Client sends resize

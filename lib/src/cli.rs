@@ -291,11 +291,12 @@ async fn handle_server_session(conn: quinn::Connection, store: SessionStore) -> 
             version: _,
             rows,
             cols,
+            env_vars,
         } => {
             let session_id: [u8; 16] = rand_session_id();
             tracing::info!(rows, cols, "new session");
 
-            let pty = PtySession::open(rows, cols)?;
+            let pty = PtySession::open_with_env(rows, cols, &env_vars)?;
             let terminal = Arc::new(Mutex::new(RoseTerminal::new(rows, cols)));
             let ssp_sender = Arc::new(Mutex::new(SspSender::new()));
 
@@ -314,6 +315,7 @@ async fn handle_server_session(conn: quinn::Connection, store: SessionStore) -> 
             rows,
             cols,
             session_id,
+            env_vars: _,
         } => {
             tracing::info!(rows, cols, "reconnecting session");
 
@@ -556,6 +558,37 @@ fn rand_session_id() -> [u8; 16] {
     seed.to_ne_bytes()
 }
 
+/// Collects environment variables to forward from client to server.
+///
+/// Includes `TERM`, `COLORTERM`, `LANG`, and all `LC_*` locale variables.
+/// Defaults `TERM` to `xterm-256color` if unset (matches wezterm-term capabilities).
+///
+/// COVERAGE: Only called from `client_session_loop` which is excluded from
+/// instrumented coverage (tested via e2e tests).
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn collect_env_vars() -> Vec<(String, String)> {
+    let mut vars = Vec::new();
+
+    // TERM — default to xterm-256color if not set
+    let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
+    vars.push(("TERM".to_string(), term));
+
+    for key in ["COLORTERM", "LANG"] {
+        if let Ok(val) = std::env::var(key) {
+            vars.push((key.to_string(), val));
+        }
+    }
+
+    // All LC_* locale variables
+    for (key, val) in std::env::vars() {
+        if key.starts_with("LC_") {
+            vars.push((key, val));
+        }
+    }
+
+    vars
+}
+
 /// COVERAGE: CLI client loop is tested via integration/e2e tests.
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn run_client(host: &str, port: u16, cert_path: Option<PathBuf>) -> anyhow::Result<()> {
@@ -636,8 +669,9 @@ async fn client_session_loop(
         };
 
         let (cols, rows) = terminal::size()?;
+        let env = collect_env_vars();
         let mut session = if let Some(sid) = session_id {
-            match ClientSession::reconnect(conn, rows, cols, sid).await {
+            match ClientSession::reconnect(conn, rows, cols, sid, env).await {
                 Ok(s) => s,
                 Err(e) => {
                     let mut stdout = std::io::stdout();
@@ -652,7 +686,7 @@ async fn client_session_loop(
                 }
             }
         } else {
-            ClientSession::connect(conn, rows, cols).await?
+            ClientSession::connect(conn, rows, cols, env).await?
         };
 
         // Read SessionInfo from server

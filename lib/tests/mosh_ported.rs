@@ -89,7 +89,9 @@ async fn e2e_window_resize() {
     // Client: connect, send resize, then query columns
     let client = QuicClient::new().unwrap();
     let client_conn = client.connect(addr, "localhost", &cert).await.unwrap();
-    let mut client_session = ClientSession::connect(client_conn, 24, 80).await.unwrap();
+    let mut client_session = ClientSession::connect(client_conn, 24, 80, vec![])
+        .await
+        .unwrap();
 
     // Wait for shell to start
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -202,7 +204,9 @@ async fn e2e_basic_connection() {
     // Client: connect, send data, read echo
     let client = QuicClient::new().unwrap();
     let client_conn = client.connect(addr, "localhost", &cert).await.unwrap();
-    let client_session = ClientSession::connect(client_conn, 24, 80).await.unwrap();
+    let client_session = ClientSession::connect(client_conn, 24, 80, vec![])
+        .await
+        .unwrap();
 
     // Send some input
     client_session
@@ -296,7 +300,9 @@ async fn e2e_local_connection() {
 
     let client = QuicClient::new().unwrap();
     let client_conn = client.connect(addr, "localhost", &cert).await.unwrap();
-    let client_session = ClientSession::connect(client_conn, 24, 80).await.unwrap();
+    let client_session = ClientSession::connect(client_conn, 24, 80, vec![])
+        .await
+        .unwrap();
 
     client_session
         .send_input(Bytes::from_static(b"local_e2e_test\n"))
@@ -377,7 +383,9 @@ async fn e2e_repeat_connections() {
             .connect(iter_addr, "localhost", &iter_cert)
             .await
             .unwrap();
-        let client_session = ClientSession::connect(client_conn, 24, 80).await.unwrap();
+        let client_session = ClientSession::connect(client_conn, 24, 80, vec![])
+            .await
+            .unwrap();
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         let mut collected = String::new();
@@ -580,6 +588,7 @@ async fn session_persists_across_network_disruption() {
                 version: _,
                 rows,
                 cols,
+                ..
             } = handshake
             else {
                 panic!("expected Hello");
@@ -651,7 +660,9 @@ async fn session_persists_across_network_disruption() {
 
         let client = QuicClient::new().unwrap();
         let client_conn = client.connect(addr, "localhost", &cert).await.unwrap();
-        let mut client_session = ClientSession::connect(client_conn, 24, 80).await.unwrap();
+        let mut client_session = ClientSession::connect(client_conn, 24, 80, vec![])
+            .await
+            .unwrap();
 
         // Read SessionInfo
         let info = client_session.recv_control().await.unwrap().unwrap();
@@ -710,6 +721,7 @@ async fn session_persists_across_network_disruption() {
                 rows: _,
                 cols: _,
                 session_id: rsid,
+                ..
             } = handshake
             else {
                 panic!("expected Reconnect, got {handshake:?}");
@@ -766,9 +778,10 @@ async fn session_persists_across_network_disruption() {
 
         let client2 = QuicClient::new().unwrap();
         let client_conn2 = client2.connect(addr2, "localhost", &cert2).await.unwrap();
-        let mut client_session2 = ClientSession::reconnect(client_conn2, 24, 80, session_id)
-            .await
-            .unwrap();
+        let mut client_session2 =
+            ClientSession::reconnect(client_conn2, 24, 80, session_id, vec![])
+                .await
+                .unwrap();
 
         // Read SessionInfo confirming reconnection
         let info2 = client_session2.recv_control().await.unwrap().unwrap();
@@ -858,7 +871,7 @@ async fn scrollback_sync_over_reliable_stream() {
     // Client: connect, accept scrollback uni stream, decode lines
     let client = QuicClient::new().unwrap();
     let client_conn = client.connect(addr, "localhost", &cert).await.unwrap();
-    let _client_session = ClientSession::connect(client_conn.clone(), 4, 80)
+    let _client_session = ClientSession::connect(client_conn.clone(), 4, 80, vec![])
         .await
         .unwrap();
 
@@ -967,7 +980,9 @@ async fn native_mode_mutual_tls_auth() {
             .await
             .unwrap();
 
-        let _client_session = ClientSession::connect(client_conn, 24, 80).await.unwrap();
+        let _client_session = ClientSession::connect(client_conn, 24, 80, vec![])
+            .await
+            .unwrap();
         let (_, rows, cols) = server_task.await.unwrap().unwrap();
         assert_eq!(rows, 24);
         assert_eq!(cols, 80);
