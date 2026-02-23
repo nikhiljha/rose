@@ -902,4 +902,129 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn decode_resize_too_short() {
+        // MSG_RESIZE with only 2 bytes instead of 4
+        let data = [MSG_RESIZE, 0x00, 0x18];
+        assert!(ControlMessage::decode(&data).is_err());
+    }
+
+    #[test]
+    fn decode_resize_valid() {
+        let data = [MSG_RESIZE, 0x00, 0x18, 0x00, 0x50];
+        let msg = ControlMessage::decode(&data).unwrap();
+        assert_eq!(msg, ControlMessage::Resize { rows: 24, cols: 80 });
+    }
+
+    #[tokio::test]
+    async fn read_control_oversized_message() {
+        // Set up a QUIC connection to test read_control with oversized length
+        let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = server.local_addr().unwrap();
+        let cert = server.server_cert_der().clone();
+        let client = QuicClient::new().unwrap();
+
+        let accept = tokio::spawn({
+            let endpoint = server.endpoint.clone();
+            async move {
+                let incoming = endpoint.accept().await.unwrap();
+                incoming.await.unwrap()
+            }
+        });
+        let client_conn = client.connect(addr, "localhost", &cert).await.unwrap();
+        let server_conn = accept.await.unwrap();
+
+        // Client sends an oversized length prefix (> 65536)
+        let (mut send, _recv) = client_conn.open_bi().await.unwrap();
+        let bad_len: u32 = 100_000;
+        send.write_all(&bad_len.to_be_bytes()).await.unwrap();
+        send.finish().unwrap();
+
+        let (_server_send, mut server_recv) = server_conn.accept_bi().await.unwrap();
+        let result = read_control(&mut server_recv).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_control_stream_closed_early() {
+        // Test that read_control returns None when stream closes before any data
+        let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = server.local_addr().unwrap();
+        let cert = server.server_cert_der().clone();
+        let client = QuicClient::new().unwrap();
+
+        let accept = tokio::spawn({
+            let endpoint = server.endpoint.clone();
+            async move {
+                let incoming = endpoint.accept().await.unwrap();
+                incoming.await.unwrap()
+            }
+        });
+        let client_conn = client.connect(addr, "localhost", &cert).await.unwrap();
+        let server_conn = accept.await.unwrap();
+
+        // Client opens bi-stream and immediately finishes (no data)
+        let (mut send, _recv) = client_conn.open_bi().await.unwrap();
+        send.finish().unwrap();
+
+        let (_server_send, mut server_recv) = server_conn.accept_bi().await.unwrap();
+        let result = read_control(&mut server_recv).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn accept_non_hello_rejected() {
+        // ServerSession::accept should reject non-Hello messages
+        let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = server.local_addr().unwrap();
+        let cert = server.server_cert_der().clone();
+        let client = QuicClient::new().unwrap();
+
+        let accept = tokio::spawn({
+            let endpoint = server.endpoint.clone();
+            async move {
+                let incoming = endpoint.accept().await.unwrap();
+                let conn = incoming.await.unwrap();
+                ServerSession::accept(conn).await
+            }
+        });
+        let client_conn = client.connect(addr, "localhost", &cert).await.unwrap();
+
+        // Send a Resize instead of Hello (invalid for handshake)
+        let (mut send, _recv) = client_conn.open_bi().await.unwrap();
+        let resize = ControlMessage::Resize { rows: 24, cols: 80 };
+        write_control(&mut send, &resize).await.unwrap();
+
+        let result = accept.await.unwrap();
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn accept_any_non_hello_non_reconnect_rejected() {
+        // ServerSession::accept_any should reject non-Hello/Reconnect messages
+        let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = server.local_addr().unwrap();
+        let cert = server.server_cert_der().clone();
+        let client = QuicClient::new().unwrap();
+
+        let accept = tokio::spawn({
+            let endpoint = server.endpoint.clone();
+            async move {
+                let incoming = endpoint.accept().await.unwrap();
+                let conn = incoming.await.unwrap();
+                ServerSession::accept_any(conn).await
+            }
+        });
+        let client_conn = client.connect(addr, "localhost", &cert).await.unwrap();
+
+        // Send Goodbye (not Hello or Reconnect)
+        let (mut send, _recv) = client_conn.open_bi().await.unwrap();
+        write_control(&mut send, &ControlMessage::Goodbye)
+            .await
+            .unwrap();
+
+        let result = accept.await.unwrap();
+        assert!(result.is_err());
+    }
 }

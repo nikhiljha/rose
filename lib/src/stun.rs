@@ -178,6 +178,7 @@ fn parse_mapped_address(value: &[u8]) -> Option<SocketAddrV4> {
 ///
 /// Returns [`StunError::NoResponse`] if no STUN server responds, or
 /// [`StunError::Io`] on network errors.
+///
 pub fn stun_discover(socket: &UdpSocket) -> Result<SocketAddr, StunError> {
     let txn_id = random_txn_id();
     let request = build_binding_request(&txn_id);

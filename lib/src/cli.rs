@@ -2033,4 +2033,173 @@ mod tests {
     fn parse_stun_line_empty() {
         assert!(parse_stun_line("").is_err());
     }
+
+    #[test]
+    fn parse_bootstrap_invalid_hex() {
+        assert!(parse_bootstrap_line("ROSE_BOOTSTRAP 60123 zzzz").is_err());
+    }
+
+    #[test]
+    fn key_event_ctrl_c() {
+        let key = crossterm::event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(key_event_to_bytes(&key), vec![3]); // Ctrl+C = 0x03
+    }
+
+    #[test]
+    fn key_event_ctrl_a() {
+        let key = crossterm::event::KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
+        assert_eq!(key_event_to_bytes(&key), vec![1]); // Ctrl+A = 0x01
+    }
+
+    #[test]
+    fn key_event_regular_char() {
+        let key = crossterm::event::KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(key_event_to_bytes(&key), b"x");
+    }
+
+    #[test]
+    fn key_event_unicode_char() {
+        let key = crossterm::event::KeyEvent::new(KeyCode::Char('\u{1f600}'), KeyModifiers::NONE);
+        let bytes = key_event_to_bytes(&key);
+        assert_eq!(std::str::from_utf8(&bytes).unwrap(), "\u{1f600}");
+    }
+
+    #[test]
+    fn key_event_special_keys() {
+        assert_eq!(
+            key_event_to_bytes(&crossterm::event::KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE
+            )),
+            vec![b'\r']
+        );
+        assert_eq!(
+            key_event_to_bytes(&crossterm::event::KeyEvent::new(
+                KeyCode::Backspace,
+                KeyModifiers::NONE
+            )),
+            vec![127]
+        );
+        assert_eq!(
+            key_event_to_bytes(&crossterm::event::KeyEvent::new(
+                KeyCode::Tab,
+                KeyModifiers::NONE
+            )),
+            vec![b'\t']
+        );
+        assert_eq!(
+            key_event_to_bytes(&crossterm::event::KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE
+            )),
+            vec![0x1b]
+        );
+    }
+
+    #[test]
+    fn key_event_arrow_keys() {
+        assert_eq!(
+            key_event_to_bytes(&crossterm::event::KeyEvent::new(
+                KeyCode::Up,
+                KeyModifiers::NONE
+            )),
+            b"\x1b[A"
+        );
+        assert_eq!(
+            key_event_to_bytes(&crossterm::event::KeyEvent::new(
+                KeyCode::Down,
+                KeyModifiers::NONE
+            )),
+            b"\x1b[B"
+        );
+        assert_eq!(
+            key_event_to_bytes(&crossterm::event::KeyEvent::new(
+                KeyCode::Right,
+                KeyModifiers::NONE
+            )),
+            b"\x1b[C"
+        );
+        assert_eq!(
+            key_event_to_bytes(&crossterm::event::KeyEvent::new(
+                KeyCode::Left,
+                KeyModifiers::NONE
+            )),
+            b"\x1b[D"
+        );
+    }
+
+    #[test]
+    fn key_event_navigation_keys() {
+        assert_eq!(
+            key_event_to_bytes(&crossterm::event::KeyEvent::new(
+                KeyCode::Home,
+                KeyModifiers::NONE
+            )),
+            b"\x1b[H"
+        );
+        assert_eq!(
+            key_event_to_bytes(&crossterm::event::KeyEvent::new(
+                KeyCode::End,
+                KeyModifiers::NONE
+            )),
+            b"\x1b[F"
+        );
+        assert_eq!(
+            key_event_to_bytes(&crossterm::event::KeyEvent::new(
+                KeyCode::PageUp,
+                KeyModifiers::NONE
+            )),
+            b"\x1b[5~"
+        );
+        assert_eq!(
+            key_event_to_bytes(&crossterm::event::KeyEvent::new(
+                KeyCode::PageDown,
+                KeyModifiers::NONE
+            )),
+            b"\x1b[6~"
+        );
+        assert_eq!(
+            key_event_to_bytes(&crossterm::event::KeyEvent::new(
+                KeyCode::Delete,
+                KeyModifiers::NONE
+            )),
+            b"\x1b[3~"
+        );
+        assert_eq!(
+            key_event_to_bytes(&crossterm::event::KeyEvent::new(
+                KeyCode::Insert,
+                KeyModifiers::NONE
+            )),
+            b"\x1b[2~"
+        );
+    }
+
+    #[test]
+    fn key_event_function_keys() {
+        assert_eq!(f_key_escape(1), b"\x1bOP");
+        assert_eq!(f_key_escape(2), b"\x1bOQ");
+        assert_eq!(f_key_escape(3), b"\x1bOR");
+        assert_eq!(f_key_escape(4), b"\x1bOS");
+        assert_eq!(f_key_escape(5), b"\x1b[15~");
+        assert_eq!(f_key_escape(6), b"\x1b[17~");
+        assert_eq!(f_key_escape(7), b"\x1b[18~");
+        assert_eq!(f_key_escape(8), b"\x1b[19~");
+        assert_eq!(f_key_escape(9), b"\x1b[20~");
+        assert_eq!(f_key_escape(10), b"\x1b[21~");
+        assert_eq!(f_key_escape(11), b"\x1b[23~");
+        assert_eq!(f_key_escape(12), b"\x1b[24~");
+        assert_eq!(f_key_escape(13), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn key_event_unknown_returns_empty() {
+        let key = crossterm::event::KeyEvent::new(KeyCode::Null, KeyModifiers::NONE);
+        assert!(key_event_to_bytes(&key).is_empty());
+    }
+
+    #[test]
+    fn key_event_f_key_via_key_event() {
+        let key = crossterm::event::KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE);
+        assert_eq!(key_event_to_bytes(&key), b"\x1bOP");
+    }
 }

@@ -1574,4 +1574,78 @@ mod tests {
         let state = predictor.predicted_state();
         assert_eq!(state.rows.len(), 40);
     }
+
+    #[test]
+    fn detect_scroll_up_empty_state() {
+        let old = ScreenState::empty(0);
+        let new = ScreenState::empty(0);
+        assert_eq!(detect_scroll_up(&old, &new), None);
+    }
+
+    #[test]
+    fn detect_scroll_up_mismatched_rows() {
+        let old = ScreenState::empty(3);
+        let new = ScreenState::empty(5);
+        assert_eq!(detect_scroll_up(&old, &new), None);
+    }
+
+    #[test]
+    fn detect_scroll_up_no_scroll() {
+        let state = ScreenState {
+            rows: vec!["a".into(), "b".into(), "c".into()],
+            cursor_x: 0,
+            cursor_y: 0,
+        };
+        assert_eq!(detect_scroll_up(&state, &state), None);
+    }
+
+    #[test]
+    fn detect_scroll_up_one_line() {
+        let old = ScreenState {
+            rows: vec!["a".into(), "b".into(), "c".into()],
+            cursor_x: 0,
+            cursor_y: 0,
+        };
+        let new = ScreenState {
+            rows: vec!["b".into(), "c".into(), "d".into()],
+            cursor_x: 0,
+            cursor_y: 0,
+        };
+        assert_eq!(detect_scroll_up(&old, &new), Some(1));
+    }
+
+    #[test]
+    fn detect_scroll_up_early_exit() {
+        // old[1] != new[0], so k>1 can't work
+        let old = ScreenState {
+            rows: vec!["a".into(), "x".into(), "c".into()],
+            cursor_x: 0,
+            cursor_y: 0,
+        };
+        let new = ScreenState {
+            rows: vec!["y".into(), "z".into(), "w".into()],
+            cursor_x: 0,
+            cursor_y: 0,
+        };
+        assert_eq!(detect_scroll_up(&old, &new), None);
+    }
+
+    #[test]
+    fn sender_queue_pruning_with_ack() {
+        let mut sender = SspSender::new();
+        // Push many states to exceed MAX_QUEUE_SIZE
+        for i in 0..35 {
+            let state = ScreenState {
+                rows: vec![format!("line {i}")],
+                cursor_x: 0,
+                cursor_y: 0,
+            };
+            sender.push_state(state);
+        }
+        // Ack state 1 so it's retained during pruning
+        sender.process_ack(1);
+        // Queue should be pruned, but state 1 should still be there
+        let frame = sender.generate_frame();
+        assert!(frame.is_some());
+    }
 }

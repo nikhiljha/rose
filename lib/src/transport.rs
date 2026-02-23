@@ -129,6 +129,7 @@ impl QuicServer {
     /// The connection attempt is expected to fail — only the UDP packets
     /// matter. They create a stateful firewall entry that allows return
     /// traffic from `target` to reach this server's port.
+    ///
     pub fn punch_hole(&self, target: SocketAddr) {
         send_punch_packets(self.endpoint.clone(), target);
     }
@@ -156,6 +157,7 @@ impl PunchHandle {
 /// Uses a TOFU (accept-any-cert) client config since we don't care about the
 /// TLS handshake completing — only the UDP packets matter for creating the
 /// firewall pinhole. The connection attempt will fail, which is expected.
+///
 fn send_punch_packets(endpoint: quinn::Endpoint, target: SocketAddr) {
     tokio::spawn(async move {
         let Ok(dummy_config) = config::build_tofu_client_config() else {
@@ -366,5 +368,21 @@ mod tests {
         // Just verify it can be created without panicking.
         // Actual hole-punching is tested via e2e tests.
         drop(handle);
+    }
+
+    #[tokio::test]
+    async fn server_cert_pem_is_valid() {
+        let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let pem = server.server_cert_pem();
+        assert!(pem.contains("BEGIN CERTIFICATE"));
+    }
+
+    #[tokio::test]
+    async fn accept_returns_none_on_close() {
+        let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        // Close the endpoint, then accept should return None
+        server.endpoint.close(0u32.into(), b"done");
+        let result = server.accept().await.unwrap();
+        assert!(result.is_none());
     }
 }

@@ -416,4 +416,12 @@ mod tests {
         );
         session.wait().unwrap();
     }
+
+    #[test]
+    fn closed_returns_notify_handle() {
+        let session = PtySession::open(4, 20).unwrap();
+        let closed = session.closed();
+        // PtySession holds one clone, the reader thread holds another, we hold a third
+        assert!(std::sync::Arc::strong_count(&closed) >= 2);
+    }
 }

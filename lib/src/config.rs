@@ -196,6 +196,7 @@ pub fn tofu_check(
 ///
 /// This is intentionally insecure and should only be used for the TOFU
 /// first-connection flow where the cert is then cached for future verification.
+///
 #[derive(Debug)]
 struct TofuFirstConnectionVerifier;
 
