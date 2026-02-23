@@ -62,6 +62,10 @@ enum Commands {
         /// Skip direct UDP and force STUN hole-punching (for testing).
         #[arg(long)]
         force_stun: bool,
+
+        /// SSH port to connect to (for `--ssh` mode). Defaults to SSH's own default (22).
+        #[arg(long)]
+        ssh_port: Option<u16>,
     },
     /// Run the `RoSE` server daemon.
     Server {
@@ -110,9 +114,10 @@ pub async fn run() -> anyhow::Result<()> {
             ssh,
             server_binary,
             force_stun,
+            ssh_port,
         } => {
             if ssh {
-                run_ssh_bootstrap(&host, &server_binary, force_stun).await
+                run_ssh_bootstrap(&host, &server_binary, force_stun, ssh_port).await
             } else {
                 run_client(&host, port, cert).await
             }
@@ -1469,6 +1474,7 @@ async fn run_ssh_bootstrap(
     host: &str,
     server_binary: &str,
     force_stun: bool,
+    ssh_port: Option<u16>,
 ) -> anyhow::Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
@@ -1477,7 +1483,11 @@ async fn run_ssh_bootstrap(
 
     eprintln!("Starting SSH bootstrap to {host}...");
 
-    let mut ssh = tokio::process::Command::new("ssh")
+    let mut cmd = tokio::process::Command::new("ssh");
+    if let Some(port) = ssh_port {
+        cmd.arg("-p").arg(port.to_string());
+    }
+    let mut ssh = cmd
         .arg(host)
         .arg(server_binary)
         .arg("server")

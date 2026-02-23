@@ -34,6 +34,14 @@ enum Commands {
         /// Path to the `rose` binary on the remote server (for `--ssh` mode).
         #[arg(long, default_value = "rose")]
         server_binary: String,
+
+        /// Skip direct UDP and force STUN hole-punching (for testing).
+        #[arg(long)]
+        force_stun: bool,
+
+        /// SSH port to connect to (for `--ssh` mode). Defaults to SSH's own default (22).
+        #[arg(long)]
+        ssh_port: Option<u16>,
     },
     /// Run the `RoSE` server daemon.
     Server {

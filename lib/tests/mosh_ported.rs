@@ -919,14 +919,270 @@ async fn scrollback_sync_over_reliable_stream() {
 // to QUIC.
 // ---------------------------------------------------------------------------
 
-#[test]
-#[ignore = "requires SSH server"]
-fn ssh_bootstrap_mode() {
-    // Full e2e test requires an SSH server. The parsing logic
-    // (parse_bootstrap_line, hex_encode/decode) is unit tested in cli/src/main.rs.
-    // To test manually: run `rose connect --ssh localhost` against a machine
-    // with `rose` installed and SSH access.
-    unimplemented!("SSH bootstrap e2e test requires SSH server");
+/// SSH bootstrap e2e test using an in-process `russh` SSH server.
+///
+/// Spins up a minimal SSH server that accepts any auth and executes the
+/// requested command (which will be `rose server --bootstrap --ephemeral`).
+/// Then runs the bootstrap handshake to verify certificates are exchanged
+/// and the `ROSE_BOOTSTRAP` line is parsed correctly.
+///
+/// This does NOT test the full interactive session (that requires raw terminal
+/// mode), but verifies the bootstrap handshake and QUIC connection succeed.
+#[tokio::test]
+async fn ssh_bootstrap_mode() {
+    use russh::ChannelId;
+    use russh::server::{Auth, Config, Handler, Msg, Session};
+    use std::sync::Arc;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    // --- Minimal SSH server handler ---
+
+    struct TestHandler;
+
+    impl Handler for TestHandler {
+        type Error = russh::Error;
+
+        async fn auth_none(&mut self, _user: &str) -> Result<Auth, Self::Error> {
+            Ok(Auth::Accept)
+        }
+
+        async fn auth_password(
+            &mut self,
+            _user: &str,
+            _password: &str,
+        ) -> Result<Auth, Self::Error> {
+            Ok(Auth::Accept)
+        }
+
+        async fn channel_open_session(
+            &mut self,
+            _channel: russh::Channel<Msg>,
+            _session: &mut Session,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+
+        async fn exec_request(
+            &mut self,
+            channel: ChannelId,
+            data: &[u8],
+            session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            let command = String::from_utf8_lossy(data).to_string();
+            session.channel_success(channel)?;
+
+            // Parse command into program + args
+            let parts: Vec<&str> = command.split_whitespace().collect();
+            let (program, args) = parts.split_first().expect("empty command");
+
+            let mut child = tokio::process::Command::new(program)
+                .args(args)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("failed to spawn command");
+
+            let child_stdin = child.stdin.take().unwrap();
+            let child_stdout = child.stdout.take().unwrap();
+
+            // Forward child stdout → SSH channel
+            let handle = session.handle();
+            tokio::spawn(async move {
+                let mut reader = tokio::io::BufReader::new(child_stdout);
+                let mut line = String::new();
+                while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                    let _ = handle.data(channel, line.as_bytes().into()).await;
+                    line.clear();
+                }
+                let _ = handle.eof(channel).await;
+                let _ = handle.close(channel).await;
+            });
+
+            // Store child stdin for data() calls
+            // We use a task-local approach: spawn a reader task that receives
+            // data via a channel
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+            STDIN_TX.lock().unwrap().replace(tx);
+
+            tokio::spawn(async move {
+                let mut stdin = child_stdin;
+                while let Some(data) = rx.recv().await {
+                    if stdin.write_all(&data).await.is_err() {
+                        break;
+                    }
+                    let _ = stdin.flush().await;
+                }
+            });
+
+            Ok(())
+        }
+
+        async fn data(
+            &mut self,
+            _channel: ChannelId,
+            data: &[u8],
+            _session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            if let Some(tx) = STDIN_TX.lock().unwrap().as_ref() {
+                let _ = tx.send(data.to_vec());
+            }
+            Ok(())
+        }
+    }
+
+    // Global stdin sender (one handler at a time in tests)
+    use std::sync::Mutex;
+    static STDIN_TX: Mutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>> = Mutex::new(None);
+
+    // --- Start SSH server on random port ---
+
+    let key = russh::keys::ssh_key::PrivateKey::from_openssh(
+        // Pre-generated Ed25519 test key (not used for anything sensitive)
+        "-----BEGIN OPENSSH PRIVATE KEY-----\n\
+         b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\n\
+         QyNTUxOQAAACDNF8H9T4hz3xjOs/9Sir1PSMCCf/uq9LDq1n2+RqnKbQAAAJjUO2xr1Dts\n\
+         awAAAAtzc2gtZWQyNTUxOQAAACDNF8H9T4hz3xjOs/9Sir1PSMCCf/uq9LDq1n2+RqnKbQ\n\
+         AAAECwlGy/T8W251pPYyguTT7l3I6VXzjfxIQm5PY6UUs0WM0Xwf1PiHPfGM6z/1KKvU9I\n\
+         wIJ/+6r0sOrWfb5GqcptAAAAFG5qaGFATWFjLmxvY2FsZG9tYWluAQ==\n\
+         -----END OPENSSH PRIVATE KEY-----\n",
+    )
+    .unwrap();
+    let config = Arc::new(Config {
+        keys: vec![key],
+        auth_rejection_time: std::time::Duration::from_secs(0),
+        auth_rejection_time_initial: Some(std::time::Duration::from_secs(0)),
+        ..Config::default()
+    });
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ssh_port = listener.local_addr().unwrap().port();
+
+    // Accept one SSH connection in the background and hand it to russh
+    let ssh_server_config = config.clone();
+    tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let _ = russh::server::run_stream(ssh_server_config, socket, TestHandler).await;
+    });
+
+    // --- Run bootstrap handshake ---
+
+    // Build path to the rose binary we just compiled
+    // Integration tests in a lib crate don't get CARGO_BIN_EXE_*.
+    // Find the binary relative to the test binary's directory.
+    let rose_bin = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("rose")
+        .to_string_lossy()
+        .to_string();
+
+    // Generate ephemeral client cert
+    let client_cert =
+        rose::config::generate_self_signed_cert(&["bootstrap-client".to_string()]).unwrap();
+
+    // Spawn SSH connecting to our test server
+    let mut ssh = tokio::process::Command::new("ssh")
+        .arg("-p")
+        .arg(ssh_port.to_string())
+        .arg("-o")
+        .arg("StrictHostKeyChecking=no")
+        .arg("-o")
+        .arg("UserKnownHostsFile=/dev/null")
+        .arg("-o")
+        .arg("PreferredAuthentications=none")
+        .arg("-o")
+        .arg("NoHostAuthenticationForLocalhost=yes")
+        .arg("127.0.0.1")
+        .arg(rose_bin)
+        .arg("server")
+        .arg("--bootstrap")
+        .arg("--ephemeral")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn ssh");
+
+    // Send client cert over SSH stdin
+    let cert_hex: String = client_cert
+        .cert_der
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    {
+        let stdin = ssh.stdin.as_mut().unwrap();
+        stdin.write_all(cert_hex.as_bytes()).await.unwrap();
+        stdin.write_all(b"\n").await.unwrap();
+        stdin.flush().await.unwrap();
+    }
+
+    // Read ROSE_BOOTSTRAP line from SSH stdout
+    let stdout = ssh.stdout.take().unwrap();
+    let mut reader = tokio::io::BufReader::new(stdout);
+    let mut line = String::new();
+
+    let read_result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        reader.read_line(&mut line),
+    )
+    .await;
+
+    match read_result {
+        Ok(Ok(n)) if n > 0 => {
+            assert!(
+                line.starts_with("ROSE_BOOTSTRAP "),
+                "expected ROSE_BOOTSTRAP line, got: {line:?}"
+            );
+            // Parse port and cert from the bootstrap line
+            let parts: Vec<&str> = line.trim().splitn(3, ' ').collect();
+            assert_eq!(parts.len(), 3);
+            let bootstrap_port: u16 = parts[1].parse().expect("invalid bootstrap port");
+            assert!(bootstrap_port >= 60000);
+            assert!(!parts[2].is_empty(), "server cert should not be empty");
+
+            // Try connecting QUIC to the bootstrap port
+            let server_cert_der: Vec<u8> = (0..parts[2].len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&parts[2][i..i + 2], 16).unwrap())
+                .collect();
+            let server_cert = rustls::pki_types::CertificateDer::from(server_cert_der);
+
+            let client = rose::transport::QuicClient::new().unwrap();
+            let addr: std::net::SocketAddr = format!("127.0.0.1:{bootstrap_port}").parse().unwrap();
+
+            let conn_result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client.connect_with_cert(addr, "localhost", &server_cert, &client_cert),
+            )
+            .await;
+
+            assert!(
+                conn_result.is_ok() && conn_result.unwrap().is_ok(),
+                "QUIC connection to bootstrap server should succeed"
+            );
+        }
+        Ok(Ok(_)) => panic!("SSH stdout closed without ROSE_BOOTSTRAP line"),
+        Ok(Err(e)) => panic!("failed to read from SSH stdout: {e}"),
+        Err(_) => {
+            // Read stderr for debugging
+            let stderr = ssh.stderr.take().unwrap();
+            let mut stderr_reader = tokio::io::BufReader::new(stderr);
+            let mut stderr_output = String::new();
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                stderr_reader.read_line(&mut stderr_output),
+            )
+            .await;
+            panic!("timeout waiting for ROSE_BOOTSTRAP line. stderr: {stderr_output:?}");
+        }
+    }
+
+    // Cleanup
+    let _ = ssh.kill().await;
 }
 
 // ---------------------------------------------------------------------------

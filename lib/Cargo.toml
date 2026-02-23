@@ -28,6 +28,7 @@ wezterm-term = { git = "https://github.com/wezterm/wezterm", branch = "main", ve
 bytes = "1.11.1"
 criterion.workspace = true
 insta.workspace = true
+russh = "0.57.0"
 tokio = { workspace = true, features = ["full"] }
 tracing-chrome = "0.7.2"
 tracing-subscriber = { workspace = true, features = ["registry"] }
