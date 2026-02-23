@@ -118,6 +118,50 @@ fn terminal_snapshot() {
 }
 
 // ---------------------------------------------------------------------------
+// Resize + line wrapping: snapshot test with insta
+// ---------------------------------------------------------------------------
+
+#[test]
+fn terminal_resize_wrapping() {
+    use rose::terminal::RoseTerminal;
+
+    /// Renders visible screen state as a human-readable string for snapshot
+    /// comparison. Each row is shown with its index, pipe-delimited, with
+    /// trailing whitespace trimmed.
+    fn render_screen(term: &RoseTerminal) -> String {
+        let (rows, cols) = term.size();
+        let (cx, cy) = term.cursor_pos();
+        let mut out = format!("size: {rows}x{cols}  cursor: ({cx},{cy})\n");
+        for r in 0..rows {
+            let text = term.line_text(r);
+            let trimmed = text.trim_end();
+            out.push_str(&format!("{r:2}|{trimmed}\n"));
+        }
+        out
+    }
+
+    let mut term = RoseTerminal::new(6, 20);
+    // Write text that will wrap at 20 columns
+    term.advance(b"ABCDEFGHIJKLMNOPQRSTUVWXYZ");
+    // Also write a second line
+    term.advance(b"\r\nshort line");
+
+    insta::assert_snapshot!("initial_20col", render_screen(&term));
+
+    // Resize wider — wrapped content should reflow
+    term.resize(6, 40);
+    insta::assert_snapshot!("after_widen_40col", render_screen(&term));
+
+    // Resize very narrow — content wraps more aggressively
+    term.resize(6, 10);
+    insta::assert_snapshot!("after_narrow_10col", render_screen(&term));
+
+    // Resize back to original
+    term.resize(6, 20);
+    insta::assert_snapshot!("after_restore_20col", render_screen(&term));
+}
+
+// ---------------------------------------------------------------------------
 // SSP sender → receiver roundtrip (no network)
 // ---------------------------------------------------------------------------
 

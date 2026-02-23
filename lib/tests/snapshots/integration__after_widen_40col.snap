@@ -1,0 +1,11 @@
+---
+source: lib/tests/integration.rs
+expression: render_screen(&term)
+---
+size: 6x40  cursor: (10,1)
+ 0|ABCDEFGHIJKLMNOPQRSTUVWXYZ
+ 1|short line
+ 2|
+ 3|
+ 4|
+ 5|
