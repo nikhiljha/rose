@@ -175,13 +175,6 @@ async fn run_server(listen: SocketAddr, bootstrap: bool, ephemeral: bool) -> any
             .map_err(|e| anyhow::anyhow!("failed to read client cert from stdin: {e}"))?;
         let client_cert_der = hex_decode(client_cert_hex.trim())?;
 
-        // Detach from the SSH session so we survive when the client kills SSH
-        // after the bootstrap handshake. setsid() creates a new session —
-        // the process won't receive SIGHUP when the SSH session ends.
-        // stdin/stdout remain open for the rest of the handshake.
-        #[cfg(unix)]
-        let _ = nix::unistd::setsid();
-
         let server_cert = config::generate_self_signed_cert(&["localhost".to_string()])?;
 
         // Write the client cert to a temp dir for mutual TLS authorization
@@ -309,6 +302,28 @@ async fn run_server(listen: SocketAddr, bootstrap: bool, ephemeral: bool) -> any
     }
 
     Ok(())
+}
+
+/// Detaches the server process from its parent (SSH session).
+///
+/// Calls `setsid()` to create a new session and ignores `SIGHUP` so
+/// the process survives when the SSH session that spawned it ends.
+///
+/// COVERAGE: Only exercised in bootstrap mode via SSH; tested via
+/// the `ssh_bootstrap_mode` integration test.
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn detach_from_parent() {
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::{SigHandler, Signal, signal};
+        use nix::unistd::setsid;
+        let _ = setsid();
+        // nix::sys::signal::signal() requires unsafe because POSIX signal
+        // handlers have strict requirements. SigIgn is always safe — it
+        // just tells the kernel to discard the signal.
+        #[allow(unsafe_code)]
+        let _ = unsafe { signal(Signal::SIGHUP, SigHandler::SigIgn) };
+    }
 }
 
 /// Generates a pseudo-random u16 for port selection.
@@ -629,6 +644,17 @@ async fn handle_server_session(conn: quinn::Connection, store: SessionStore) -> 
                         .expect("terminal lock poisoned")
                         .resize(rows, cols);
                 }
+                Ok(Some(ControlMessage::Detach)) => {
+                    tracing::info!("detach requested — daemonizing");
+                    detach_from_parent();
+                    if session
+                        .send_control(&ControlMessage::DetachAck)
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
                 Ok(Some(ControlMessage::Goodbye) | None) => break,
                 Ok(Some(msg)) => {
                     tracing::warn!(?msg, "unexpected control message");
@@ -815,7 +841,7 @@ async fn client_session_loop(
     cert_der: &rustls::pki_types::CertificateDer<'static>,
     client_cert: Option<&CertKeyPair>,
 ) -> anyhow::Result<()> {
-    client_session_loop_inner(addr, cert_der, client_cert, None, None).await
+    client_session_loop_inner(addr, cert_der, client_cert, None, None, None).await
 }
 
 /// Like [`client_session_loop`] but uses a pre-established connection for the
@@ -828,8 +854,17 @@ async fn client_session_loop_with_conn(
     addr: SocketAddr,
     cert_der: &rustls::pki_types::CertificateDer<'static>,
     client_cert: Option<&CertKeyPair>,
+    ssh_process: Option<tokio::process::Child>,
 ) -> anyhow::Result<()> {
-    client_session_loop_inner(addr, cert_der, client_cert, Some(first_conn), None).await
+    client_session_loop_inner(
+        addr,
+        cert_der,
+        client_cert,
+        Some(first_conn),
+        None,
+        ssh_process,
+    )
+    .await
 }
 
 /// Like [`client_session_loop`] but uses a pre-created [`QuicClient`] for the
@@ -843,6 +878,7 @@ async fn client_session_loop_with_client(
     cert_der: &rustls::pki_types::CertificateDer<'static>,
     client_cert: Option<&CertKeyPair>,
     stun_ctx: StunReconnectContext,
+    ssh_process: Option<tokio::process::Child>,
 ) -> anyhow::Result<()> {
     let conn = if let Some(cc) = client_cert {
         first_client
@@ -851,7 +887,15 @@ async fn client_session_loop_with_client(
     } else {
         first_client.connect(addr, "localhost", cert_der).await?
     };
-    client_session_loop_inner(addr, cert_der, client_cert, Some(conn), Some(stun_ctx)).await
+    client_session_loop_inner(
+        addr,
+        cert_der,
+        client_cert,
+        Some(conn),
+        Some(stun_ctx),
+        ssh_process,
+    )
+    .await
 }
 
 /// Performs STUN discovery for reconnection, returning a [`QuicClient`]
@@ -889,6 +933,7 @@ async fn client_session_loop_inner(
     client_cert: Option<&CertKeyPair>,
     first_conn: Option<quinn::Connection>,
     stun_ctx: Option<StunReconnectContext>,
+    mut ssh_process: Option<tokio::process::Child>,
 ) -> anyhow::Result<()> {
     let mut session_id: Option<[u8; 16]> = None;
     let mut backoff = Duration::from_millis(100);
@@ -1091,6 +1136,25 @@ async fn client_session_loop_inner(
                 backoff = (backoff * 2).min(Duration::from_secs(5));
                 continue;
             }
+        }
+
+        // On first connect with an SSH process, ask the server to detach
+        // from SSH, then kill the SSH process. This allows the QUIC session
+        // to survive independently and support roaming.
+        if let Some(mut ssh) = ssh_process.take() {
+            session
+                .send_control(&ControlMessage::Detach)
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to send Detach: {e}"))?;
+            match tokio::time::timeout(Duration::from_secs(5), session.recv_control()).await {
+                Ok(Ok(Some(ControlMessage::DetachAck))) => {
+                    tracing::info!("server detached — killing SSH");
+                }
+                other => {
+                    tracing::warn!("expected DetachAck, got {other:?}");
+                }
+            }
+            let _ = ssh.kill().await;
         }
 
         if session_id.is_some() && backoff > Duration::from_millis(100) {
@@ -1625,13 +1689,18 @@ async fn run_ssh_bootstrap(
         Ok(SessionSetup::WithConn(conn))
     };
 
-    // Bootstrap handshake is done — kill SSH. The QUIC connection is
-    // independent and supports roaming without SSH.
-    let _ = ssh.kill().await;
-
+    // Pass SSH process to the session loop — it will send Detach,
+    // wait for DetachAck, then kill SSH before starting the session.
     match result? {
         SessionSetup::WithConn(conn) => {
-            client_session_loop_with_conn(conn, addr, &server_cert_der, Some(&client_cert)).await
+            client_session_loop_with_conn(
+                conn,
+                addr,
+                &server_cert_der,
+                Some(&client_cert),
+                Some(ssh),
+            )
+            .await
         }
         SessionSetup::WithClient(client) => {
             client_session_loop_with_client(
@@ -1640,6 +1709,7 @@ async fn run_ssh_bootstrap(
                 &server_cert_der,
                 Some(&client_cert),
                 StunReconnectContext {},
+                Some(ssh),
             )
             .await
         }
