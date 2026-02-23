@@ -1549,8 +1549,9 @@ async fn run_ssh_bootstrap(
         Ok::<_, anyhow::Error>((socket, public_addr))
     });
 
-    eprintln!("[RoSE debug: attempting direct QUIC to {addr}]");
-    // Try direct QUIC connection first (3s timeout), unless --force-stun
+    // Try direct QUIC connection first (3s timeout), unless --force-stun.
+    // We return both the connection AND the client — dropping the client
+    // would close the endpoint and kill all connections on it.
     let direct_result = if force_stun {
         eprintln!("[RoSE: --force-stun: skipping direct attempt]");
         None
@@ -1558,25 +1559,23 @@ async fn run_ssh_bootstrap(
         Some(
             tokio::time::timeout(Duration::from_secs(3), async {
                 let client = QuicClient::new()?;
-                client
+                let conn = client
                     .connect_with_cert(addr, "localhost", &server_cert_der, &client_cert)
-                    .await
+                    .await?;
+                Ok::<_, crate::transport::TransportError>((client, conn))
             })
             .await,
         )
     };
 
     let use_stun = match &direct_result {
-        Some(Ok(Ok(_))) => {
-            eprintln!("[RoSE debug: direct QUIC succeeded]");
-            false
-        }
+        Some(Ok(Ok(_))) => false,
         Some(Ok(Err(e))) => {
-            eprintln!("[RoSE debug: direct QUIC failed: {e}]");
+            tracing::debug!("direct connection failed: {e}");
             true
         }
         Some(Err(_)) => {
-            eprintln!("[RoSE debug: direct QUIC timed out]");
+            tracing::debug!("direct connection timed out");
             true
         }
         None => true, // --force-stun
@@ -1619,9 +1618,7 @@ async fn run_ssh_bootstrap(
     };
 
     // Kill SSH — nohup keeps the server alive.
-    eprintln!("[RoSE debug: killing SSH, use_stun={use_stun}]");
     let _ = ssh.kill().await;
-    eprintln!("[RoSE debug: SSH killed]");
 
     // Enter raw mode and start the session loop
     terminal::enable_raw_mode()?;
@@ -1637,8 +1634,8 @@ async fn run_ssh_bootstrap(
             StunReconnectContext {},
         )
         .await
-    } else if let Some(Ok(Ok(conn))) = direct_result {
-        eprintln!("[RoSE debug: entering session loop with direct conn]");
+    } else if let Some(Ok(Ok((_client, conn)))) = direct_result {
+        // _client must stay alive — dropping it closes the endpoint.
         client_session_loop_with_conn(conn, addr, &server_cert_der, Some(&client_cert)).await
     } else {
         // Direct failed but STUN wasn't available — already bailed above
