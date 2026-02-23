@@ -111,6 +111,67 @@ fn push_color_sgr(color: ColorAttribute, is_fg: bool, codes: &mut Vec<String>) {
     }
 }
 
+/// Formats a terminal [`Line`](wezterm_term::Line) with ANSI SGR escape
+/// sequences, preserving colors and text attributes. Trailing
+/// default-attributed whitespace is trimmed.
+///
+/// Shared by [`RoseTerminal::line_ansi`] (visible rows) and
+/// [`RoseTerminal::scrollback_lines`] (scrollback history).
+fn format_line_cells(line: &wezterm_term::Line) -> String {
+    let default_attrs = CellAttributes::default();
+
+    // Collect runs of (attrs, text)
+    let mut runs: Vec<(CellAttributes, String)> = Vec::new();
+    for cell in line.visible_cells() {
+        let cell_attrs = cell.attrs().clone();
+        if let Some(last) = runs.last_mut()
+            && last.0 == cell_attrs
+        {
+            last.1.push_str(cell.str());
+            continue;
+        }
+        runs.push((cell_attrs, cell.str().to_string()));
+    }
+
+    // Trim trailing spaces from the last default-attr run
+    if let Some(last) = runs.last_mut()
+        && last.0 == default_attrs
+    {
+        let trimmed = last.1.trim_end().to_string();
+        if trimmed.is_empty() {
+            runs.pop();
+        } else {
+            last.1 = trimmed;
+        }
+    }
+
+    if runs.is_empty() {
+        return String::new();
+    }
+
+    // Build ANSI string
+    let mut result = String::new();
+    let mut current_attrs = default_attrs.clone();
+
+    for (attrs, text) in &runs {
+        if *attrs != current_attrs {
+            if current_attrs != default_attrs {
+                result.push_str("\x1b[0m");
+            }
+            result.push_str(&attrs_to_sgr(attrs));
+            current_attrs = attrs.clone();
+        }
+        result.push_str(text);
+    }
+
+    // Reset at end if non-default attributes were active
+    if current_attrs != default_attrs {
+        result.push_str("\x1b[0m");
+    }
+
+    result
+}
+
 /// Wraps a wezterm [`Terminal`] for use in `RoSE`'s state synchronization.
 pub struct RoseTerminal {
     inner: Terminal,
@@ -188,8 +249,9 @@ impl RoseTerminal {
 
     /// Returns scrollback lines (lines above the visible viewport).
     ///
-    /// Each entry is `(stable_row_index, text)`. Only lines that have scrolled
-    /// off the top of the visible area are included.
+    /// Each entry is `(stable_row_index, ansi_text)` where `ansi_text`
+    /// includes SGR escape sequences for colors and attributes, matching
+    /// the format used by [`line_ansi`] for visible rows.
     #[must_use]
     pub fn scrollback_lines(&self) -> Vec<(isize, String)> {
         let screen = self.inner.screen();
@@ -205,7 +267,7 @@ impl RoseTerminal {
             .enumerate()
             .map(|(i, line)| {
                 let stable = screen.phys_to_stable_row_index(i);
-                (stable, line.as_str().to_string())
+                (stable, format_line_cells(line))
             })
             .collect()
     }
@@ -222,59 +284,7 @@ impl RoseTerminal {
         let Some(line) = phys_lines.first() else {
             return String::new();
         };
-
-        let default_attrs = CellAttributes::default();
-
-        // Collect runs of (attrs, text)
-        let mut runs: Vec<(CellAttributes, String)> = Vec::new();
-        for cell in line.visible_cells() {
-            let cell_attrs = cell.attrs().clone();
-            if let Some(last) = runs.last_mut()
-                && last.0 == cell_attrs
-            {
-                last.1.push_str(cell.str());
-                continue;
-            }
-            runs.push((cell_attrs, cell.str().to_string()));
-        }
-
-        // Trim trailing spaces from the last default-attr run
-        if let Some(last) = runs.last_mut()
-            && last.0 == default_attrs
-        {
-            let trimmed = last.1.trim_end().to_string();
-            if trimmed.is_empty() {
-                runs.pop();
-            } else {
-                last.1 = trimmed;
-            }
-        }
-
-        if runs.is_empty() {
-            return String::new();
-        }
-
-        // Build ANSI string
-        let mut result = String::new();
-        let mut current_attrs = default_attrs.clone();
-
-        for (attrs, text) in &runs {
-            if *attrs != current_attrs {
-                if current_attrs != default_attrs {
-                    result.push_str("\x1b[0m");
-                }
-                result.push_str(&attrs_to_sgr(attrs));
-                current_attrs = attrs.clone();
-            }
-            result.push_str(text);
-        }
-
-        // Reset at end if non-default attributes were active
-        if current_attrs != default_attrs {
-            result.push_str("\x1b[0m");
-        }
-
-        result
+        format_line_cells(line)
     }
 
     /// Captures the current visible screen state as a [`ScreenState`].

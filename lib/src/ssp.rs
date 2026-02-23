@@ -598,11 +598,13 @@ pub fn render_full_redraw(scrollback: &[ScrollbackLine], visible: &ScreenState) 
         buf.extend_from_slice(b"\r\n");
     }
 
-    // Flush any remaining scrollback lines off the visible area by emitting
-    // enough newlines to push them all into the scrollback buffer
+    // Flush any remaining scrollback lines off the visible area.
+    // Each scrollback line's \r\n already moved the cursor down once,
+    // so we need (visible_rows - 1) additional newlines to push the
+    // last visible scrollback lines into the scrollback buffer.
     if !scrollback.is_empty() {
-        let visible_rows = visible.rows.len();
-        buf.extend(std::iter::repeat_n(b'\n', visible_rows));
+        let flush = visible.rows.len().saturating_sub(1);
+        buf.extend(std::iter::repeat_n(b'\n', flush));
     }
 
     // Render visible rows with absolute positioning
@@ -1227,10 +1229,10 @@ mod tests {
         assert!(pos0 < pos1);
         assert!(pos1 < pos2);
 
-        // Flush newlines present (2 for 2 visible rows)
+        // Flush newlines present (1 for 2 visible rows minus 1)
         let after_sb = pos2 + "sb line 2\r\n".len();
         let flush_region = &s[after_sb..s.find("\x1b[1;1H").unwrap()];
-        assert_eq!(flush_region.matches('\n').count(), 2);
+        assert_eq!(flush_region.matches('\n').count(), 1);
 
         // Visible rows rendered
         assert!(s.contains("visible A"));
