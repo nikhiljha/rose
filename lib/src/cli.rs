@@ -729,7 +729,6 @@ async fn client_session_loop(
 ) -> anyhow::Result<()> {
     let mut session_id: Option<[u8; 16]> = None;
     let mut backoff = Duration::from_millis(100);
-    let client = QuicClient::new()?;
 
     // Long-lived stdin reader: sends crossterm events through a channel
     // that survives across reconnection attempts, so the user can always
@@ -745,6 +744,22 @@ async fn client_session_loop(
     });
 
     loop {
+        // Create a fresh endpoint each iteration so the UDP socket
+        // survives network interface changes (WiFi → cellular, etc.).
+        let client = match QuicClient::new() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!(?backoff, "failed to create endpoint: {e}");
+                if wait_or_disconnect(&key_rx, backoff).await {
+                    let mut stdout = std::io::stdout();
+                    let _ = stdout.write_all(b"\r\n[RoSE: disconnected]\r\n");
+                    let _ = stdout.flush();
+                    break Ok(());
+                }
+                backoff = (backoff * 2).min(Duration::from_secs(5));
+                continue;
+            }
+        };
         let conn_result = tokio::time::timeout(Duration::from_secs(5), async {
             if let Some(cc) = client_cert {
                 client
@@ -784,7 +799,7 @@ async fn client_session_loop(
             }
         };
 
-        let (cols, rows) = terminal::size()?;
+        let (cols, rows) = terminal::size().unwrap_or((80, 24));
         let env = collect_env_vars();
         let mut session = if let Some(sid) = session_id {
             match ClientSession::reconnect(conn, rows, cols, sid, env).await {
