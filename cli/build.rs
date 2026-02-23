@@ -30,6 +30,10 @@ enum Commands {
         /// Use SSH bootstrap mode instead of native mode.
         #[arg(long)]
         ssh: bool,
+
+        /// Path to the `rose` binary on the remote server (for `--ssh` mode).
+        #[arg(long, default_value = "rose")]
+        server_binary: String,
     },
     /// Run the `RoSE` server daemon.
     Server {

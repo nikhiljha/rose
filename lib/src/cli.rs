@@ -54,6 +54,10 @@ enum Commands {
         /// Use SSH bootstrap mode instead of native mode.
         #[arg(long)]
         ssh: bool,
+
+        /// Path to the `rose` binary on the remote server (for `--ssh` mode).
+        #[arg(long, default_value = "rose")]
+        server_binary: String,
     },
     /// Run the `RoSE` server daemon.
     Server {
@@ -95,9 +99,10 @@ pub async fn run() -> anyhow::Result<()> {
             port,
             cert,
             ssh,
+            server_binary,
         } => {
             if ssh {
-                run_ssh_bootstrap(&host).await
+                run_ssh_bootstrap(&host, &server_binary).await
             } else {
                 run_client(&host, port, cert).await
             }
@@ -842,7 +847,7 @@ async fn client_session_loop(
 ///
 /// COVERAGE: CLI bootstrap mode is tested via unit tests for parsing.
 #[cfg_attr(coverage_nightly, coverage(off))]
-async fn run_ssh_bootstrap(host: &str) -> anyhow::Result<()> {
+async fn run_ssh_bootstrap(host: &str, server_binary: &str) -> anyhow::Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
     // Generate ephemeral client cert — private key stays local
@@ -852,7 +857,7 @@ async fn run_ssh_bootstrap(host: &str) -> anyhow::Result<()> {
 
     let mut ssh = tokio::process::Command::new("ssh")
         .arg(host)
-        .arg("rose")
+        .arg(server_binary)
         .arg("server")
         .arg("--bootstrap")
         .arg("--ephemeral")
@@ -891,14 +896,20 @@ async fn run_ssh_bootstrap(host: &str) -> anyhow::Result<()> {
 
     let server_cert_der = rustls::pki_types::CertificateDer::from(server_cert_der);
 
-    // Resolve host to an IP for QUIC (UDP) connection
+    // Resolve the actual hostname via `ssh -G` since the user may be using
+    // an SSH config alias (Host) that isn't a real DNS name.
+    let resolved_host = resolve_ssh_hostname(host).await?;
     let addr: SocketAddr = {
         use std::net::ToSocketAddrs;
-        format!("{host}:{port}")
+        format!("{resolved_host}:{port}")
             .to_socket_addrs()
             .ok()
             .and_then(|mut addrs| addrs.next())
-            .ok_or_else(|| anyhow::anyhow!("could not resolve {host}:{port}"))?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "could not resolve {resolved_host}:{port} (from ssh config for {host})"
+                )
+            })?
     };
 
     // Enter raw mode and start the client session loop with mutual TLS
@@ -911,6 +922,39 @@ async fn run_ssh_bootstrap(host: &str) -> anyhow::Result<()> {
     let _ = ssh.kill().await;
 
     result
+}
+
+/// Resolves an SSH host alias to the actual hostname using `ssh -G`.
+///
+/// SSH config aliases (e.g., `myserver` mapping to `10.0.0.5` via `HostName`)
+/// aren't DNS-resolvable, so we ask SSH what it would actually connect to.
+///
+/// COVERAGE: Requires SSH to be installed.
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn resolve_ssh_hostname(host: &str) -> anyhow::Result<String> {
+    let output = tokio::process::Command::new("ssh")
+        .arg("-G")
+        .arg(host)
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to run `ssh -G {host}`: {e}"))?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "`ssh -G {host}` failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if let Some(hostname) = line.strip_prefix("hostname ") {
+            return Ok(hostname.to_string());
+        }
+    }
+
+    // If ssh -G doesn't have a hostname field, fall back to the original
+    Ok(host.to_string())
 }
 
 /// Processes an SSP frame: applies diff, renders to stdout, sends ACK.
