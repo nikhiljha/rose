@@ -206,20 +206,39 @@ async fn run_server(listen: SocketAddr, bootstrap: bool, ephemeral: bool) -> any
 
         server
     } else {
-        QuicServer::bind(listen)?
+        // Native mode: reuse existing server cert if available, otherwise
+        // generate one. Generating a new cert on every startup would
+        // invalidate clients' TOFU cache.
+        let paths = RosePaths::resolve();
+        std::fs::create_dir_all(&paths.config_dir)?;
+        let cert_path = paths.config_dir.join("server.crt");
+        let key_path = paths.config_dir.join("server.key");
+
+        let cert = if cert_path.exists() && key_path.exists() {
+            let cert_der_bytes = std::fs::read(&cert_path)?;
+            let key_der = std::fs::read(&key_path)?;
+            eprintln!("Loaded existing certificate from {}", cert_path.display());
+            CertKeyPair {
+                cert_pem: String::new(),
+                key_pem: String::new(),
+                cert_der: rustls::pki_types::CertificateDer::from(cert_der_bytes),
+                key_der,
+            }
+        } else {
+            let cert = config::generate_self_signed_cert(&["localhost".to_string()])?;
+            std::fs::write(&cert_path, cert.cert_der.as_ref())?;
+            std::fs::write(&key_path, &cert.key_der)?;
+            eprintln!("Generated new certificate at {}", cert_path.display());
+            cert
+        };
+
+        QuicServer::bind_with_cert(listen, cert)?
     };
 
     let addr = server.local_addr()?;
 
     if !bootstrap {
         eprintln!("RoSE server listening on {addr}");
-
-        // Save server cert for clients to use
-        let paths = RosePaths::resolve();
-        std::fs::create_dir_all(&paths.config_dir)?;
-        let cert_path = paths.config_dir.join("server.crt");
-        std::fs::write(&cert_path, server.server_cert_der().as_ref())?;
-        eprintln!("Server certificate written to {}", cert_path.display());
     }
 
     let store = SessionStore::new();
