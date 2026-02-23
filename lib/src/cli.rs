@@ -896,6 +896,10 @@ async fn client_session_loop_inner(
     let mut session_id: Option<[u8; 16]> = None;
     let mut backoff = Duration::from_millis(100);
     let mut initial_conn = first_conn;
+    /// Max retries before giving up on the initial connection.
+    /// Once a session is established, retries are unlimited (reconnection).
+    const MAX_INITIAL_RETRIES: u32 = 5;
+    let mut initial_retries: u32 = 0;
 
     // Long-lived stdin reader: sends crossterm events through a channel
     // that survives across reconnection attempts, so the user can always
@@ -911,6 +915,26 @@ async fn client_session_loop_inner(
     });
 
     loop {
+        // On initial connection (no session yet), give up after MAX_INITIAL_RETRIES.
+        // Once a session is established, retry indefinitely (reconnection).
+        if session_id.is_none() && initial_conn.is_none() {
+            initial_retries += 1;
+            if initial_retries > MAX_INITIAL_RETRIES {
+                let mut stdout = std::io::stdout();
+                let _ = stdout.write_all(b"\r\n[RoSE: could not connect to server, giving up]\r\n");
+                let _ = stdout.flush();
+                anyhow::bail!("failed to connect after {MAX_INITIAL_RETRIES} attempts");
+            }
+            let mut stdout = std::io::stdout();
+            let _ = stdout.write_all(
+                format!(
+                    "\r\n[RoSE: connection failed, retrying ({initial_retries}/{MAX_INITIAL_RETRIES})...]\r\n"
+                )
+                .as_bytes(),
+            );
+            let _ = stdout.flush();
+        }
+
         // If we have a pre-established connection (first iteration after
         // bootstrap), use it directly. Otherwise, create a fresh endpoint
         // so the UDP socket survives network interface changes.
