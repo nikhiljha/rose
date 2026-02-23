@@ -224,6 +224,76 @@ fn ssp_render_scrollback_in_client_terminal() {
          but got none — render_diff_ansi is using absolute positioning instead \
          of real scroll operations"
     );
+
+    // ---------------------------------------------------------------
+    // Phase 2: after scrolling, non-scroll updates must still render.
+    // This reproduces the real-world freeze: ls scrolls, then the
+    // shell prompt (a non-scroll single-row change) fails to display.
+    // ---------------------------------------------------------------
+
+    // Simulate typing a character (non-scroll change: only bottom row changes)
+    server_term.advance(b"$ ");
+    ssp_cycle(
+        &server_term,
+        &mut sender,
+        &mut receiver,
+        &mut client_term,
+        &mut prev_state,
+    );
+
+    let server_text = server_term.screen_text();
+    let client_text = client_term.screen_text();
+    let server_lines: Vec<&str> = server_text.lines().map(str::trim_end).collect();
+    let client_lines: Vec<&str> = client_text.lines().map(str::trim_end).collect();
+    assert_eq!(
+        server_lines, client_lines,
+        "after scroll, non-scroll update (prompt) should render correctly"
+    );
+
+    // Type more characters — simulates user typing after ls output
+    for ch in ['h', 'e', 'l', 'l', 'o'] {
+        server_term.advance(format!("{ch}").as_bytes());
+        ssp_cycle(
+            &server_term,
+            &mut sender,
+            &mut receiver,
+            &mut client_term,
+            &mut prev_state,
+        );
+    }
+
+    let server_text = server_term.screen_text();
+    let client_text = client_term.screen_text();
+    let server_lines: Vec<&str> = server_text.lines().map(str::trim_end).collect();
+    let client_lines: Vec<&str> = client_text.lines().map(str::trim_end).collect();
+    assert_eq!(
+        server_lines, client_lines,
+        "typing after scroll should render correctly on client"
+    );
+    // Verify the typed text is visible
+    assert!(
+        client_lines.iter().any(|l| l.contains("$ hello")),
+        "client should show typed text '$ hello', got: {client_lines:?}"
+    );
+
+    // Phase 3: another scroll after non-scroll updates
+    server_term.advance(b"\r\nmore output\r\nand more\r\nkeep going\r\nstill more\r\nfinal");
+    ssp_cycle(
+        &server_term,
+        &mut sender,
+        &mut receiver,
+        &mut client_term,
+        &mut prev_state,
+    );
+
+    let server_text = server_term.screen_text();
+    let client_text = client_term.screen_text();
+    let server_lines: Vec<&str> = server_text.lines().map(str::trim_end).collect();
+    let client_lines: Vec<&str> = client_text.lines().map(str::trim_end).collect();
+    assert_eq!(
+        server_lines, client_lines,
+        "second scroll after typing should render correctly"
+    );
 }
 
 // ---------------------------------------------------------------------------

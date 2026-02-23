@@ -780,31 +780,33 @@ async fn client_session_loop(
                         }
                     }
                     scrollback::stream_type::SCROLLBACK => {
-                        // Scrollback stream: read lines continuously
+                        // Spawn scrollback reader as a separate task so the
+                        // stream accept loop remains free to handle SSP frames.
                         let sb_rx = Arc::clone(&scrollback_rx);
-                        let mut buf = Vec::new();
-                        loop {
-                            let mut chunk = vec![0u8; 4096];
-                            match uni.read(&mut chunk).await {
-                                Ok(Some(n)) => {
-                                    buf.extend_from_slice(&chunk[..n]);
-                                    // Decode as many complete lines as possible
-                                    while buf.len() >= 12 {
-                                        match ScrollbackLine::decode(&buf) {
-                                            Ok((line, consumed)) => {
-                                                sb_rx
-                                                    .lock()
-                                                    .expect("scrollback lock poisoned")
-                                                    .add_line(line);
-                                                buf.drain(..consumed);
+                        tokio::spawn(async move {
+                            let mut buf = Vec::new();
+                            loop {
+                                let mut chunk = vec![0u8; 4096];
+                                match uni.read(&mut chunk).await {
+                                    Ok(Some(n)) => {
+                                        buf.extend_from_slice(&chunk[..n]);
+                                        while buf.len() >= 12 {
+                                            match ScrollbackLine::decode(&buf) {
+                                                Ok((line, consumed)) => {
+                                                    sb_rx
+                                                        .lock()
+                                                        .expect("scrollback lock poisoned")
+                                                        .add_line(line);
+                                                    buf.drain(..consumed);
+                                                }
+                                                Err(_) => break,
                                             }
-                                            Err(_) => break,
                                         }
                                     }
+                                    _ => break,
                                 }
-                                _ => break,
                             }
-                        }
+                        });
                     }
                     _ => {
                         tracing::warn!(type_byte = type_buf[0], "unknown uni stream type");
