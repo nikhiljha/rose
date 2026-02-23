@@ -21,8 +21,7 @@ use crate::pty::PtySession;
 use crate::scrollback::{self, ScrollbackLine, ScrollbackReceiver, ScrollbackSender};
 use crate::session::{DetachedSession, SessionStore};
 use crate::ssp::{
-    DATAGRAM_KEYSTROKE, DATAGRAM_SSP_ACK, ScreenState, SspFrame, SspReceiver, SspSender,
-    render_diff_ansi,
+    DATAGRAM_KEYSTROKE, DATAGRAM_SSP_ACK, SspFrame, SspReceiver, SspSender, render_diff_ansi,
 };
 use crate::terminal::RoseTerminal;
 use crate::transport::{QuicClient, QuicServer};
@@ -733,25 +732,33 @@ async fn client_session_loop(
 
         // Fresh SSP state each connection (server resets SspSender on reconnect)
         let receiver = Arc::new(Mutex::new(SspReceiver::new(rows)));
-        let prev_state = Arc::new(Mutex::new(ScreenState::empty(rows)));
+        // Client-side terminal tracks what's actually on the user's screen.
+        // We diff against this (not the network SSP state) to generate correct
+        // ANSI output regardless of scroll artifacts or clear-line padding.
+        let client_terminal = Arc::new(Mutex::new(RoseTerminal::new(rows, cols)));
+        // Initialize client terminal with same clear as the real terminal
+        client_terminal
+            .lock()
+            .expect("client terminal lock poisoned")
+            .advance(b"\x1b[2J\x1b[H");
 
         // Task: receive SSP frames via datagrams → apply diff → render
         let output_conn = session.connection().clone();
         let recv_dgram = Arc::clone(&receiver);
-        let prev_dgram = Arc::clone(&prev_state);
+        let client_dgram = Arc::clone(&client_terminal);
         let output_task = tokio::spawn(async move {
             while let Ok(data) = output_conn.read_datagram().await {
                 let Ok(frame) = SspFrame::decode(&data) else {
                     continue;
                 };
-                process_ssp_frame(&frame, &recv_dgram, &prev_dgram, &output_conn);
+                process_ssp_frame(&frame, &recv_dgram, &client_dgram, &output_conn);
             }
         });
 
         // Task: receive uni streams (oversized SSP frames and scrollback)
         let stream_conn = session.connection().clone();
         let recv_stream = Arc::clone(&receiver);
-        let prev_stream = Arc::clone(&prev_state);
+        let client_stream = Arc::clone(&client_terminal);
         let scrollback_rx = Arc::new(Mutex::new(ScrollbackReceiver::new()));
         let stream_task = tokio::spawn(async move {
             while let Ok(mut uni) = stream_conn.accept_uni().await {
@@ -774,7 +781,7 @@ async fn client_session_loop(
                                     process_ssp_frame(
                                         &frame,
                                         &recv_stream,
-                                        &prev_stream,
+                                        &client_stream,
                                         &stream_conn,
                                     );
                                 }
@@ -1083,24 +1090,31 @@ async fn resolve_ssh_hostname(host: &str) -> anyhow::Result<String> {
 ///
 /// Shared by both the datagram and stream receive paths.
 ///
+/// Diffs the new SSP state against the client terminal's actual content
+/// (not the previous network state) to generate correct ANSI output.
+/// The client terminal is then advanced with the same ANSI, keeping it
+/// in sync with what's on the user's screen.
+///
 /// COVERAGE: CLI helper tested via integration/e2e tests.
 #[cfg_attr(coverage_nightly, coverage(off))]
 fn process_ssp_frame(
     frame: &SspFrame,
     receiver: &Arc<Mutex<SspReceiver>>,
-    prev_state: &Arc<Mutex<ScreenState>>,
+    client_term: &Arc<Mutex<RoseTerminal>>,
     conn: &quinn::Connection,
 ) {
     let mut recv = receiver.lock().expect("receiver lock poisoned");
     match recv.process_frame(frame) {
         Ok(Some(_)) => {
             let new_state = recv.state().clone();
-            let mut prev = prev_state.lock().expect("prev_state lock poisoned");
-            let ansi = render_diff_ansi(&prev, &new_state);
+            let mut term = client_term.lock().expect("client terminal lock poisoned");
+            let client_state = term.snapshot();
+            let ansi = render_diff_ansi(&client_state, &new_state);
             let mut out = std::io::stdout();
             let _ = out.write_all(&ansi);
             let _ = out.flush();
-            *prev = new_state;
+            // Advance client terminal with same ANSI so it tracks what's on screen
+            term.advance(&ansi);
 
             // Send ACK back to server
             let ack = SspFrame::ack_only(recv.ack_num());
