@@ -42,6 +42,9 @@ steps:
     commands:
       - bash site/build.sh
       - wrangler pages deploy site/public --project-name=rose --branch=main
+    secrets:
+      - CLOUDFLARE_API_TOKEN
+      - CLOUDFLARE_ACCOUNT_ID
     plugins:
       - docker#v5.11.0:
           image: "ghcr.io/nikhiljha/rose-ci:latest"
