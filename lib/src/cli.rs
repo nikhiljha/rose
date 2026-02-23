@@ -571,20 +571,44 @@ async fn handle_server_session(conn: quinn::Connection, store: SessionStore) -> 
     // can reconnect later — even if the network just dropped without a
     // Goodbye. The control_task holds the PTY, so we keep its handle
     // alive via `&mut` and await it afterwards to extract the PTY.
+    // When control_task itself wins the race, we extract the PTY directly
+    // since a JoinHandle cannot be polled after completion.
     let mut control_task = control_task;
-    let shell_exited = tokio::select! {
-        _ = output_task => true,
-        _ = input_task => false,
-        _ = scrollback_task => false,
-        _ = &mut control_task => false,
+    let shell_exited;
+    let pty_from_control;
+    tokio::select! {
+        _ = output_task => {
+            shell_exited = true;
+            pty_from_control = None;
+        },
+        _ = input_task => {
+            shell_exited = false;
+            pty_from_control = None;
+        },
+        _ = scrollback_task => {
+            shell_exited = false;
+            pty_from_control = None;
+        },
+        result = &mut control_task => {
+            shell_exited = false;
+            pty_from_control = result.ok();
+        },
     };
 
     if shell_exited {
         close_conn.close(0u32.into(), b"shell exited");
     } else {
-        // Await control_task to get the PTY back for detaching.
-        // It will finish quickly since the connection is dead.
-        if let Ok(Ok(pty)) = tokio::time::timeout(Duration::from_secs(2), control_task).await {
+        // Get PTY for detaching: either already extracted from control_task
+        // (if it won the select race), or await it now (it will finish
+        // quickly since the connection is dead).
+        let pty = match pty_from_control {
+            Some(pty) => Some(pty),
+            None => tokio::time::timeout(Duration::from_secs(2), control_task)
+                .await
+                .ok()
+                .and_then(Result::ok),
+        };
+        if let Some(pty) = pty {
             let _ = store.insert(
                 session_id,
                 DetachedSession {
@@ -732,14 +756,7 @@ async fn client_session_loop(
                 c
             }
             Ok(Err(e)) => {
-                let mut stdout = std::io::stdout();
-                let _ = stdout.write_all(
-                    format!(
-                        "\r\n[RoSE: connection failed ({e}), reconnecting in {backoff:?}...]\r\n"
-                    )
-                    .as_bytes(),
-                );
-                let _ = stdout.flush();
+                tracing::debug!(?backoff, "connection failed: {e}");
                 if wait_or_disconnect(&key_rx, backoff).await {
                     let mut stdout = std::io::stdout();
                     let _ = stdout.write_all(b"\r\n[RoSE: disconnected]\r\n");
@@ -750,12 +767,7 @@ async fn client_session_loop(
                 continue;
             }
             Err(_) => {
-                let mut stdout = std::io::stdout();
-                let _ = stdout.write_all(
-                    format!("\r\n[RoSE: connection timed out, reconnecting in {backoff:?}...]\r\n")
-                        .as_bytes(),
-                );
-                let _ = stdout.flush();
+                tracing::debug!(?backoff, "connection timed out");
                 if wait_or_disconnect(&key_rx, backoff).await {
                     let mut stdout = std::io::stdout();
                     let _ = stdout.write_all(b"\r\n[RoSE: disconnected]\r\n");
@@ -773,14 +785,7 @@ async fn client_session_loop(
             match ClientSession::reconnect(conn, rows, cols, sid, env).await {
                 Ok(s) => s,
                 Err(e) => {
-                    let mut stdout = std::io::stdout();
-                    let _ = stdout.write_all(
-                        format!(
-                            "\r\n[RoSE: reconnect handshake failed ({e}), retrying in {backoff:?}...]\r\n"
-                        )
-                        .as_bytes(),
-                    );
-                    let _ = stdout.flush();
+                    tracing::debug!(?backoff, "reconnect handshake failed: {e}");
                     if wait_or_disconnect(&key_rx, backoff).await {
                         let mut stdout = std::io::stdout();
                         let _ = stdout.write_all(b"\r\n[RoSE: disconnected]\r\n");
@@ -807,12 +812,7 @@ async fn client_session_loop(
                 anyhow::bail!("expected SessionInfo, got {other:?}");
             }
             Ok(Ok(None) | Err(_)) | Err(_) => {
-                let mut stdout = std::io::stdout();
-                let _ = stdout.write_all(
-                    format!("\r\n[RoSE: handshake timed out, retrying in {backoff:?}...]\r\n")
-                        .as_bytes(),
-                );
-                let _ = stdout.flush();
+                tracing::debug!(?backoff, "handshake timed out");
                 if wait_or_disconnect(&key_rx, backoff).await {
                     let mut stdout = std::io::stdout();
                     let _ = stdout.write_all(b"\r\n[RoSE: disconnected]\r\n");
@@ -824,20 +824,10 @@ async fn client_session_loop(
             }
         }
 
-        {
-            let mut stdout = std::io::stdout();
-            let _ = stdout.write_all(
-                format!(
-                    "\r\n[RoSE: {}]\r\n",
-                    if session_id.is_some() && backoff > Duration::from_millis(100) {
-                        "reconnected"
-                    } else {
-                        "connected"
-                    }
-                )
-                .as_bytes(),
-            );
-            let _ = stdout.flush();
+        if session_id.is_some() && backoff > Duration::from_millis(100) {
+            tracing::info!("reconnected");
+        } else {
+            tracing::info!("connected");
         }
 
         // Clear screen + scrollback so SSP rendering starts clean
@@ -1183,9 +1173,7 @@ async fn client_session_loop(
                 break Ok(());
             }
             SessionExit::ConnectionLost => {
-                let mut stdout = std::io::stdout();
-                let _ = stdout.write_all(b"\r\n[RoSE: connection lost, reconnecting...]\r\n");
-                let _ = stdout.flush();
+                tracing::debug!("connection lost, reconnecting");
             }
         }
     }
