@@ -360,6 +360,7 @@ async fn handle_server_session(conn: quinn::Connection, store: SessionStore) -> 
     };
 
     let mut pty_output = pty.subscribe_output();
+    let pty_closed = pty.closed();
     let pty_writer = pty.clone_writer();
 
     // Task: PTY output → terminal → SSP diff → client datagram
@@ -392,6 +393,7 @@ async fn handle_server_session(conn: quinn::Connection, store: SessionStore) -> 
                     }
                 }
                 _ = retransmit.tick() => {}
+                () = pty_closed.notified() => break,
             }
 
             // Send eagerly: snapshot and push state as soon as PTY output

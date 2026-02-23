@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use portable_pty::{Child, ChildKiller, CommandBuilder, ExitStatus, MasterPty, PtySize};
-use tokio::sync::broadcast;
+use tokio::sync::{Notify, broadcast};
 
 /// Errors that can occur during PTY operations.
 #[derive(Debug, thiserror::Error)]
@@ -31,6 +31,8 @@ pub struct PtySession {
     child: Box<dyn Child + Send + Sync>,
     killer: Box<dyn ChildKiller + Send + Sync>,
     output_tx: broadcast::Sender<Bytes>,
+    /// Notified when the PTY reader thread exits (shell closed).
+    pty_closed: Arc<Notify>,
     _reader_handle: std::thread::JoinHandle<()>,
 }
 
@@ -129,6 +131,10 @@ impl PtySession {
             .try_clone_reader()
             .map_err(|e| PtyError::Io(std::io::Error::other(e.to_string())))?;
 
+        // Notified when the reader thread exits (shell closed / PTY EOF).
+        let pty_closed = Arc::new(Notify::new());
+        let closed = Arc::clone(&pty_closed);
+
         // Spawn a dedicated OS thread for blocking PTY reads.
         // tokio::task::spawn_blocking is not suitable because the tokio
         // blocking thread pool has a limited number of threads and this
@@ -146,6 +152,7 @@ impl PtySession {
                     Err(_) => break,
                 }
             }
+            closed.notify_waiters();
         });
 
         Ok(Self {
@@ -154,6 +161,7 @@ impl PtySession {
             child,
             killer,
             output_tx,
+            pty_closed,
             _reader_handle: reader_handle,
         })
     }
@@ -163,6 +171,15 @@ impl PtySession {
     #[must_use]
     pub fn subscribe_output(&self) -> broadcast::Receiver<Bytes> {
         self.output_tx.subscribe()
+    }
+
+    /// Returns a handle that is notified when the PTY reader exits
+    /// (shell closed / EOF). Used by the server to detect shell exit
+    /// even though the broadcast channel stays open (`PtySession` holds
+    /// a sender).
+    #[must_use]
+    pub fn closed(&self) -> Arc<Notify> {
+        Arc::clone(&self.pty_closed)
     }
 
     /// Returns a clone of the writer handle for use from another task/thread.
