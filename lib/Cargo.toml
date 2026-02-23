@@ -21,7 +21,7 @@ termwiz = "0.23.3"
 thiserror.workspace = true
 tokio = { workspace = true, features = ["full"] }
 tracing.workspace = true
-tracing-subscriber.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 wezterm-term = { git = "https://github.com/wezterm/wezterm", branch = "main", version = "0.1.0" }
 
 [dev-dependencies]
