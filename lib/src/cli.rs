@@ -175,6 +175,13 @@ async fn run_server(listen: SocketAddr, bootstrap: bool, ephemeral: bool) -> any
             .map_err(|e| anyhow::anyhow!("failed to read client cert from stdin: {e}"))?;
         let client_cert_der = hex_decode(client_cert_hex.trim())?;
 
+        // Detach from the SSH session so we survive when the client kills SSH
+        // after the bootstrap handshake. setsid() creates a new session —
+        // the process won't receive SIGHUP when the SSH session ends.
+        // stdin/stdout remain open for the rest of the handshake.
+        #[cfg(unix)]
+        let _ = nix::unistd::setsid();
+
         let server_cert = config::generate_self_signed_cert(&["localhost".to_string()])?;
 
         // Write the client cert to a temp dir for mutual TLS authorization
