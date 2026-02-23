@@ -105,10 +105,20 @@ pub fn generate_self_signed_cert(san: &[String]) -> Result<CertKeyPair, ConfigEr
 ///
 /// Returns `ConfigError::Tls` if the TLS configuration is invalid.
 pub fn build_server_config(cert: &CertKeyPair) -> Result<quinn::ServerConfig, ConfigError> {
-    let server_config = quinn::ServerConfig::with_single_cert(
+    let mut server_config = quinn::ServerConfig::with_single_cert(
         vec![cert.cert_der.clone()],
         PrivateKeyDer::Pkcs8(cert.key_der.clone().into()),
     )?;
+
+    let mut transport = quinn::TransportConfig::default();
+    // Detect dead clients within 15s. The client sends keep-alives every 5s,
+    // so a live client will always respond in time.
+    transport.max_idle_timeout(Some(
+        // 15s is well within the valid range for IdleTimeout.
+        quinn::IdleTimeout::from(quinn::VarInt::from_u32(15_000)),
+    ));
+    server_config.transport_config(Arc::new(transport));
+
     Ok(server_config)
 }
 
@@ -340,10 +350,17 @@ pub fn build_mutual_tls_server_config(
             PrivateKeyDer::Pkcs8(cert.key_der.clone().into()),
         )?;
 
-    let server_config = quinn::ServerConfig::with_crypto(Arc::new(
+    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(rustls_config)
             .map_err(|e| ConfigError::QuicCrypto(e.to_string()))?,
     ));
+
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_idle_timeout(Some(
+        // 15s is well within the valid range for IdleTimeout.
+        quinn::IdleTimeout::from(quinn::VarInt::from_u32(15_000)),
+    ));
+    server_config.transport_config(Arc::new(transport));
 
     Ok(server_config)
 }

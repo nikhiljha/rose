@@ -1013,7 +1013,9 @@ async fn client_session_loop_inner(
     let mut initial_conn = first_conn;
     /// Max retries before giving up on the initial connection.
     /// Once a session is established, retries are unlimited (reconnection).
-    const MAX_INITIAL_RETRIES: u32 = 5;
+    /// Set high enough to outlast the server's idle timeout (15s) when
+    /// reattaching after detach.
+    const MAX_INITIAL_RETRIES: u32 = 10;
     let mut initial_retries: u32 = 0;
 
     // Long-lived stdin reader: sends crossterm events through a channel
@@ -1142,7 +1144,7 @@ async fn client_session_loop_inner(
                     c
                 }
                 Ok(Err(e)) => {
-                    tracing::debug!(?backoff, "connection failed: {e}");
+                    eprintln!("[RoSE: {e}]");
                     if wait_or_disconnect(&key_rx, backoff).await {
                         let mut stdout = std::io::stdout();
                         let _ = stdout.write_all(b"\r\n[RoSE: disconnected]\r\n");
@@ -1153,7 +1155,7 @@ async fn client_session_loop_inner(
                     continue;
                 }
                 Err(_) => {
-                    tracing::debug!(?backoff, "connection timed out");
+                    eprintln!("[RoSE: connection timed out]");
                     if wait_or_disconnect(&key_rx, backoff).await {
                         let mut stdout = std::io::stdout();
                         let _ = stdout.write_all(b"\r\n[RoSE: disconnected]\r\n");
