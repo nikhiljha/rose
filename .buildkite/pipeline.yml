@@ -7,48 +7,45 @@ cache:
     - target
 
 steps:
-  - group: ":rust: CI"
-    steps:
-      - label: ":memo: Format"
-        command: cargo fmt --all -- --check
-        plugins:
-          - docker#v5.11.0:
-              image: "ghcr.io/nikhiljha/rose-ci:latest"
-              mount-checkout: true
+  - label: ":memo: Format"
+    command: cargo fmt --all -- --check
+    plugins:
+      - docker#v5.11.0:
+          image: "ghcr.io/nikhiljha/rose-ci:latest"
+          mount-checkout: true
 
-      - label: ":lint-roller: Clippy"
-        command: cargo clippy --workspace --all-targets
-        plugins:
-          - docker#v5.11.0:
-              image: "ghcr.io/nikhiljha/rose-ci:latest"
-              mount-checkout: true
+  - label: ":lint-roller: Clippy"
+    command: cargo clippy --workspace --all-targets
+    plugins:
+      - docker#v5.11.0:
+          image: "ghcr.io/nikhiljha/rose-ci:latest"
+          mount-checkout: true
 
-      - label: ":bar_chart: Coverage"
-        commands:
-          - cargo +nightly llvm-cov-easy nextest --workspace --branch
-          - cargo test --workspace --doc
-        plugins:
-          - docker#v5.11.0:
-              image: "ghcr.io/nikhiljha/rose-ci:latest"
-              mount-checkout: true
+  - label: ":bar_chart: Coverage"
+    commands:
+      - cargo +nightly llvm-cov-easy nextest --workspace --branch
+      - cargo test --workspace --doc
+    plugins:
+      - docker#v5.11.0:
+          image: "ghcr.io/nikhiljha/rose-ci:latest"
+          mount-checkout: true
 
-      - label: ":shield: Security"
-        command: cargo deny check
-        plugins:
-          - docker#v5.11.0:
-              image: "ghcr.io/nikhiljha/rose-ci:latest"
-              mount-checkout: true
+  - label: ":shield: Security"
+    command: cargo deny check
+    plugins:
+      - docker#v5.11.0:
+          image: "ghcr.io/nikhiljha/rose-ci:latest"
+          mount-checkout: true
 
-  - wait
-
-  - group: ":globe_with_meridians: Deploy"
-    steps:
-      - label: ":zap: Build & Deploy Site"
-        if: build.branch == "main" && build.pull_request.id == null
-        commands:
-          - bash site/build.sh
-          - wrangler pages deploy site/public --project-name=rose --branch=main
-        plugins:
-          - docker#v5.11.0:
-              image: "ghcr.io/nikhiljha/rose-ci:latest"
-              mount-checkout: true
+  - label: ":zap: Build & Deploy Site"
+    if: build.branch == "main" && build.pull_request.id == null
+    commands:
+      - bash site/build.sh
+      - wrangler pages deploy site/public --project-name=rose --branch=main
+    plugins:
+      - docker#v5.11.0:
+          image: "ghcr.io/nikhiljha/rose-ci:latest"
+          mount-checkout: true
+          environment:
+            - CLOUDFLARE_API_TOKEN
+            - CLOUDFLARE_ACCOUNT_ID
