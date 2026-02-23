@@ -1,5 +1,9 @@
 [advisories]
-ignore = []
+# Transitive deps from wezterm — not actionable on our side
+ignore = [
+    "RUSTSEC-2025-0056", # adler unmaintained (via wezterm → image → png → flate2)
+    "RUSTSEC-2024-0436", # paste unmaintained (via wezterm)
+]
 
 [licenses]
 allow = [
@@ -11,6 +15,11 @@ allow = [
     "Unicode-3.0",
     "Unicode-DFS-2016",
     "Zlib",
+    "GPL-3.0-or-later",      # rose itself
+    "OpenSSL",                # aws-lc-sys (via rustls)
+    "NCSA",                   # libfuzzer-sys (via rav1e/image/wezterm)
+    "WTFPL",                  # terminfo (via wezterm)
+    "CDLA-Permissive-2.0",    # webpki-root-certs (via rustls-platform-verifier)
 ]
 
 [bans]
@@ -21,4 +30,8 @@ wildcards = "deny"
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
+# wezterm crates are not published to crates.io; pulled from git
+allow-git = [
+    "https://github.com/wezterm/wezterm",
+    "https://github.com/wez/finl_unicode.git",
+]
