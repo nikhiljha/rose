@@ -12,6 +12,23 @@ use quinn::crypto::rustls::QuicClientConfig;
 use rustls::SignatureScheme;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 
+/// Sanitizes a hostname for safe use in filesystem paths.
+///
+/// Replaces any character that is not alphanumeric, `.`, `-`, or `_` with `_`,
+/// preventing path traversal attacks (e.g., `../../etc/passwd`).
+#[must_use]
+pub fn sanitize_hostname(host: &str) -> String {
+    host.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// Errors that can occur during configuration or certificate operations.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -184,7 +201,8 @@ pub fn tofu_check(
     host: &str,
     server_cert_der: &[u8],
 ) -> Result<TofuResult, ConfigError> {
-    let cert_path = known_hosts_dir.join(format!("{host}.crt"));
+    let sanitized = sanitize_hostname(host);
+    let cert_path = known_hosts_dir.join(format!("{sanitized}.crt"));
 
     if cert_path.exists() {
         let cached = std::fs::read(&cert_path)?;
@@ -500,6 +518,30 @@ mod tests {
     fn build_platform_verified_client_config_succeeds() {
         let config = build_platform_verified_client_config();
         assert!(config.is_ok());
+    }
+
+    #[test]
+    fn sanitize_hostname_normal() {
+        assert_eq!(sanitize_hostname("example.com"), "example.com");
+        assert_eq!(sanitize_hostname("host-1_a"), "host-1_a");
+    }
+
+    #[test]
+    fn sanitize_hostname_path_traversal() {
+        assert_eq!(sanitize_hostname("../../etc/passwd"), ".._.._etc_passwd");
+        assert_eq!(sanitize_hostname("foo/bar"), "foo_bar");
+    }
+
+    #[test]
+    fn tofu_path_traversal_is_contained() {
+        let dir = std::env::temp_dir().join(format!("rose-tofu-traversal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let result = tofu_check(&dir, "../../etc/shadow", b"cert").unwrap();
+        assert_eq!(result, TofuResult::FirstConnection);
+        assert!(dir.join(".._.._etc_shadow.crt").exists());
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

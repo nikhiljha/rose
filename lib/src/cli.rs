@@ -197,7 +197,7 @@ async fn run_server(listen: SocketAddr, bootstrap: bool) -> anyhow::Result<()> {
         } else {
             let cert = config::generate_self_signed_cert(&["localhost".to_string()])?;
             std::fs::write(&cert_path, cert.cert_der.as_ref())?;
-            std::fs::write(&key_path, &cert.key_der)?;
+            write_private_key(&key_path, &cert.key_der)?;
             cert
         };
 
@@ -256,12 +256,13 @@ async fn run_server(listen: SocketAddr, bootstrap: bool) -> anyhow::Result<()> {
         } else {
             let cert = config::generate_self_signed_cert(&["localhost".to_string()])?;
             std::fs::write(&cert_path, cert.cert_der.as_ref())?;
-            std::fs::write(&key_path, &cert.key_der)?;
+            write_private_key(&key_path, &cert.key_der)?;
             eprintln!("Generated new certificate at {}", cert_path.display());
             cert
         };
 
-        QuicServer::bind_with_cert(listen, cert)?
+        std::fs::create_dir_all(&paths.authorized_certs_dir)?;
+        QuicServer::bind_mutual_tls(listen, cert, &paths.authorized_certs_dir)?
     };
 
     let addr = server.local_addr()?;
@@ -358,10 +359,13 @@ fn load_or_generate_client_cert() -> anyhow::Result<CertKeyPair> {
         let cert = config::generate_self_signed_cert(&["localhost".to_string()])?;
         // Save DER for fast loading
         std::fs::write(&cert_der_path, cert.cert_der.as_ref())?;
-        std::fs::write(&key_der_path, &cert.key_der)?;
+        write_private_key(&key_der_path, &cert.key_der)?;
         // Also save PEM for human readability / interop
         std::fs::write(paths.config_dir.join("client.crt"), &cert.cert_pem)?;
-        std::fs::write(paths.config_dir.join("client.key"), &cert.key_pem)?;
+        write_private_key(
+            &paths.config_dir.join("client.key"),
+            cert.key_pem.as_bytes(),
+        )?;
         eprintln!(
             "Generated client certificate at {}",
             cert_der_path.display()
@@ -370,16 +374,33 @@ fn load_or_generate_client_cert() -> anyhow::Result<CertKeyPair> {
     }
 }
 
-/// Generates a pseudo-random u16 for port selection.
+/// Writes private key data to a file with owner-only permissions (0o600).
+#[cfg(unix)]
+fn write_private_key(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(data)
+}
+
+/// Writes private key data to a file (non-Unix fallback).
+#[cfg(not(unix))]
+fn write_private_key(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, data)
+}
+
+/// Generates a random u16 using system entropy.
 ///
 /// COVERAGE: Thin wrapper for bootstrap port randomization.
 #[cfg_attr(coverage_nightly, coverage(off))]
 fn rand_u16() -> u16 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("time before epoch");
-    (now.subsec_nanos() % 65536) as u16
+    let mut buf = [0u8; 2];
+    getrandom::getrandom(&mut buf).expect("OS RNG unavailable");
+    u16::from_ne_bytes(buf)
 }
 
 /// Hex-encodes a byte slice.
@@ -494,6 +515,23 @@ async fn reattach_session(
     ))
 }
 
+/// Server-side allowlist for environment variables that clients may set.
+const ALLOWED_ENV_VARS: &[&str] = &["TERM", "COLORTERM", "LANG"];
+
+/// Returns true if the environment variable name is allowed by the server.
+fn is_allowed_env_var(name: &str) -> bool {
+    ALLOWED_ENV_VARS.contains(&name) || name.starts_with("LC_")
+}
+
+/// Filters environment variables from the client, keeping only safe entries.
+fn filter_env_vars(env_vars: &[(String, String)]) -> Vec<(String, String)> {
+    env_vars
+        .iter()
+        .filter(|(k, _)| is_allowed_env_var(k))
+        .cloned()
+        .collect()
+}
+
 /// COVERAGE: Tested via integration/e2e tests.
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn new_session(
@@ -505,7 +543,8 @@ async fn new_session(
     let session_id: [u8; 16] = rand_session_id();
     tracing::info!(rows, cols, "new session");
 
-    let pty = PtySession::open_with_env(rows, cols, env_vars)?;
+    let filtered = filter_env_vars(env_vars);
+    let pty = PtySession::open_with_env(rows, cols, &filtered)?;
     let terminal = Arc::new(Mutex::new(RoseTerminal::new(rows, cols)));
     let ssp_sender = Arc::new(Mutex::new(SspSender::new()));
 
@@ -842,17 +881,9 @@ async fn handle_server_session(
 /// COVERAGE: Thin wrapper around getrandom, tested via integration tests.
 #[cfg_attr(coverage_nightly, coverage(off))]
 fn rand_session_id() -> [u8; 16] {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    // Mix process ID, thread ID, and high-precision time for uniqueness.
-    // This is not cryptographic but sufficient for session IDs.
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("time before epoch");
-    let nanos = now.as_nanos();
-    let pid = u128::from(std::process::id());
-    let tid = std::thread::current().id();
-    let seed = nanos ^ (pid << 32) ^ (format!("{tid:?}").len() as u128);
-    seed.to_ne_bytes()
+    let mut buf = [0u8; 16];
+    getrandom::getrandom(&mut buf).expect("OS RNG unavailable");
+    buf
 }
 
 /// Collects environment variables to forward from client to server.
@@ -897,7 +928,9 @@ async fn run_client(
     // Load server certificate
     let cert_path = cert_path.unwrap_or_else(|| {
         let paths = RosePaths::resolve();
-        paths.known_hosts_dir.join(format!("{host}.crt"))
+        paths
+            .known_hosts_dir
+            .join(format!("{}.crt", config::sanitize_hostname(host)))
     });
     let cert_der = std::fs::read(&cert_path).map_err(|e| {
         anyhow::anyhow!(
@@ -907,37 +940,21 @@ async fn run_client(
     })?;
     let cert_der = rustls::pki_types::CertificateDer::from(cert_der);
 
-    // Load client cert for mutual TLS if specified, or auto-load if
-    // the persistent client cert exists (for reattaching to bootstrap sessions).
+    // Load client cert for mutual TLS (required — server always demands mTLS).
     let client_cert = if let Some(ref path) = client_cert_path {
         let cert_der_bytes = std::fs::read(path)?;
         let key_path = path.with_extension("key.der");
         let key_der = std::fs::read(&key_path).map_err(|e| {
             anyhow::anyhow!("failed to read client key at {}: {e}", key_path.display())
         })?;
-        Some(CertKeyPair {
+        CertKeyPair {
             cert_pem: String::new(),
             key_pem: String::new(),
             cert_der: rustls::pki_types::CertificateDer::from(cert_der_bytes),
             key_der,
-        })
-    } else {
-        // Auto-detect: if persistent client cert exists, use it for mutual TLS
-        let paths = RosePaths::resolve();
-        let auto_cert = paths.config_dir.join("client.crt.der");
-        let auto_key = paths.config_dir.join("client.key.der");
-        if auto_cert.exists() && auto_key.exists() {
-            let cert_der_bytes = std::fs::read(&auto_cert)?;
-            let key_der = std::fs::read(&auto_key)?;
-            Some(CertKeyPair {
-                cert_pem: String::new(),
-                key_pem: String::new(),
-                cert_der: rustls::pki_types::CertificateDer::from(cert_der_bytes),
-                key_der,
-            })
-        } else {
-            None
         }
+    } else {
+        load_or_generate_client_cert()?
     };
 
     let addr: SocketAddr = format!("{host}:{port}").parse().unwrap_or_else(|_| {
@@ -957,7 +974,7 @@ async fn run_client(
     terminal::enable_raw_mode()?;
     let _raw_guard = RawModeGuard;
 
-    client_session_loop(addr, &cert_der, client_cert.as_ref()).await
+    client_session_loop(addr, &cert_der, &client_cert).await
 }
 
 /// Marker that STUN was used for the initial connection.
@@ -978,7 +995,7 @@ struct StunReconnectContext {}
 async fn client_session_loop(
     addr: SocketAddr,
     cert_der: &rustls::pki_types::CertificateDer<'static>,
-    client_cert: Option<&CertKeyPair>,
+    client_cert: &CertKeyPair,
 ) -> anyhow::Result<()> {
     client_session_loop_inner(addr, cert_der, client_cert, None, None).await
 }
@@ -992,7 +1009,7 @@ async fn client_session_loop_with_conn(
     first_conn: quinn::Connection,
     addr: SocketAddr,
     cert_der: &rustls::pki_types::CertificateDer<'static>,
-    client_cert: Option<&CertKeyPair>,
+    client_cert: &CertKeyPair,
 ) -> anyhow::Result<()> {
     client_session_loop_inner(addr, cert_der, client_cert, Some(first_conn), None).await
 }
@@ -1006,16 +1023,12 @@ async fn client_session_loop_with_client(
     first_client: QuicClient,
     addr: SocketAddr,
     cert_der: &rustls::pki_types::CertificateDer<'static>,
-    client_cert: Option<&CertKeyPair>,
+    client_cert: &CertKeyPair,
     stun_ctx: StunReconnectContext,
 ) -> anyhow::Result<()> {
-    let conn = if let Some(cc) = client_cert {
-        first_client
-            .connect_with_cert(addr, "localhost", cert_der, cc)
-            .await?
-    } else {
-        first_client.connect(addr, "localhost", cert_der).await?
-    };
+    let conn = first_client
+        .connect_with_cert(addr, "localhost", cert_der, client_cert)
+        .await?;
     client_session_loop_inner(addr, cert_der, client_cert, Some(conn), Some(stun_ctx)).await
 }
 
@@ -1051,7 +1064,7 @@ async fn stun_reconnect() -> anyhow::Result<QuicClient> {
 async fn client_session_loop_inner(
     addr: SocketAddr,
     cert_der: &rustls::pki_types::CertificateDer<'static>,
-    client_cert: Option<&CertKeyPair>,
+    client_cert: &CertKeyPair,
     first_conn: Option<quinn::Connection>,
     stun_ctx: Option<StunReconnectContext>,
 ) -> anyhow::Result<()> {
@@ -1113,14 +1126,8 @@ async fn client_session_loop_inner(
             // STUN was required — redo STUN for reconnection
             match stun_reconnect().await {
                 Ok(client) => {
-                    let conn_result = tokio::time::timeout(Duration::from_secs(5), async {
-                        if let Some(cc) = client_cert {
-                            client
-                                .connect_with_cert(addr, "localhost", cert_der, cc)
-                                .await
-                        } else {
-                            client.connect(addr, "localhost", cert_der).await
-                        }
+                    let conn_result = tokio::time::timeout(Duration::from_secs(5), {
+                        client.connect_with_cert(addr, "localhost", cert_der, client_cert)
                     })
                     .await;
                     match conn_result {
@@ -1180,14 +1187,8 @@ async fn client_session_loop_inner(
                     continue;
                 }
             };
-            let conn_result = tokio::time::timeout(Duration::from_secs(5), async {
-                if let Some(cc) = client_cert {
-                    client
-                        .connect_with_cert(addr, "localhost", cert_der, cc)
-                        .await
-                } else {
-                    client.connect(addr, "localhost", cert_der).await
-                }
+            let conn_result = tokio::time::timeout(Duration::from_secs(5), {
+                client.connect_with_cert(addr, "localhost", cert_der, client_cert)
             })
             .await;
             match conn_result {
@@ -1849,13 +1850,13 @@ async fn run_ssh_bootstrap(
             client,
             addr,
             &server_cert_der,
-            Some(&client_cert),
+            &client_cert,
             StunReconnectContext {},
         )
         .await
     } else if let Some(Ok(Ok((_client, conn)))) = direct_result {
         // _client must stay alive — dropping it closes the endpoint.
-        client_session_loop_with_conn(conn, addr, &server_cert_der, Some(&client_cert)).await
+        client_session_loop_with_conn(conn, addr, &server_cert_der, &client_cert).await
     } else {
         // Direct failed but STUN wasn't available — already bailed above
         unreachable!()
@@ -2072,12 +2073,15 @@ fn run_keygen() -> anyhow::Result<()> {
 
     // Save PEM (human readable) and DER (fast loading)
     std::fs::write(paths.config_dir.join("client.crt"), &cert.cert_pem)?;
-    std::fs::write(paths.config_dir.join("client.key"), &cert.key_pem)?;
+    write_private_key(
+        &paths.config_dir.join("client.key"),
+        cert.key_pem.as_bytes(),
+    )?;
     std::fs::write(
         paths.config_dir.join("client.crt.der"),
         cert.cert_der.as_ref(),
     )?;
-    std::fs::write(paths.config_dir.join("client.key.der"), &cert.key_der)?;
+    write_private_key(&paths.config_dir.join("client.key.der"), &cert.key_der)?;
 
     eprintln!(
         "Certificate: {}",
@@ -2430,5 +2434,39 @@ mod tests {
     fn key_event_f_key_via_key_event() {
         let key = crossterm::event::KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE);
         assert_eq!(key_event_to_bytes(&key), b"\x1bOP");
+    }
+
+    #[test]
+    fn filter_env_vars_allows_safe_vars() {
+        let input = vec![
+            ("TERM".into(), "xterm".into()),
+            ("LANG".into(), "en_US.UTF-8".into()),
+            ("COLORTERM".into(), "truecolor".into()),
+            ("LC_ALL".into(), "C".into()),
+        ];
+        let filtered = filter_env_vars(&input);
+        assert_eq!(filtered.len(), 4);
+    }
+
+    #[test]
+    fn filter_env_vars_blocks_dangerous_vars() {
+        let input = vec![
+            ("TERM".into(), "xterm".into()),
+            ("LD_PRELOAD".into(), "/evil.so".into()),
+            ("PATH".into(), "/tmp/evil".into()),
+            ("LD_LIBRARY_PATH".into(), "/tmp".into()),
+            ("SHELL".into(), "/bin/evil".into()),
+        ];
+        let filtered = filter_env_vars(&input);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].0, "TERM");
+    }
+
+    #[test]
+    fn is_allowed_env_var_lc_prefix() {
+        assert!(is_allowed_env_var("LC_CTYPE"));
+        assert!(is_allowed_env_var("LC_MESSAGES"));
+        assert!(!is_allowed_env_var("HOME"));
+        assert!(!is_allowed_env_var("USER"));
     }
 }

@@ -59,18 +59,10 @@ fn build_binding_request(txn_id: &[u8; 12]) -> [u8; 20] {
     buf
 }
 
-/// Generates a pseudo-random 12-byte transaction ID.
+/// Generates a random 12-byte STUN transaction ID using system entropy.
 fn random_txn_id() -> [u8; 12] {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("time before epoch")
-        .as_nanos();
-    let pid = u128::from(std::process::id());
-    let seed = nanos ^ (pid << 32);
-    let bytes = seed.to_ne_bytes();
     let mut txn = [0u8; 12];
-    txn.copy_from_slice(&bytes[..12]);
+    getrandom::getrandom(&mut txn).expect("OS RNG unavailable");
     txn
 }
 
