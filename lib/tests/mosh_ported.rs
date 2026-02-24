@@ -927,10 +927,11 @@ mod ssh_bootstrap_helpers {
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
-    pub struct TestHandler;
-
-    static STDIN_TX: Mutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>> = Mutex::new(None);
-    static BOOTSTRAP_CHILD_EXITED: AtomicBool = AtomicBool::new(false);
+    pub struct TestHandler {
+        home: std::path::PathBuf,
+        stdin_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>>,
+        child_exited: Arc<AtomicBool>,
+    }
 
     impl Handler for TestHandler {
         type Error = russh::Error;
@@ -967,9 +968,10 @@ mod ssh_bootstrap_helpers {
             let parts: Vec<&str> = command.split_whitespace().collect();
             let (program, args) = parts.split_first().expect("empty command");
 
-            BOOTSTRAP_CHILD_EXITED.store(false, Ordering::SeqCst);
+            self.child_exited.store(false, Ordering::SeqCst);
             let mut child = tokio::process::Command::new(program)
                 .args(args)
+                .env("HOME", &self.home)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
@@ -992,7 +994,7 @@ mod ssh_bootstrap_helpers {
             });
 
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-            STDIN_TX.lock().unwrap().replace(tx);
+            self.stdin_tx.lock().unwrap().replace(tx);
 
             tokio::spawn(async move {
                 let mut stdin = child_stdin;
@@ -1004,9 +1006,10 @@ mod ssh_bootstrap_helpers {
                 }
             });
 
+            let child_exited = self.child_exited.clone();
             tokio::spawn(async move {
                 let _ = child.wait().await;
-                BOOTSTRAP_CHILD_EXITED.store(true, Ordering::SeqCst);
+                child_exited.store(true, Ordering::SeqCst);
             });
 
             Ok(())
@@ -1018,7 +1021,7 @@ mod ssh_bootstrap_helpers {
             data: &[u8],
             _session: &mut Session,
         ) -> Result<(), Self::Error> {
-            if let Some(tx) = STDIN_TX.lock().unwrap().as_ref() {
+            if let Some(tx) = self.stdin_tx.lock().unwrap().as_ref() {
                 let _ = tx.send(data.to_vec());
             }
             Ok(())
@@ -1056,9 +1059,16 @@ mod ssh_bootstrap_helpers {
             .expect("could not find rose binary in cargo build output")
     }
 
-    pub async fn start_ssh_server() -> u16 {
+    pub struct SshServer {
+        pub port: u16,
+        pub child_exited: Arc<AtomicBool>,
+    }
+
+    pub async fn start_ssh_server(home: std::path::PathBuf) -> SshServer {
         use base64::Engine;
-        BOOTSTRAP_CHILD_EXITED.store(false, Ordering::SeqCst);
+        let child_exited = Arc::new(AtomicBool::new(false));
+        let stdin_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>> =
+            Arc::new(Mutex::new(None));
         let key_pem = String::from_utf8(
             base64::engine::general_purpose::STANDARD
                 .decode(concat!(
@@ -1089,19 +1099,29 @@ mod ssh_bootstrap_helpers {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let ssh_port = listener.local_addr().unwrap().port();
 
+        let child_exited_clone = child_exited.clone();
+        let stdin_tx_clone = stdin_tx.clone();
         tokio::spawn(async move {
             loop {
                 let Ok((socket, _)) = listener.accept().await else {
                     break;
                 };
                 let cfg = config.clone();
+                let handler = TestHandler {
+                    home: home.clone(),
+                    stdin_tx: stdin_tx_clone.clone(),
+                    child_exited: child_exited_clone.clone(),
+                };
                 tokio::spawn(async move {
-                    let _ = russh::server::run_stream(cfg, socket, TestHandler).await;
+                    let _ = russh::server::run_stream(cfg, socket, handler).await;
                 });
             }
         });
 
-        ssh_port
+        SshServer {
+            port: ssh_port,
+            child_exited,
+        }
     }
 
     pub struct PtyChild {
@@ -1168,8 +1188,15 @@ mod ssh_bootstrap_helpers {
         }
     }
 
-    pub fn bootstrap_cmd(rose_bin: &str, ssh_port: u16) -> CommandBuilder {
+    pub fn isolated_home_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("rose-test-home-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    pub fn bootstrap_cmd(rose_bin: &str, ssh_port: u16, home: &std::path::Path) -> CommandBuilder {
         let mut cmd = CommandBuilder::new(rose_bin);
+        cmd.env("HOME", home.as_os_str());
         cmd.args([
             "connect",
             "--ssh",
@@ -1215,15 +1242,18 @@ mod ssh_bootstrap_helpers {
         false
     }
 
-    pub async fn wait_for_bootstrap_child_exit(timeout_secs: u64) -> bool {
+    pub async fn wait_for_bootstrap_child_exit(
+        child_exited: &AtomicBool,
+        timeout_secs: u64,
+    ) -> bool {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
         while tokio::time::Instant::now() < deadline {
-            if BOOTSTRAP_CHILD_EXITED.load(Ordering::SeqCst) {
+            if child_exited.load(Ordering::SeqCst) {
                 return true;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        BOOTSTRAP_CHILD_EXITED.load(Ordering::SeqCst)
+        child_exited.load(Ordering::SeqCst)
     }
 }
 
@@ -1231,13 +1261,18 @@ mod ssh_bootstrap_helpers {
 async fn ssh_bootstrap_mode() {
     use ssh_bootstrap_helpers::*;
 
-    let ssh_port = start_ssh_server().await;
+    let home = isolated_home_dir();
+    let ssh = start_ssh_server(home.clone()).await;
     let rose_bin = build_rose_binary();
 
-    let cmd = bootstrap_cmd(&rose_bin, ssh_port);
+    let cmd = bootstrap_cmd(&rose_bin, ssh.port, &home);
     let mut pty = spawn_in_pty(cmd);
 
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        wait_for_output_contains(&pty, "Bootstrap: server on port", 15).await,
+        "bootstrap did not start. output:\n{}",
+        pty.captured_output()
+    );
 
     let w = pty.writer.as_mut().unwrap();
     std::io::Write::write_all(w, &[4]).unwrap();
@@ -1250,10 +1285,6 @@ async fn ssh_bootstrap_mode() {
         assert!(
             s.exit_code() == 0,
             "rose client exited with {s:?}. output:\n{captured}"
-        );
-        assert!(
-            captured.contains("Bootstrap: server on port"),
-            "bootstrap failed. output:\n{captured}"
         );
         assert!(
             !captured.contains("connection error") && !captured.contains("connection failed"),
@@ -1284,11 +1315,12 @@ async fn ssh_bootstrap_detach_reconnect() {
     }
 
     let result = tokio::time::timeout(std::time::Duration::from_secs(60), async {
-        let ssh_port = start_ssh_server().await;
+        let home = isolated_home_dir();
+        let ssh = start_ssh_server(home.clone()).await;
         let rose_bin = build_rose_binary();
         let marker = format!("rose_reconnect_marker_{}", std::process::id());
 
-        let cmd = bootstrap_cmd(&rose_bin, ssh_port);
+        let cmd = bootstrap_cmd(&rose_bin, ssh.port, &home);
         let mut pty = spawn_in_pty(cmd);
 
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -1361,6 +1393,7 @@ async fn ssh_bootstrap_detach_reconnect() {
             .expect("failed to parse port from bootstrap output");
 
         let mut cmd = CommandBuilder::new(&rose_bin);
+        cmd.env("HOME", home.as_os_str());
         cmd.args(["connect", "127.0.0.1", "--port", &port.to_string()]);
         let mut pty2 = spawn_in_pty(cmd);
 
@@ -1409,7 +1442,7 @@ async fn ssh_bootstrap_detach_reconnect() {
         );
 
         assert!(
-            wait_for_bootstrap_child_exit(10).await,
+            wait_for_bootstrap_child_exit(&ssh.child_exited, 10).await,
             "bootstrap server did not exit after shell exit. detach output:\n{captured}\nreconnect output:\n{captured2}"
         );
     })
