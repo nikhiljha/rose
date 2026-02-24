@@ -338,13 +338,18 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
     }
 }
 
-/// A server certificate verifier that accepts any certificate.
+/// A server certificate verifier that accepts any certificate identity but
+/// still cryptographically verifies TLS handshake signatures.
 ///
-/// This is intentionally insecure and should only be used for the TOFU
-/// first-connection flow where the cert is then cached for future verification.
+/// Used for the TOFU first-connection flow: we don't know which cert to
+/// expect, but we must verify the server actually holds the private key
+/// for the cert it presents (otherwise a MITM could present an arbitrary
+/// cert and the client would cache it permanently).
 ///
 #[derive(Debug)]
-struct TofuFirstConnectionVerifier;
+struct TofuFirstConnectionVerifier {
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
 
 impl rustls::client::danger::ServerCertVerifier for TofuFirstConnectionVerifier {
     fn verify_server_cert(
@@ -360,24 +365,34 @@ impl rustls::client::danger::ServerCertVerifier for TofuFirstConnectionVerifier 
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        rustls::crypto::ring::default_provider()
+        self.provider
             .signature_verification_algorithms
             .supported_schemes()
     }
@@ -393,11 +408,14 @@ impl rustls::client::danger::ServerCertVerifier for TofuFirstConnectionVerifier 
 /// Returns `ConfigError` if the TLS configuration cannot be built.
 pub fn build_tofu_client_config() -> Result<quinn::ClientConfig, ConfigError> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let verifier = TofuFirstConnectionVerifier {
+        provider: Arc::clone(&provider),
+    };
     let rustls_config = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| ConfigError::QuicCrypto(e.to_string()))?
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(TofuFirstConnectionVerifier))
+        .with_custom_certificate_verifier(Arc::new(verifier))
         .with_no_client_auth();
 
     let quic_client_config = QuicClientConfig::try_from(rustls_config)
@@ -592,11 +610,14 @@ pub fn build_tofu_client_config_with_cert(
     client_cert: &CertKeyPair,
 ) -> Result<quinn::ClientConfig, ConfigError> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let verifier = TofuFirstConnectionVerifier {
+        provider: Arc::clone(&provider),
+    };
     let rustls_config = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| ConfigError::QuicCrypto(e.to_string()))?
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(TofuFirstConnectionVerifier))
+        .with_custom_certificate_verifier(Arc::new(verifier))
         .with_client_auth_cert(
             vec![client_cert.cert_der.clone()],
             PrivateKeyDer::Pkcs8(client_cert.key_der.clone().into()),

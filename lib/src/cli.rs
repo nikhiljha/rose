@@ -613,10 +613,24 @@ async fn handle_server_session(
             cols,
             env_vars,
         } => {
-            // In bootstrap mode, reattach if a detached session exists.
-            let detached = if bootstrap { store.remove_any() } else { None };
-            if let Some((session_id, mut detached)) = detached {
-                detached.owner_cert_der = peer_cert.clone();
+            // In bootstrap mode, reattach if a detached session exists
+            // and the connecting client's cert matches the session owner.
+            let detached = if bootstrap {
+                let candidate = store.remove_any();
+                if let Some((id, ref det)) = candidate {
+                    if det.owner_cert_der.as_deref() == peer_cert.as_deref() {
+                        candidate
+                    } else {
+                        let _ = store.insert(id, candidate.unwrap().1);
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some((session_id, detached)) = detached {
                 reattach_session(&mut session, session_id, detached, rows, cols).await?
             } else {
                 new_session(&mut session, rows, cols, &env_vars).await?
