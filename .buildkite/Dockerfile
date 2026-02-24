@@ -1,7 +1,7 @@
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential curl ca-certificates pkg-config git \
+    build-essential curl ca-certificates pkg-config git openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
 # Rust stable + nightly
