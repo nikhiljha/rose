@@ -11,6 +11,38 @@ use std::sync::Arc;
 use quinn::crypto::rustls::QuicClientConfig;
 use rustls::SignatureScheme;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+use serde::{Deserialize, Serialize};
+
+/// Application configuration loaded from `~/.config/rose/config.toml`.
+///
+/// All fields have sensible defaults so a missing config file is equivalent
+/// to an empty one.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+#[derive(Default)]
+pub struct RoseConfig {
+    /// Require CA-signed server certificates verified against the OS trust
+    /// store. When `true`, TOFU and pinned self-signed certs are rejected.
+    pub require_ca_certs: bool,
+}
+
+impl RoseConfig {
+    /// Loads config from `<config_dir>/config.toml`, falling back to defaults
+    /// if the file does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConfigError::Io` on filesystem errors or
+    /// `ConfigError::ConfigParse` if the file is not valid TOML.
+    pub fn load(config_dir: &Path) -> Result<Self, ConfigError> {
+        let path = config_dir.join("config.toml");
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let contents = std::fs::read_to_string(&path)?;
+        toml::from_str(&contents).map_err(|e| ConfigError::ConfigParse(e.to_string()))
+    }
+}
 
 /// Sanitizes a hostname for safe use in filesystem paths.
 ///
@@ -44,6 +76,9 @@ pub enum ConfigError {
     /// Quinn crypto configuration error.
     #[error("QUIC crypto configuration error: {0}")]
     QuicCrypto(String),
+    /// Config file parse error.
+    #[error("config parse error: {0}")]
+    ConfigParse(String),
 }
 
 /// A generated certificate and its private key in both PEM and DER formats.
@@ -404,6 +439,43 @@ pub fn build_platform_verified_client_config() -> Result<quinn::ClientConfig, Co
     Ok(client_config)
 }
 
+/// Builds a quinn `ClientConfig` that verifies the server certificate against
+/// the OS trust store and provides a client cert for mutual TLS.
+///
+/// Use this when `require_ca_certs` is `true` — the server must present a
+/// CA-signed certificate (e.g., from Let's Encrypt).
+///
+/// # Errors
+///
+/// Returns `ConfigError` if the TLS configuration cannot be built.
+pub fn build_platform_verified_client_config_with_cert(
+    client_cert: &CertKeyPair,
+) -> Result<quinn::ClientConfig, ConfigError> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let verifier = rustls_platform_verifier::Verifier::new(Arc::clone(&provider))
+        .map_err(|e| ConfigError::QuicCrypto(format!("platform verifier: {e}")))?;
+    let rustls_config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|e| ConfigError::QuicCrypto(e.to_string()))?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(verifier))
+        .with_client_auth_cert(
+            vec![client_cert.cert_der.clone()],
+            PrivateKeyDer::Pkcs8(client_cert.key_der.clone().into()),
+        )?;
+
+    let quic_client_config = QuicClientConfig::try_from(rustls_config)
+        .map_err(|e| ConfigError::QuicCrypto(e.to_string()))?;
+
+    let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
+
+    let mut transport = quinn::TransportConfig::default();
+    transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
+    client_config.transport_config(Arc::new(transport));
+
+    Ok(client_config)
+}
+
 /// Builds a quinn `ServerConfig` that requires mutual TLS client authentication.
 ///
 /// Loads all `.crt` files from `authorized_certs_dir` as trusted client certificate
@@ -715,5 +787,69 @@ mod tests {
         let client = generate_self_signed_cert(&["localhost".to_string()]).unwrap();
         let config = build_tofu_client_config_with_cert(&client);
         assert!(config.is_ok());
+    }
+
+    #[test]
+    fn build_platform_verified_client_config_with_cert_succeeds() {
+        let client = generate_self_signed_cert(&["localhost".to_string()]).unwrap();
+        let config = build_platform_verified_client_config_with_cert(&client);
+        assert!(config.is_ok());
+    }
+
+    #[test]
+    fn config_default_does_not_require_ca() {
+        let cfg = RoseConfig::default();
+        assert!(!cfg.require_ca_certs);
+    }
+
+    #[test]
+    fn config_load_missing_file_returns_default() {
+        let dir = std::env::temp_dir().join(format!("rose-cfg-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = RoseConfig::load(&dir).unwrap();
+        assert_eq!(cfg, RoseConfig::default());
+    }
+
+    #[test]
+    fn config_load_empty_file_returns_default() {
+        let dir = std::env::temp_dir().join(format!("rose-cfg-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.toml"), "").unwrap();
+        let cfg = RoseConfig::load(&dir).unwrap();
+        assert_eq!(cfg, RoseConfig::default());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn config_load_require_ca_certs_true() {
+        let dir = std::env::temp_dir().join(format!("rose-cfg-ca-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.toml"), "require_ca_certs = true\n").unwrap();
+        let cfg = RoseConfig::load(&dir).unwrap();
+        assert!(cfg.require_ca_certs);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn config_load_invalid_toml() {
+        let dir = std::env::temp_dir().join(format!("rose-cfg-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.toml"), "not valid {{{{ toml").unwrap();
+        let err = RoseConfig::load(&dir).unwrap_err();
+        assert!(matches!(err, ConfigError::ConfigParse(_)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn config_roundtrip_toml() {
+        let cfg = RoseConfig {
+            require_ca_certs: true,
+        };
+        let serialized = toml::to_string(&cfg).unwrap();
+        let deserialized: RoseConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(cfg, deserialized);
     }
 }

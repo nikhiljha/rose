@@ -969,7 +969,9 @@ async fn run_client(
     cert_path: Option<PathBuf>,
     client_cert_path: Option<PathBuf>,
 ) -> anyhow::Result<()> {
-    // Load client cert first (needed for both normal and TOFU flows).
+    let paths = RosePaths::resolve();
+    let cfg = config::RoseConfig::load(&paths.config_dir)?;
+
     let client_cert = if let Some(ref path) = client_cert_path {
         let cert_der_bytes = std::fs::read(path)?;
         let key_path = path.with_extension("key.der");
@@ -986,13 +988,6 @@ async fn run_client(
         load_or_generate_client_cert()?
     };
 
-    let cert_path = cert_path.unwrap_or_else(|| {
-        let paths = RosePaths::resolve();
-        paths
-            .known_hosts_dir
-            .join(format!("{}.crt", config::sanitize_hostname(host)))
-    });
-
     let addr: SocketAddr = format!("{host}:{port}").parse().unwrap_or_else(|_| {
         use std::net::ToSocketAddrs;
         format!("{host}:{port}")
@@ -1005,21 +1000,29 @@ async fn run_client(
             })
     });
 
-    // Load server cert or do TOFU (before entering raw mode so user can type).
-    let cert_der = if cert_path.exists() {
-        let bytes = std::fs::read(&cert_path).map_err(|e| {
-            anyhow::anyhow!("failed to read server cert at {}: {e}", cert_path.display())
-        })?;
-        rustls::pki_types::CertificateDer::from(bytes)
+    let client_config = if cfg.require_ca_certs {
+        config::build_platform_verified_client_config_with_cert(&client_cert)?
     } else {
-        tofu_first_connect(host, addr, &client_cert, &cert_path).await?
+        let cert_path = cert_path.unwrap_or_else(|| {
+            paths
+                .known_hosts_dir
+                .join(format!("{}.crt", config::sanitize_hostname(host)))
+        });
+        let cert_der = if cert_path.exists() {
+            let bytes = std::fs::read(&cert_path).map_err(|e| {
+                anyhow::anyhow!("failed to read server cert at {}: {e}", cert_path.display())
+            })?;
+            rustls::pki_types::CertificateDer::from(bytes)
+        } else {
+            tofu_first_connect(host, addr, &client_cert, &cert_path).await?
+        };
+        config::build_client_config_with_cert(&cert_der, &client_cert)?
     };
 
-    // Enter raw mode before the reconnection loop so it stays active across reconnections
     terminal::enable_raw_mode()?;
     let _raw_guard = RawModeGuard;
 
-    client_session_loop(addr, host, &cert_der, &client_cert).await
+    client_session_loop(addr, host, client_config).await
 }
 
 /// Performs a TOFU (Trust On First Use) first connection: connects to the
@@ -1081,10 +1084,9 @@ struct StunReconnectContext {}
 async fn client_session_loop(
     addr: SocketAddr,
     server_name: &str,
-    cert_der: &rustls::pki_types::CertificateDer<'static>,
-    client_cert: &CertKeyPair,
+    client_config: quinn::ClientConfig,
 ) -> anyhow::Result<()> {
-    client_session_loop_inner(addr, server_name, cert_der, client_cert, None, None).await
+    client_session_loop_inner(addr, server_name, client_config, None, None).await
 }
 
 /// Like [`client_session_loop`] but uses a pre-established connection for the
@@ -1096,18 +1098,9 @@ async fn client_session_loop_with_conn(
     first_conn: quinn::Connection,
     addr: SocketAddr,
     server_name: &str,
-    cert_der: &rustls::pki_types::CertificateDer<'static>,
-    client_cert: &CertKeyPair,
+    client_config: quinn::ClientConfig,
 ) -> anyhow::Result<()> {
-    client_session_loop_inner(
-        addr,
-        server_name,
-        cert_der,
-        client_cert,
-        Some(first_conn),
-        None,
-    )
-    .await
+    client_session_loop_inner(addr, server_name, client_config, Some(first_conn), None).await
 }
 
 /// Like [`client_session_loop`] but uses a pre-created [`QuicClient`] for the
@@ -1119,22 +1112,13 @@ async fn client_session_loop_with_client(
     first_client: QuicClient,
     addr: SocketAddr,
     server_name: &str,
-    cert_der: &rustls::pki_types::CertificateDer<'static>,
-    client_cert: &CertKeyPair,
+    client_config: quinn::ClientConfig,
     stun_ctx: StunReconnectContext,
 ) -> anyhow::Result<()> {
     let conn = first_client
-        .connect_with_cert(addr, server_name, cert_der, client_cert)
+        .connect_with_config(client_config.clone(), addr, server_name)
         .await?;
-    client_session_loop_inner(
-        addr,
-        server_name,
-        cert_der,
-        client_cert,
-        Some(conn),
-        Some(stun_ctx),
-    )
-    .await
+    client_session_loop_inner(addr, server_name, client_config, Some(conn), Some(stun_ctx)).await
 }
 
 /// Performs STUN discovery for reconnection, returning a [`QuicClient`]
@@ -1169,8 +1153,7 @@ async fn stun_reconnect() -> anyhow::Result<QuicClient> {
 async fn client_session_loop_inner(
     addr: SocketAddr,
     server_name: &str,
-    cert_der: &rustls::pki_types::CertificateDer<'static>,
-    client_cert: &CertKeyPair,
+    client_config: quinn::ClientConfig,
     first_conn: Option<quinn::Connection>,
     stun_ctx: Option<StunReconnectContext>,
 ) -> anyhow::Result<()> {
@@ -1233,7 +1216,7 @@ async fn client_session_loop_inner(
             match stun_reconnect().await {
                 Ok(client) => {
                     let conn_result = tokio::time::timeout(Duration::from_secs(5), {
-                        client.connect_with_cert(addr, server_name, cert_der, client_cert)
+                        client.connect_with_config(client_config.clone(), addr, server_name)
                     })
                     .await;
                     match conn_result {
@@ -1294,7 +1277,7 @@ async fn client_session_loop_inner(
                 }
             };
             let conn_result = tokio::time::timeout(Duration::from_secs(5), {
-                client.connect_with_cert(addr, server_name, cert_der, client_cert)
+                client.connect_with_config(client_config.clone(), addr, server_name)
             })
             .await;
             match conn_result {
@@ -1950,21 +1933,21 @@ async fn run_ssh_bootstrap(
     terminal::enable_raw_mode()?;
     let _raw_guard = RawModeGuard;
 
+    let client_config = config::build_client_config_with_cert(&server_cert_der, &client_cert)?;
+
     if let Some(stun_socket) = stun_socket {
         let client = QuicClient::from_socket(stun_socket)?;
         client_session_loop_with_client(
             client,
             addr,
             &resolved_host,
-            &server_cert_der,
-            &client_cert,
+            client_config,
             StunReconnectContext {},
         )
         .await
     } else if let Some(Ok(Ok((_client, conn)))) = direct_result {
         // _client must stay alive — dropping it closes the endpoint.
-        client_session_loop_with_conn(conn, addr, &resolved_host, &server_cert_der, &client_cert)
-            .await
+        client_session_loop_with_conn(conn, addr, &resolved_host, client_config).await
     } else {
         // Direct failed but STUN wasn't available — already bailed above
         unreachable!()

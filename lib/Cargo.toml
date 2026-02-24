@@ -19,9 +19,11 @@ rcgen = "0.14.7"
 ring = "0.17.14"
 rustls = "0.23.36"
 rustls-platform-verifier = "0.6.2"
+serde = { version = "1.0.228", features = ["derive"] }
 termwiz = "0.23.3"
 thiserror.workspace = true
 tokio = { workspace = true, features = ["full"] }
+toml = "1.0.3"
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 wezterm-term = { git = "https://github.com/wezterm/wezterm", branch = "main", version = "0.1.0" }
