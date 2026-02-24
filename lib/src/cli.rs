@@ -272,22 +272,23 @@ async fn run_server(listen: SocketAddr, bootstrap: bool) -> anyhow::Result<()> {
 
     let store = SessionStore::new();
 
-    // In bootstrap mode, watch stdin briefly for a STUN hole-punch request.
+    // In bootstrap mode, watch stdin for a STUN hole-punch request.
+    // Uses a native thread instead of tokio::io::stdin() because the
+    // latter uses spawn_blocking internally — if the blocking read
+    // never completes, Runtime::drop hangs waiting for it.
     if bootstrap {
         let punch_server = server.clone_for_punch();
-        tokio::spawn(async move {
-            use tokio::io::AsyncBufReadExt;
-            let stdin = tokio::io::stdin();
-            let mut reader = tokio::io::BufReader::new(stdin);
+        let rt_handle = tokio::runtime::Handle::current();
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            let stdin = std::io::stdin();
             let mut line = String::new();
-            match tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut line)).await {
-                Ok(Ok(n)) if n > 0 => {
-                    if let Ok(client_addr) = parse_stun_line(line.trim()) {
-                        tracing::info!(%client_addr, "STUN hole-punch requested");
-                        punch_server.punch_hole(client_addr);
-                    }
-                }
-                _ => {}
+            if stdin.lock().read_line(&mut line).is_ok()
+                && !line.is_empty()
+                && let Ok(client_addr) = parse_stun_line(line.trim())
+            {
+                let _guard = rt_handle.enter();
+                punch_server.punch_hole(client_addr);
             }
         });
     }
@@ -307,10 +308,10 @@ async fn run_server(listen: SocketAddr, bootstrap: bool) -> anyhow::Result<()> {
         if bootstrap {
             // Bootstrap mode: handle session inline so we can exit when
             // the shell dies. Loop back to accept reconnections after detach.
-            if let Err(e) = handle_server_session(conn, store.clone()).await {
+            if let Err(e) = handle_server_session(conn, store.clone(), true).await {
                 tracing::error!(%peer, "session error: {e}");
             }
-            // If no detached sessions, the shell exited — stop the server.
+            let _ = store.prune_exited();
             if store.is_empty() {
                 break;
             }
@@ -319,7 +320,7 @@ async fn run_server(listen: SocketAddr, bootstrap: bool) -> anyhow::Result<()> {
             // multiple concurrent clients.
             let store = store.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_server_session(conn, store).await {
+                if let Err(e) = handle_server_session(conn, store, false).await {
                     tracing::error!(%peer, "session error: {e}");
                 }
             });
@@ -442,35 +443,106 @@ fn hex_decode(s: &str) -> anyhow::Result<Vec<u8>> {
         .collect()
 }
 
+type SessionTuple = (
+    [u8; 16],
+    PtySession,
+    Arc<Mutex<RoseTerminal>>,
+    Arc<Mutex<SspSender>>,
+    u16,
+    u16,
+);
+
+/// COVERAGE: Tested via integration/e2e tests.
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn reattach_session(
+    session: &mut ServerSession,
+    session_id: [u8; 16],
+    detached: DetachedSession,
+    rows: u16,
+    cols: u16,
+) -> anyhow::Result<SessionTuple> {
+    tracing::info!(rows, cols, "reattaching session");
+
+    if detached.rows != rows || detached.cols != cols {
+        let _ = detached.pty.resize(rows, cols);
+        detached
+            .terminal
+            .lock()
+            .expect("terminal lock poisoned")
+            .resize(rows, cols);
+    }
+
+    session
+        .send_control(&ControlMessage::SessionInfo {
+            version: protocol::PROTOCOL_VERSION,
+            session_id,
+        })
+        .await?;
+
+    {
+        let mut sender = detached.ssp_sender.lock().expect("sender lock poisoned");
+        *sender = SspSender::new();
+    }
+
+    Ok((
+        session_id,
+        detached.pty,
+        detached.terminal,
+        detached.ssp_sender,
+        rows,
+        cols,
+    ))
+}
+
+/// COVERAGE: Tested via integration/e2e tests.
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn new_session(
+    session: &mut ServerSession,
+    rows: u16,
+    cols: u16,
+    env_vars: &[(String, String)],
+) -> anyhow::Result<SessionTuple> {
+    let session_id: [u8; 16] = rand_session_id();
+    tracing::info!(rows, cols, "new session");
+
+    let pty = PtySession::open_with_env(rows, cols, env_vars)?;
+    let terminal = Arc::new(Mutex::new(RoseTerminal::new(rows, cols)));
+    let ssp_sender = Arc::new(Mutex::new(SspSender::new()));
+
+    session
+        .send_control(&ControlMessage::SessionInfo {
+            version: protocol::PROTOCOL_VERSION,
+            session_id,
+        })
+        .await?;
+
+    Ok((session_id, pty, terminal, ssp_sender, rows, cols))
+}
+
 /// COVERAGE: Session handler is tested via integration/e2e tests.
 #[cfg_attr(coverage_nightly, coverage(off))]
-async fn handle_server_session(conn: quinn::Connection, store: SessionStore) -> anyhow::Result<()> {
+async fn handle_server_session(
+    conn: quinn::Connection,
+    store: SessionStore,
+    bootstrap: bool,
+) -> anyhow::Result<()> {
     let (mut session, handshake) = ServerSession::accept_any(conn).await?;
 
-    // Generate session ID and resolve PTY/terminal/sender
-    let (session_id, pty, terminal, ssp_sender, rows, cols) = match handshake {
+    // Resolve session: either reattach a detached session or create a new one.
+    let (session_id, mut pty, terminal, ssp_sender, rows, cols) = match handshake {
         ControlMessage::Hello {
             version: _,
             rows,
             cols,
             env_vars,
         } => {
-            let session_id: [u8; 16] = rand_session_id();
-            tracing::info!(rows, cols, "new session");
-
-            let pty = PtySession::open_with_env(rows, cols, &env_vars)?;
-            let terminal = Arc::new(Mutex::new(RoseTerminal::new(rows, cols)));
-            let ssp_sender = Arc::new(Mutex::new(SspSender::new()));
-
-            // Send SessionInfo to client
-            session
-                .send_control(&ControlMessage::SessionInfo {
-                    version: protocol::PROTOCOL_VERSION,
-                    session_id,
-                })
-                .await?;
-
-            (session_id, pty, terminal, ssp_sender, rows, cols)
+            // In bootstrap mode, reattach if a detached session exists.
+            let detached = if bootstrap { store.remove_any() } else { None };
+            if let Some((session_id, detached)) = detached {
+                reattach_session(&mut session, session_id, detached, rows, cols).await?
+            } else {
+                new_session(&mut session, rows, cols, &env_vars).await?
+            }
         }
         ControlMessage::Reconnect {
             version: _,
@@ -479,44 +551,10 @@ async fn handle_server_session(conn: quinn::Connection, store: SessionStore) -> 
             session_id,
             env_vars: _,
         } => {
-            tracing::info!(rows, cols, "reconnecting session");
-
             let detached = store
                 .remove(&session_id)
                 .ok_or_else(|| anyhow::anyhow!("session not found for reconnect"))?;
-
-            // Resize if client's terminal changed
-            if detached.rows != rows || detached.cols != cols {
-                let _ = detached.pty.resize(rows, cols);
-                detached
-                    .terminal
-                    .lock()
-                    .expect("terminal lock poisoned")
-                    .resize(rows, cols);
-            }
-
-            // Send SessionInfo to confirm reconnection
-            session
-                .send_control(&ControlMessage::SessionInfo {
-                    version: protocol::PROTOCOL_VERSION,
-                    session_id,
-                })
-                .await?;
-
-            // Reset SSP sender so client gets a full init diff
-            {
-                let mut sender = detached.ssp_sender.lock().expect("sender lock poisoned");
-                *sender = SspSender::new();
-            }
-
-            (
-                session_id,
-                detached.pty,
-                detached.terminal,
-                detached.ssp_sender,
-                rows,
-                cols,
-            )
+            reattach_session(&mut session, session_id, detached, rows, cols).await?
         }
         _ => anyhow::bail!("unexpected handshake message"),
     };
@@ -685,6 +723,7 @@ async fn handle_server_session(conn: quinn::Connection, store: SessionStore) -> 
     let (control_shutdown_tx, mut control_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let terminal_ctrl = Arc::clone(&terminal);
     let control_task = tokio::spawn(async move {
+        let mut child_poll = tokio::time::interval(Duration::from_millis(100));
         loop {
             tokio::select! {
                 _ = &mut control_shutdown_rx => break,
@@ -708,6 +747,14 @@ async fn handle_server_session(conn: quinn::Connection, store: SessionStore) -> 
                         }
                     }
                 }
+                // On macOS, the PTY reader thread may not get EIO/EOF
+                // when the slave closes. Poll child exit as a backup so
+                // shell death is always detected within ~100ms.
+                _ = child_poll.tick() => {
+                    if pty.try_wait().ok().flatten().is_some() {
+                        break;
+                    }
+                }
             }
         }
         pty
@@ -717,20 +764,23 @@ async fn handle_server_session(conn: quinn::Connection, store: SessionStore) -> 
     // Every exit path except shell exit detaches the session so the client
     // can reconnect later — even if the network just dropped without a
     // Goodbye.
+    let mut output_task = output_task;
+    let mut input_task = input_task;
+    let mut scrollback_task = scrollback_task;
     let mut control_task = control_task;
     let mut control_shutdown_tx = Some(control_shutdown_tx);
-    let shell_exited;
+    let mut shell_exited;
     let pty_from_control;
     tokio::select! {
-        result = output_task => {
+        result = &mut output_task => {
             shell_exited = result.unwrap_or(false);
             pty_from_control = None;
         },
-        _ = input_task => {
+        _ = &mut input_task => {
             shell_exited = false;
             pty_from_control = None;
         },
-        _ = scrollback_task => {
+        _ = &mut scrollback_task => {
             shell_exited = false;
             pty_from_control = None;
         },
@@ -740,20 +790,37 @@ async fn handle_server_session(conn: quinn::Connection, store: SessionStore) -> 
         },
     };
 
+    // Abort orphaned tasks so their pty_closed Notify registrations are
+    // cleaned up. Without this, a reattached session's output_task would
+    // race with the old task for the single notify_one() permit.
+    output_task.abort();
+    input_task.abort();
+    scrollback_task.abort();
+
+    let mut detached_pty = None;
+    if !shell_exited {
+        detached_pty = if let Some(pty) = pty_from_control {
+            Some(pty)
+        } else {
+            if let Some(tx) = control_shutdown_tx.take() {
+                let _ = tx.send(());
+            }
+            control_task.await.ok()
+        };
+
+        if let Some(pty) = detached_pty.as_mut()
+            && pty.try_wait().ok().flatten().is_some()
+        {
+            shell_exited = true;
+            detached_pty = None;
+        }
+    }
+
     if shell_exited {
         close_conn.close(0u32.into(), b"shell exited");
     } else {
         close_conn.close(0u32.into(), b"detaching session");
-        let pty = match pty_from_control {
-            Some(pty) => Some(pty),
-            None => {
-                if let Some(tx) = control_shutdown_tx.take() {
-                    let _ = tx.send(());
-                }
-                control_task.await.ok()
-            }
-        };
-        if let Some(pty) = pty {
+        if let Some(pty) = detached_pty {
             let _ = store.insert(
                 session_id,
                 DetachedSession {

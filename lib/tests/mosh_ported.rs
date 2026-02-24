@@ -923,12 +923,14 @@ mod ssh_bootstrap_helpers {
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
     use russh::ChannelId;
     use russh::server::{Auth, Config, Handler, Msg, Session};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
     pub struct TestHandler;
 
     static STDIN_TX: Mutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>> = Mutex::new(None);
+    static BOOTSTRAP_CHILD_EXITED: AtomicBool = AtomicBool::new(false);
 
     impl Handler for TestHandler {
         type Error = russh::Error;
@@ -965,6 +967,7 @@ mod ssh_bootstrap_helpers {
             let parts: Vec<&str> = command.split_whitespace().collect();
             let (program, args) = parts.split_first().expect("empty command");
 
+            BOOTSTRAP_CHILD_EXITED.store(false, Ordering::SeqCst);
             let mut child = tokio::process::Command::new(program)
                 .args(args)
                 .stdin(std::process::Stdio::piped())
@@ -999,6 +1002,11 @@ mod ssh_bootstrap_helpers {
                     }
                     let _ = stdin.flush().await;
                 }
+            });
+
+            tokio::spawn(async move {
+                let _ = child.wait().await;
+                BOOTSTRAP_CHILD_EXITED.store(true, Ordering::SeqCst);
             });
 
             Ok(())
@@ -1050,6 +1058,7 @@ mod ssh_bootstrap_helpers {
 
     pub async fn start_ssh_server() -> u16 {
         use base64::Engine;
+        BOOTSTRAP_CHILD_EXITED.store(false, Ordering::SeqCst);
         let key_pem = String::from_utf8(
             base64::engine::general_purpose::STANDARD
                 .decode(concat!(
@@ -1194,6 +1203,28 @@ mod ssh_bootstrap_helpers {
         .await
         .ok()
     }
+
+    pub async fn wait_for_output_contains(pty: &PtyChild, needle: &str, timeout_secs: u64) -> bool {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+        while tokio::time::Instant::now() < deadline {
+            if pty.captured_output().contains(needle) {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    pub async fn wait_for_bootstrap_child_exit(timeout_secs: u64) -> bool {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+        while tokio::time::Instant::now() < deadline {
+            if BOOTSTRAP_CHILD_EXITED.load(Ordering::SeqCst) {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        BOOTSTRAP_CHILD_EXITED.load(Ordering::SeqCst)
+    }
 }
 
 #[tokio::test]
@@ -1206,7 +1237,7 @@ async fn ssh_bootstrap_mode() {
     let cmd = bootstrap_cmd(&rose_bin, ssh_port);
     let mut pty = spawn_in_pty(cmd);
 
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     let w = pty.writer.as_mut().unwrap();
     std::io::Write::write_all(w, &[4]).unwrap();
@@ -1215,25 +1246,22 @@ async fn ssh_bootstrap_mode() {
     let status = wait_for_exit(&mut pty.child, 10).await;
     let captured = pty.finish();
 
-    match status {
-        Some(s) => {
-            assert!(
-                s.exit_code() == 0,
-                "rose client exited with {s:?}. output:\n{captured}"
-            );
-            assert!(
-                captured.contains("Bootstrap: server on port"),
-                "bootstrap failed. output:\n{captured}"
-            );
-            assert!(
-                !captured.contains("connection error") && !captured.contains("connection failed"),
-                "QUIC connection failed. output:\n{captured}"
-            );
-        }
-        None => {
-            pty.child.kill().unwrap();
-            panic!("rose client timed out — likely hung. output:\n{captured}");
-        }
+    if let Some(s) = status {
+        assert!(
+            s.exit_code() == 0,
+            "rose client exited with {s:?}. output:\n{captured}"
+        );
+        assert!(
+            captured.contains("Bootstrap: server on port"),
+            "bootstrap failed. output:\n{captured}"
+        );
+        assert!(
+            !captured.contains("connection error") && !captured.contains("connection failed"),
+            "QUIC connection failed. output:\n{captured}"
+        );
+    } else {
+        pty.child.kill().unwrap();
+        panic!("rose client timed out — likely hung. output:\n{captured}");
     }
 }
 
@@ -1242,86 +1270,153 @@ async fn ssh_bootstrap_detach_reconnect() {
     use portable_pty::CommandBuilder;
     use ssh_bootstrap_helpers::*;
 
-    let ssh_port = start_ssh_server().await;
-    let rose_bin = build_rose_binary();
-
-    let cmd = bootstrap_cmd(&rose_bin, ssh_port);
-    let mut pty = spawn_in_pty(cmd);
-
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-
-    // Send Enter ~ d to trigger detach
-    {
-        let w = pty.writer.as_mut().unwrap();
-        std::io::Write::write_all(w, b"\r").unwrap();
-        std::io::Write::flush(w).unwrap();
-    }
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    {
-        let w = pty.writer.as_mut().unwrap();
-        std::io::Write::write_all(w, b"~").unwrap();
-        std::io::Write::flush(w).unwrap();
-    }
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    {
-        let w = pty.writer.as_mut().unwrap();
-        std::io::Write::write_all(w, b"d").unwrap();
-        std::io::Write::flush(w).unwrap();
+    fn extract_tagged_value(output: &str, tag: &str) -> String {
+        for (idx, _) in output.rmatch_indices(tag) {
+            let value: String = output[idx + tag.len()..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+                .collect();
+            if !value.is_empty() {
+                return value;
+            }
+        }
+        panic!("missing tagged value {tag} in output:\n{output}");
     }
 
-    let status = wait_for_exit(&mut pty.child, 10).await;
-    let captured = pty.finish();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        let ssh_port = start_ssh_server().await;
+        let rose_bin = build_rose_binary();
+        let marker = format!("rose_reconnect_marker_{}", std::process::id());
 
-    let status = status.unwrap_or_else(|| {
-        pty.child.kill().unwrap();
-        panic!("rose client timed out during detach. output:\n{captured}");
-    });
+        let cmd = bootstrap_cmd(&rose_bin, ssh_port);
+        let mut pty = spawn_in_pty(cmd);
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        {
+            let w = pty.writer.as_mut().unwrap();
+            let probe = format!(
+                "ROSE_MARK={marker}; printf \"__PID1__%s __MARK1__%s\\n\" \"$$\" \"$ROSE_MARK\"\r"
+            );
+            std::io::Write::write_all(w, probe.as_bytes()).unwrap();
+            std::io::Write::flush(w).unwrap();
+        }
+
+        assert!(
+            wait_for_output_contains(&pty, &format!("__MARK1__{marker}"), 10).await,
+            "did not capture initial shell probe. output:\n{}",
+            pty.captured_output()
+        );
+        let pre_detach_output = pty.captured_output();
+        let pid1 = extract_tagged_value(&pre_detach_output, "__PID1__");
+        let mark1 = extract_tagged_value(&pre_detach_output, "__MARK1__");
+        assert_eq!(mark1, marker, "initial shell marker did not persist");
+
+        {
+            let w = pty.writer.as_mut().unwrap();
+            std::io::Write::write_all(w, b"\r").unwrap();
+            std::io::Write::flush(w).unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        {
+            let w = pty.writer.as_mut().unwrap();
+            std::io::Write::write_all(w, b"~").unwrap();
+            std::io::Write::flush(w).unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        {
+            let w = pty.writer.as_mut().unwrap();
+            std::io::Write::write_all(w, b"d").unwrap();
+            std::io::Write::flush(w).unwrap();
+        }
+
+        let status = wait_for_exit(&mut pty.child, 10).await;
+        if status.is_none() {
+            let _ = pty.child.kill();
+        }
+        let captured = pty.finish();
+
+        let status = status.unwrap_or_else(|| {
+            panic!("rose client timed out during detach. output:\n{captured}");
+        });
+        assert!(
+            status.exit_code() == 0,
+            "rose client exited with {status:?} during detach. output:\n{captured}"
+        );
+        assert!(
+            captured.contains("detached"),
+            "detach message not found. output:\n{captured}"
+        );
+
+        let port_line = captured
+            .lines()
+            .find(|l| l.contains("Bootstrap: server on port"))
+            .expect("bootstrap port line not found in output");
+        let port: u16 = port_line
+            .split("port ")
+            .nth(1)
+            .unwrap()
+            .trim()
+            .parse()
+            .expect("failed to parse port from bootstrap output");
+
+        let mut cmd = CommandBuilder::new(&rose_bin);
+        cmd.args(["connect", "127.0.0.1", "--port", &port.to_string()]);
+        let mut pty2 = spawn_in_pty(cmd);
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        {
+            let w = pty2.writer.as_mut().unwrap();
+            std::io::Write::write_all(
+                w,
+                b"printf \"__PID2__%s __MARK2__%s\\n\" \"$$\" \"$ROSE_MARK\"\r",
+            )
+            .unwrap();
+            std::io::Write::flush(w).unwrap();
+        }
+
+        assert!(
+            wait_for_output_contains(&pty2, &format!("__MARK2__{marker}"), 10).await,
+            "did not capture reattached shell probe. output:\n{}",
+            pty2.captured_output()
+        );
+        let reconnect_probe_output = pty2.captured_output();
+        let pid2 = extract_tagged_value(&reconnect_probe_output, "__PID2__");
+        let mark2 = extract_tagged_value(&reconnect_probe_output, "__MARK2__");
+
+        assert_eq!(pid2, pid1, "reconnect attached to a different shell process");
+        assert_eq!(mark2, marker, "reconnect did not preserve shell environment");
+
+        {
+            let w = pty2.writer.as_mut().unwrap();
+            std::io::Write::write_all(w, b"\x04").unwrap();
+            std::io::Write::flush(w).unwrap();
+        }
+
+        let status2 = wait_for_exit(&mut pty2.child, 10).await;
+        if status2.is_none() {
+            let _ = pty2.child.kill();
+        }
+        let captured2 = pty2.finish();
+
+        let status2 = status2.unwrap_or_else(|| {
+            panic!("rose reconnect timed out. output:\n{captured2}");
+        });
+        assert!(
+            status2.exit_code() == 0,
+            "rose reconnect failed with {status2:?}. output:\n{captured2}"
+        );
+
+        assert!(
+            wait_for_bootstrap_child_exit(10).await,
+            "bootstrap server did not exit after shell exit. detach output:\n{captured}\nreconnect output:\n{captured2}"
+        );
+    })
+    .await;
     assert!(
-        status.exit_code() == 0,
-        "rose client exited with {status:?} during detach. output:\n{captured}"
-    );
-    assert!(
-        captured.contains("detached"),
-        "detach message not found. output:\n{captured}"
-    );
-
-    // Parse the QUIC port from the detach output
-    let port_line = captured
-        .lines()
-        .find(|l| l.contains("Bootstrap: server on port"))
-        .expect("bootstrap port line not found in output");
-    let port: u16 = port_line
-        .split("port ")
-        .nth(1)
-        .unwrap()
-        .trim()
-        .parse()
-        .expect("failed to parse port from bootstrap output");
-
-    // Reconnect using native mode (rose connect --port <port> 127.0.0.1)
-    let mut cmd = CommandBuilder::new(&rose_bin);
-    cmd.args(["connect", "127.0.0.1", "--port", &port.to_string()]);
-    let mut pty2 = spawn_in_pty(cmd);
-
-    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-
-    // Send Ctrl-D to exit the shell
-    {
-        let w = pty2.writer.as_mut().unwrap();
-        std::io::Write::write_all(w, &[4]).unwrap();
-        std::io::Write::flush(w).unwrap();
-    }
-
-    let status2 = wait_for_exit(&mut pty2.child, 10).await;
-    let captured2 = pty2.finish();
-
-    let status2 = status2.unwrap_or_else(|| {
-        pty2.child.kill().unwrap();
-        panic!("rose reconnect timed out. output:\n{captured2}");
-    });
-    assert!(
-        status2.exit_code() == 0,
-        "rose reconnect failed with {status2:?}. output:\n{captured2}"
+        result.is_ok(),
+        "ssh_bootstrap_detach_reconnect timed out after 60s"
     );
 }
 

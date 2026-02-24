@@ -102,6 +102,32 @@ impl SessionStore {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Removes and returns an arbitrary detached session.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the session store mutex is poisoned.
+    #[must_use]
+    pub fn remove_any(&self) -> Option<([u8; 16], DetachedSession)> {
+        let mut sessions = self.sessions.lock().expect("session store lock poisoned");
+        let id = *sessions.keys().next()?;
+        sessions.remove(&id).map(|session| (id, session))
+    }
+
+    /// Removes detached sessions whose PTY child has already exited.
+    /// Returns the number of removed sessions.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the session store mutex is poisoned.
+    #[must_use]
+    pub fn prune_exited(&self) -> usize {
+        let mut sessions = self.sessions.lock().expect("session store lock poisoned");
+        let before = sessions.len();
+        sessions.retain(|_, detached| detached.pty.try_wait().ok().flatten().is_none());
+        before.saturating_sub(sessions.len())
+    }
 }
 
 impl Default for SessionStore {
@@ -166,6 +192,27 @@ mod tests {
     #[test]
     fn default_is_empty() {
         let store = SessionStore::default();
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn prune_exited_removes_dead_sessions() {
+        let store = SessionStore::new();
+        let id = [3u8; 16];
+        let session = DetachedSession {
+            pty: PtySession::open_command(24, 80, "sh", &["-c", "exit 0"]).unwrap(),
+            terminal: Arc::new(Mutex::new(RoseTerminal::new(24, 80))),
+            ssp_sender: Arc::new(Mutex::new(SspSender::new())),
+            rows: 24,
+            cols: 80,
+        };
+        let _ = store.insert(id, session);
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            if store.prune_exited() > 0 {
+                break;
+            }
+        }
         assert!(store.is_empty());
     }
 }
