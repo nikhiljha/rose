@@ -220,6 +220,84 @@ pub fn tofu_check(
     }
 }
 
+/// Computes the SHA-256 fingerprint of a DER-encoded certificate.
+///
+/// Returns a colon-separated hex string (e.g., `ab:cd:ef:...`).
+#[must_use]
+pub fn cert_fingerprint(cert_der: &[u8]) -> String {
+    let hash = ring::digest::digest(&ring::digest::SHA256, cert_der);
+    hash.as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+/// A server certificate verifier that checks the cert matches a pinned certificate.
+///
+/// Unlike root-store verification, this ignores Subject Alternative Names and
+/// hostname checks — the security comes from the exact cert byte match, not
+/// the certificate's claimed identity. TLS handshake signatures are still
+/// verified cryptographically.
+#[derive(Debug)]
+struct PinnedCertVerifier {
+    expected_cert: CertificateDer<'static>,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if end_entity.as_ref() == self.expected_cert.as_ref() {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::ApplicationVerificationFailure,
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
 /// A server certificate verifier that accepts any certificate.
 ///
 /// This is intentionally insecure and should only be used for the TOFU
@@ -383,7 +461,12 @@ pub fn build_mutual_tls_server_config(
     Ok(server_config)
 }
 
-/// Builds a quinn `ClientConfig` that trusts a server cert and provides a client cert.
+/// Builds a quinn `ClientConfig` that verifies a pinned server cert and provides
+/// a client cert for mutual TLS.
+///
+/// Uses [`PinnedCertVerifier`] which checks exact cert byte equality, ignoring
+/// SANs and hostname. This allows using real hostnames as `server_name` for SNI
+/// while the security comes from the pinned cert match.
 ///
 /// # Errors
 ///
@@ -392,14 +475,51 @@ pub fn build_client_config_with_cert(
     server_cert_der: &CertificateDer<'static>,
     client_cert: &CertKeyPair,
 ) -> Result<quinn::ClientConfig, ConfigError> {
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.add(server_cert_der.clone())?;
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let verifier = PinnedCertVerifier {
+        expected_cert: server_cert_der.clone(),
+        provider: Arc::clone(&provider),
+    };
+    let rustls_config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|e| ConfigError::QuicCrypto(e.to_string()))?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(verifier))
+        .with_client_auth_cert(
+            vec![client_cert.cert_der.clone()],
+            PrivateKeyDer::Pkcs8(client_cert.key_der.clone().into()),
+        )?;
 
+    let quic_client_config = QuicClientConfig::try_from(rustls_config)
+        .map_err(|e| ConfigError::QuicCrypto(e.to_string()))?;
+
+    let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
+
+    let mut transport = quinn::TransportConfig::default();
+    transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
+    client_config.transport_config(Arc::new(transport));
+
+    Ok(client_config)
+}
+
+/// Builds a quinn `ClientConfig` that accepts any server certificate and provides
+/// a client cert for mutual TLS.
+///
+/// Used for the TOFU first-connection flow where the caller will extract the
+/// server cert, prompt the user, and cache it for future verification.
+///
+/// # Errors
+///
+/// Returns `ConfigError` if the TLS configuration cannot be built.
+pub fn build_tofu_client_config_with_cert(
+    client_cert: &CertKeyPair,
+) -> Result<quinn::ClientConfig, ConfigError> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let rustls_config = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| ConfigError::QuicCrypto(e.to_string()))?
-        .with_root_certificates(root_store)
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(TofuFirstConnectionVerifier))
         .with_client_auth_cert(
             vec![client_cert.cert_der.clone()],
             PrivateKeyDer::Pkcs8(client_cert.key_der.clone().into()),
@@ -556,5 +676,44 @@ mod tests {
             paths.known_hosts_dir,
             PathBuf::from("/tmp/rose-test/known_hosts")
         );
+    }
+
+    #[test]
+    fn cert_fingerprint_format() {
+        let data = b"test cert data";
+        let fp = cert_fingerprint(data);
+        assert!(fp.contains(':'));
+        let parts: Vec<&str> = fp.split(':').collect();
+        assert_eq!(parts.len(), 32);
+        for part in &parts {
+            assert_eq!(part.len(), 2);
+            assert!(part.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+    }
+
+    #[test]
+    fn cert_fingerprint_deterministic() {
+        let data = b"same input";
+        assert_eq!(cert_fingerprint(data), cert_fingerprint(data));
+    }
+
+    #[test]
+    fn cert_fingerprint_different_for_different_input() {
+        assert_ne!(cert_fingerprint(b"cert-a"), cert_fingerprint(b"cert-b"));
+    }
+
+    #[test]
+    fn build_client_config_with_cert_succeeds() {
+        let server = generate_self_signed_cert(&["localhost".to_string()]).unwrap();
+        let client = generate_self_signed_cert(&["localhost".to_string()]).unwrap();
+        let config = build_client_config_with_cert(&server.cert_der, &client);
+        assert!(config.is_ok());
+    }
+
+    #[test]
+    fn build_tofu_client_config_with_cert_succeeds() {
+        let client = generate_self_signed_cert(&["localhost".to_string()]).unwrap();
+        let config = build_tofu_client_config_with_cert(&client);
+        assert!(config.is_ok());
     }
 }

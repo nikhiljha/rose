@@ -27,6 +27,9 @@ pub struct DetachedSession {
     pub rows: u16,
     /// Terminal columns at time of detach.
     pub cols: u16,
+    /// DER-encoded TLS client certificate of the session owner.
+    /// Used to verify that only the original client can reconnect.
+    pub owner_cert_der: Option<Vec<u8>>,
 }
 
 /// Thread-safe store of detached sessions indexed by session ID.
@@ -151,6 +154,7 @@ mod tests {
             ssp_sender,
             rows: 24,
             cols: 80,
+            owner_cert_der: None,
         }
     }
 
@@ -205,6 +209,7 @@ mod tests {
             ssp_sender: Arc::new(Mutex::new(SspSender::new())),
             rows: 24,
             cols: 80,
+            owner_cert_der: None,
         };
         let _ = store.insert(id, session);
         for _ in 0..50 {

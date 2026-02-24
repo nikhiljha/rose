@@ -652,6 +652,7 @@ async fn session_persists_across_network_disruption() {
                     ssp_sender,
                     rows,
                     cols,
+                    owner_cert_der: None,
                 },
             );
 

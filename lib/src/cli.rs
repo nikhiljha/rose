@@ -87,6 +87,12 @@ enum Commands {
         /// print `ROSE_BOOTSTRAP` line to stdout.
         #[arg(long)]
         bootstrap: bool,
+
+        /// Hostnames to include in the server certificate's Subject Alternative Names.
+        /// Defaults to "localhost". Add your server's hostname or IP for proper
+        /// TLS hostname verification in native mode.
+        #[arg(long)]
+        hostname: Vec<String>,
     },
     /// Generate X.509 client certificates for authentication.
     Keygen,
@@ -131,7 +137,11 @@ pub async fn run() -> anyhow::Result<()> {
                 run_client(&host, port, cert, client_cert).await
             }
         }
-        Commands::Server { listen, bootstrap } => run_server(listen, bootstrap).await,
+        Commands::Server {
+            listen,
+            bootstrap,
+            hostname,
+        } => run_server(listen, bootstrap, hostname).await,
         Commands::Keygen => run_keygen(),
     }
 }
@@ -166,7 +176,11 @@ fn send_ssp_frame(frame: &SspFrame, conn: &quinn::Connection) -> bool {
 
 /// COVERAGE: CLI server loop is tested via integration/e2e tests.
 #[cfg_attr(coverage_nightly, coverage(off))]
-async fn run_server(listen: SocketAddr, bootstrap: bool) -> anyhow::Result<()> {
+async fn run_server(
+    listen: SocketAddr,
+    bootstrap: bool,
+    hostname: Vec<String>,
+) -> anyhow::Result<()> {
     let server = if bootstrap {
         // Bootstrap mode: read the client's public cert from stdin (sent by the client
         // over the authenticated SSH channel), then bind with mutual TLS requiring it.
@@ -185,6 +199,11 @@ async fn run_server(listen: SocketAddr, bootstrap: bool) -> anyhow::Result<()> {
         std::fs::create_dir_all(&paths.config_dir)?;
         let cert_path = paths.config_dir.join("server.crt");
         let key_path = paths.config_dir.join("server.key");
+        let san = if hostname.is_empty() {
+            vec!["localhost".to_string()]
+        } else {
+            hostname.clone()
+        };
         let server_cert = if cert_path.exists() && key_path.exists() {
             let cert_der_bytes = std::fs::read(&cert_path)?;
             let key_der = std::fs::read(&key_path)?;
@@ -195,7 +214,7 @@ async fn run_server(listen: SocketAddr, bootstrap: bool) -> anyhow::Result<()> {
                 key_der,
             }
         } else {
-            let cert = config::generate_self_signed_cert(&["localhost".to_string()])?;
+            let cert = config::generate_self_signed_cert(&san)?;
             std::fs::write(&cert_path, cert.cert_der.as_ref())?;
             write_private_key(&key_path, &cert.key_der)?;
             cert
@@ -243,6 +262,11 @@ async fn run_server(listen: SocketAddr, bootstrap: bool) -> anyhow::Result<()> {
         let cert_path = paths.config_dir.join("server.crt");
         let key_path = paths.config_dir.join("server.key");
 
+        let san = if hostname.is_empty() {
+            vec!["localhost".to_string()]
+        } else {
+            hostname
+        };
         let cert = if cert_path.exists() && key_path.exists() {
             let cert_der_bytes = std::fs::read(&cert_path)?;
             let key_der = std::fs::read(&key_path)?;
@@ -254,7 +278,7 @@ async fn run_server(listen: SocketAddr, bootstrap: bool) -> anyhow::Result<()> {
                 key_der,
             }
         } else {
-            let cert = config::generate_self_signed_cert(&["localhost".to_string()])?;
+            let cert = config::generate_self_signed_cert(&san)?;
             std::fs::write(&cert_path, cert.cert_der.as_ref())?;
             write_private_key(&key_path, &cert.key_der)?;
             eprintln!("Generated new certificate at {}", cert_path.display());
@@ -406,6 +430,19 @@ fn rand_u16() -> u16 {
 /// Hex-encodes a byte slice.
 fn hex_encode(data: &[u8]) -> String {
     data.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Extracts the peer's DER-encoded TLS certificate from a QUIC connection.
+///
+/// On the server side this returns the client's certificate; on the client
+/// side it returns the server's certificate. Returns `None` if the peer
+/// did not present a certificate (e.g., no mutual TLS).
+fn extract_peer_cert(conn: &quinn::Connection) -> Option<Vec<u8>> {
+    let identity = conn.peer_identity()?;
+    let certs = identity
+        .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+        .ok()?;
+    certs.first().map(|c| c.as_ref().to_vec())
 }
 
 /// Parses a `ROSE_BOOTSTRAP` line from the server's stdout.
@@ -565,6 +602,7 @@ async fn handle_server_session(
     store: SessionStore,
     bootstrap: bool,
 ) -> anyhow::Result<()> {
+    let peer_cert = extract_peer_cert(&conn);
     let (mut session, handshake) = ServerSession::accept_any(conn).await?;
 
     // Resolve session: either reattach a detached session or create a new one.
@@ -577,7 +615,8 @@ async fn handle_server_session(
         } => {
             // In bootstrap mode, reattach if a detached session exists.
             let detached = if bootstrap { store.remove_any() } else { None };
-            if let Some((session_id, detached)) = detached {
+            if let Some((session_id, mut detached)) = detached {
+                detached.owner_cert_der = peer_cert.clone();
                 reattach_session(&mut session, session_id, detached, rows, cols).await?
             } else {
                 new_session(&mut session, rows, cols, &env_vars).await?
@@ -593,6 +632,10 @@ async fn handle_server_session(
             let detached = store
                 .remove(&session_id)
                 .ok_or_else(|| anyhow::anyhow!("session not found for reconnect"))?;
+            if detached.owner_cert_der.as_deref() != peer_cert.as_deref() {
+                let _ = store.insert(session_id, detached);
+                anyhow::bail!("client certificate does not match session owner");
+            }
             reattach_session(&mut session, session_id, detached, rows, cols).await?
         }
         _ => anyhow::bail!("unexpected handshake message"),
@@ -868,6 +911,7 @@ async fn handle_server_session(
                     ssp_sender,
                     rows,
                     cols,
+                    owner_cert_der: peer_cert,
                 },
             );
         }
@@ -925,22 +969,7 @@ async fn run_client(
     cert_path: Option<PathBuf>,
     client_cert_path: Option<PathBuf>,
 ) -> anyhow::Result<()> {
-    // Load server certificate
-    let cert_path = cert_path.unwrap_or_else(|| {
-        let paths = RosePaths::resolve();
-        paths
-            .known_hosts_dir
-            .join(format!("{}.crt", config::sanitize_hostname(host)))
-    });
-    let cert_der = std::fs::read(&cert_path).map_err(|e| {
-        anyhow::anyhow!(
-            "failed to read server cert at {}: {e}\nHint: copy the server's cert file here, or use --cert to specify a path",
-            cert_path.display()
-        )
-    })?;
-    let cert_der = rustls::pki_types::CertificateDer::from(cert_der);
-
-    // Load client cert for mutual TLS (required — server always demands mTLS).
+    // Load client cert first (needed for both normal and TOFU flows).
     let client_cert = if let Some(ref path) = client_cert_path {
         let cert_der_bytes = std::fs::read(path)?;
         let key_path = path.with_extension("key.der");
@@ -957,8 +986,14 @@ async fn run_client(
         load_or_generate_client_cert()?
     };
 
+    let cert_path = cert_path.unwrap_or_else(|| {
+        let paths = RosePaths::resolve();
+        paths
+            .known_hosts_dir
+            .join(format!("{}.crt", config::sanitize_hostname(host)))
+    });
+
     let addr: SocketAddr = format!("{host}:{port}").parse().unwrap_or_else(|_| {
-        // If host isn't a direct IP, try resolving
         use std::net::ToSocketAddrs;
         format!("{host}:{port}")
             .to_socket_addrs()
@@ -970,11 +1005,62 @@ async fn run_client(
             })
     });
 
+    // Load server cert or do TOFU (before entering raw mode so user can type).
+    let cert_der = if cert_path.exists() {
+        let bytes = std::fs::read(&cert_path).map_err(|e| {
+            anyhow::anyhow!("failed to read server cert at {}: {e}", cert_path.display())
+        })?;
+        rustls::pki_types::CertificateDer::from(bytes)
+    } else {
+        tofu_first_connect(host, addr, &client_cert, &cert_path).await?
+    };
+
     // Enter raw mode before the reconnection loop so it stays active across reconnections
     terminal::enable_raw_mode()?;
     let _raw_guard = RawModeGuard;
 
-    client_session_loop(addr, &cert_der, &client_cert).await
+    client_session_loop(addr, host, &cert_der, &client_cert).await
+}
+
+/// Performs a TOFU (Trust On First Use) first connection: connects to the
+/// server, extracts its certificate, displays the fingerprint, and prompts
+/// the user to accept. If accepted, saves the cert for future connections.
+async fn tofu_first_connect(
+    host: &str,
+    addr: SocketAddr,
+    client_cert: &CertKeyPair,
+    cert_save_path: &std::path::Path,
+) -> anyhow::Result<rustls::pki_types::CertificateDer<'static>> {
+    let tofu_config = config::build_tofu_client_config_with_cert(client_cert)?;
+    let client = QuicClient::new()?;
+    let conn = client
+        .connect_with_config(tofu_config, addr, host)
+        .await
+        .map_err(|e| anyhow::anyhow!("TOFU connection to {host}:{} failed: {e}", addr.port()))?;
+
+    let server_cert_der = extract_peer_cert(&conn)
+        .ok_or_else(|| anyhow::anyhow!("server did not present a certificate"))?;
+
+    conn.close(0u32.into(), b"tofu check");
+
+    let fingerprint = config::cert_fingerprint(&server_cert_der);
+    eprintln!("The server at {host} presented this certificate:");
+    eprintln!("  SHA-256: {fingerprint}");
+    eprint!("Trust this server? [y/N] ");
+
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    if !answer.trim().eq_ignore_ascii_case("y") {
+        anyhow::bail!("certificate rejected by user");
+    }
+
+    if let Some(parent) = cert_save_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(cert_save_path, &server_cert_der)?;
+    eprintln!("Certificate saved to {}", cert_save_path.display());
+
+    Ok(rustls::pki_types::CertificateDer::from(server_cert_der))
 }
 
 /// Marker that STUN was used for the initial connection.
@@ -994,10 +1080,11 @@ struct StunReconnectContext {}
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn client_session_loop(
     addr: SocketAddr,
+    server_name: &str,
     cert_der: &rustls::pki_types::CertificateDer<'static>,
     client_cert: &CertKeyPair,
 ) -> anyhow::Result<()> {
-    client_session_loop_inner(addr, cert_der, client_cert, None, None).await
+    client_session_loop_inner(addr, server_name, cert_der, client_cert, None, None).await
 }
 
 /// Like [`client_session_loop`] but uses a pre-established connection for the
@@ -1008,10 +1095,19 @@ async fn client_session_loop(
 async fn client_session_loop_with_conn(
     first_conn: quinn::Connection,
     addr: SocketAddr,
+    server_name: &str,
     cert_der: &rustls::pki_types::CertificateDer<'static>,
     client_cert: &CertKeyPair,
 ) -> anyhow::Result<()> {
-    client_session_loop_inner(addr, cert_der, client_cert, Some(first_conn), None).await
+    client_session_loop_inner(
+        addr,
+        server_name,
+        cert_der,
+        client_cert,
+        Some(first_conn),
+        None,
+    )
+    .await
 }
 
 /// Like [`client_session_loop`] but uses a pre-created [`QuicClient`] for the
@@ -1022,14 +1118,23 @@ async fn client_session_loop_with_conn(
 async fn client_session_loop_with_client(
     first_client: QuicClient,
     addr: SocketAddr,
+    server_name: &str,
     cert_der: &rustls::pki_types::CertificateDer<'static>,
     client_cert: &CertKeyPair,
     stun_ctx: StunReconnectContext,
 ) -> anyhow::Result<()> {
     let conn = first_client
-        .connect_with_cert(addr, "localhost", cert_der, client_cert)
+        .connect_with_cert(addr, server_name, cert_der, client_cert)
         .await?;
-    client_session_loop_inner(addr, cert_der, client_cert, Some(conn), Some(stun_ctx)).await
+    client_session_loop_inner(
+        addr,
+        server_name,
+        cert_der,
+        client_cert,
+        Some(conn),
+        Some(stun_ctx),
+    )
+    .await
 }
 
 /// Performs STUN discovery for reconnection, returning a [`QuicClient`]
@@ -1063,6 +1168,7 @@ async fn stun_reconnect() -> anyhow::Result<QuicClient> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn client_session_loop_inner(
     addr: SocketAddr,
+    server_name: &str,
     cert_der: &rustls::pki_types::CertificateDer<'static>,
     client_cert: &CertKeyPair,
     first_conn: Option<quinn::Connection>,
@@ -1127,7 +1233,7 @@ async fn client_session_loop_inner(
             match stun_reconnect().await {
                 Ok(client) => {
                     let conn_result = tokio::time::timeout(Duration::from_secs(5), {
-                        client.connect_with_cert(addr, "localhost", cert_der, client_cert)
+                        client.connect_with_cert(addr, server_name, cert_der, client_cert)
                     })
                     .await;
                     match conn_result {
@@ -1188,7 +1294,7 @@ async fn client_session_loop_inner(
                 }
             };
             let conn_result = tokio::time::timeout(Duration::from_secs(5), {
-                client.connect_with_cert(addr, "localhost", cert_der, client_cert)
+                client.connect_with_cert(addr, server_name, cert_der, client_cert)
             })
             .await;
             match conn_result {
@@ -1780,7 +1886,7 @@ async fn run_ssh_bootstrap(
             tokio::time::timeout(Duration::from_secs(3), async {
                 let client = QuicClient::new()?;
                 let conn = client
-                    .connect_with_cert(addr, "localhost", &server_cert_der, &client_cert)
+                    .connect_with_cert(addr, &resolved_host, &server_cert_der, &client_cert)
                     .await?;
                 Ok::<_, crate::transport::TransportError>((client, conn))
             })
@@ -1849,6 +1955,7 @@ async fn run_ssh_bootstrap(
         client_session_loop_with_client(
             client,
             addr,
+            &resolved_host,
             &server_cert_der,
             &client_cert,
             StunReconnectContext {},
@@ -1856,7 +1963,8 @@ async fn run_ssh_bootstrap(
         .await
     } else if let Some(Ok(Ok((_client, conn)))) = direct_result {
         // _client must stay alive — dropping it closes the endpoint.
-        client_session_loop_with_conn(conn, addr, &server_cert_der, &client_cert).await
+        client_session_loop_with_conn(conn, addr, &resolved_host, &server_cert_der, &client_cert)
+            .await
     } else {
         // Direct failed but STUN wasn't available — already bailed above
         unreachable!()

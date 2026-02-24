@@ -227,6 +227,28 @@ impl QuicClient {
             .await?;
         Ok(conn)
     }
+    /// Connects to a QUIC server using a pre-built client config.
+    ///
+    /// Used for TOFU first-connection where the caller builds a custom TLS
+    /// config (e.g., accept-any-cert with client auth).
+    ///
+    /// # Errors
+    ///
+    /// Returns `TransportError::Connect` if the connection cannot be initiated, or
+    /// `TransportError::Connection` if the handshake fails.
+    pub async fn connect_with_config(
+        &self,
+        config: quinn::ClientConfig,
+        addr: SocketAddr,
+        server_name: &str,
+    ) -> Result<quinn::Connection, TransportError> {
+        let conn = self
+            .endpoint
+            .connect_with(config, addr, server_name)?
+            .await?;
+        Ok(conn)
+    }
+
     /// Connects to a QUIC server presenting a client certificate for mutual TLS.
     ///
     /// # Errors
@@ -402,5 +424,53 @@ mod tests {
         let handle = server.clone_for_punch();
         handle.punch_hole("127.0.0.1:1".parse().unwrap());
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    #[tokio::test]
+    async fn connect_with_cert_rejects_wrong_pinned_cert() {
+        let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = server.local_addr().unwrap();
+        let client = QuicClient::new().unwrap();
+
+        let accept = tokio::spawn({
+            let endpoint = server.endpoint.clone();
+            async move {
+                let incoming = endpoint.accept().await.unwrap();
+                incoming.await
+            }
+        });
+
+        let wrong_cert = config::generate_self_signed_cert(&["localhost".to_string()]).unwrap();
+        let client_cert = config::generate_self_signed_cert(&["localhost".to_string()]).unwrap();
+        let result = client
+            .connect_with_cert(addr, "localhost", &wrong_cert.cert_der, &client_cert)
+            .await;
+        assert!(result.is_err());
+        drop(accept);
+    }
+
+    #[tokio::test]
+    async fn connect_with_config_succeeds() {
+        let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = server.local_addr().unwrap();
+        let cert = server.server_cert_der().clone();
+        let client = QuicClient::new().unwrap();
+
+        let accept = tokio::spawn({
+            let endpoint = server.endpoint.clone();
+            async move {
+                let incoming = endpoint.accept().await.unwrap();
+                incoming.await.unwrap()
+            }
+        });
+
+        let config = config::build_client_config(&cert).unwrap();
+        let client_conn = client
+            .connect_with_config(config, addr, "localhost")
+            .await
+            .unwrap();
+        let _server_conn = accept.await.unwrap();
+
+        assert_eq!(client_conn.remote_address(), addr);
     }
 }
