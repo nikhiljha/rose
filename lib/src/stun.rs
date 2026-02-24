@@ -171,8 +171,16 @@ fn parse_mapped_address(value: &[u8]) -> Option<SocketAddrV4> {
 /// Returns [`StunError::NoResponse`] if no STUN server responds, or
 /// [`StunError::Io`] on network errors.
 ///
-pub fn stun_discover(socket: &UdpSocket) -> Result<SocketAddr, StunError> {
-    stun_discover_from(socket, STUN_SERVERS)
+pub fn stun_discover(
+    socket: &UdpSocket,
+    custom_servers: Option<&[String]>,
+) -> Result<SocketAddr, StunError> {
+    if let Some(servers) = custom_servers {
+        let refs: Vec<&str> = servers.iter().map(String::as_str).collect();
+        stun_discover_from(socket, &refs)
+    } else {
+        stun_discover_from(socket, STUN_SERVERS)
+    }
 }
 
 /// Like [`stun_discover`] but accepts a custom list of STUN server addresses.
@@ -617,5 +625,28 @@ mod tests {
 
         let addr = result.unwrap();
         assert_eq!(addr, "192.168.1.100:8080".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn stun_discover_with_none_uses_defaults() {
+        let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_millis(50)))
+            .unwrap();
+        let result = stun_discover(&client, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn stun_discover_with_custom_servers() {
+        let dead_server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dead_addr = dead_server.local_addr().unwrap().to_string();
+        let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_millis(50)))
+            .unwrap();
+        let servers = vec![dead_addr];
+        let result = stun_discover(&client, Some(&servers));
+        assert!(result.is_err());
     }
 }

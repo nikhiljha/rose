@@ -24,6 +24,11 @@ pub struct RoseConfig {
     /// Require CA-signed server certificates verified against the OS trust
     /// store. When `true`, TOFU and pinned self-signed certs are rejected.
     pub require_ca_certs: bool,
+
+    /// Custom STUN server addresses for NAT traversal (e.g.,
+    /// `["stun.example.com:3478"]`). When `None`, the built-in Google STUN
+    /// servers are used.
+    pub stun_servers: Option<Vec<String>>,
 }
 
 impl RoseConfig {
@@ -847,9 +852,37 @@ mod tests {
     fn config_roundtrip_toml() {
         let cfg = RoseConfig {
             require_ca_certs: true,
+            stun_servers: Some(vec![
+                "stun.example.com:3478".to_string(),
+                "stun2.example.com:3478".to_string(),
+            ]),
         };
         let serialized = toml::to_string(&cfg).unwrap();
         let deserialized: RoseConfig = toml::from_str(&serialized).unwrap();
         assert_eq!(cfg, deserialized);
+    }
+
+    #[test]
+    fn config_load_stun_servers() {
+        let dir = std::env::temp_dir().join(format!("rose-cfg-stun-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.toml"),
+            "stun_servers = [\"stun.example.com:3478\"]\n",
+        )
+        .unwrap();
+        let cfg = RoseConfig::load(&dir).unwrap();
+        assert_eq!(
+            cfg.stun_servers,
+            Some(vec!["stun.example.com:3478".to_string()])
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn config_default_stun_servers_is_none() {
+        let cfg = RoseConfig::default();
+        assert!(cfg.stun_servers.is_none());
     }
 }

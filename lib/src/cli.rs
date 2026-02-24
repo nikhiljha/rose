@@ -1073,7 +1073,9 @@ async fn tofu_first_connect(
 /// SSH is already killed at this point — STUN reconnection sends punch
 /// packets from the server's existing endpoint, which already has the
 /// firewall pinhole from the initial connection.
-struct StunReconnectContext {}
+struct StunReconnectContext {
+    stun_servers: Option<Vec<String>>,
+}
 
 /// Reconnection loop: connects/reconnects to the server with exponential backoff.
 ///
@@ -1130,11 +1132,10 @@ async fn client_session_loop_with_client(
 ///
 /// COVERAGE: Requires real STUN server; tested via e2e.
 #[cfg_attr(coverage_nightly, coverage(off))]
-async fn stun_reconnect() -> anyhow::Result<QuicClient> {
-    // STUN discovery is blocking I/O
-    let (socket, public_addr) = tokio::task::spawn_blocking(|| {
+async fn stun_reconnect(stun_servers: Option<Vec<String>>) -> anyhow::Result<QuicClient> {
+    let (socket, public_addr) = tokio::task::spawn_blocking(move || {
         let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
-        let public_addr = crate::stun::stun_discover(&socket)?;
+        let public_addr = crate::stun::stun_discover(&socket, stun_servers.as_deref())?;
         Ok::<_, anyhow::Error>((socket, public_addr))
     })
     .await??;
@@ -1211,9 +1212,8 @@ async fn client_session_loop_inner(
         let conn = if let Some(conn) = initial_conn.take() {
             backoff = Duration::from_millis(100);
             conn
-        } else if stun_ctx.is_some() {
-            // STUN was required — redo STUN for reconnection
-            match stun_reconnect().await {
+        } else if let Some(ref ctx) = stun_ctx {
+            match stun_reconnect(ctx.stun_servers.clone()).await {
                 Ok(client) => {
                     let conn_result = tokio::time::timeout(Duration::from_secs(5), {
                         client.connect_with_config(client_config.clone(), addr, server_name)
@@ -1843,18 +1843,18 @@ async fn run_ssh_bootstrap(
 
     // Save server cert to known_hosts so direct reconnection (reattach) works.
     let paths = RosePaths::resolve();
+    let cfg = config::RoseConfig::load(&paths.config_dir)?;
     std::fs::create_dir_all(&paths.known_hosts_dir)?;
     std::fs::write(
         paths.known_hosts_dir.join(format!("{}.crt", addr.ip())),
         server_cert_der.as_ref(),
     )?;
 
-    // Start STUN discovery in parallel with direct connect attempt.
-    // If direct succeeds, we discard the STUN result. If direct fails,
-    // we use it for hole-punching.
-    let stun_handle = tokio::task::spawn_blocking(|| {
+    let stun_servers_for_discover = cfg.stun_servers.clone();
+    let stun_handle = tokio::task::spawn_blocking(move || {
         let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
-        let public_addr = crate::stun::stun_discover(&socket)?;
+        let public_addr =
+            crate::stun::stun_discover(&socket, stun_servers_for_discover.as_deref())?;
         Ok::<_, anyhow::Error>((socket, public_addr))
     });
 
@@ -1942,7 +1942,9 @@ async fn run_ssh_bootstrap(
             addr,
             &resolved_host,
             client_config,
-            StunReconnectContext {},
+            StunReconnectContext {
+                stun_servers: cfg.stun_servers.clone(),
+            },
         )
         .await
     } else if let Some(Ok(Ok((_client, conn)))) = direct_result {
