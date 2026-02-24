@@ -1424,11 +1424,11 @@ async fn ssh_bootstrap_detach_reconnect() {
 
         {
             let w = pty2.writer.as_mut().unwrap();
-            std::io::Write::write_all(w, b"\x04").unwrap();
+            std::io::Write::write_all(w, b"exit\r").unwrap();
             std::io::Write::flush(w).unwrap();
         }
 
-        let status2 = wait_for_exit(&mut pty2.child, 10).await;
+        let status2 = wait_for_exit(&mut pty2.child, 15).await;
         if status2.is_none() {
             let _ = pty2.child.kill();
         }

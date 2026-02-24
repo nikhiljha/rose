@@ -1,0 +1,6 @@
+[test-groups.ssh-bootstrap]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = "test(ssh_bootstrap)"
+test-group = "ssh-bootstrap"
