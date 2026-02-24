@@ -558,7 +558,7 @@ impl ClientSession {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
-    use crate::transport::{QuicClient, QuicServer};
+    use crate::transport::QuicClient;
 
     #[test]
     fn encode_decode_hello() {
@@ -751,81 +751,7 @@ mod tests {
         assert!(env_vars.is_empty());
     }
 
-    use crate::config::{self as cfg, CertKeyPair};
-    use std::net::SocketAddr;
-
-    struct MtlsFixture {
-        server: QuicServer,
-        client_cert: CertKeyPair,
-        _auth_dir: std::path::PathBuf,
-    }
-
-    impl MtlsFixture {
-        fn new() -> Self {
-            let server_cert = cfg::generate_self_signed_cert(&["localhost".to_string()]).unwrap();
-            let client_cert = cfg::generate_self_signed_cert(&["localhost".to_string()]).unwrap();
-
-            let auth_dir = std::env::temp_dir().join(format!(
-                "rose-proto-test-{}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            std::fs::create_dir_all(&auth_dir).unwrap();
-            std::fs::write(auth_dir.join("client.crt"), client_cert.cert_der.as_ref()).unwrap();
-
-            let server =
-                QuicServer::bind_mutual_tls("127.0.0.1:0".parse().unwrap(), server_cert, &auth_dir)
-                    .unwrap();
-
-            Self {
-                server,
-                client_cert,
-                _auth_dir: auth_dir,
-            }
-        }
-
-        fn addr(&self) -> SocketAddr {
-            self.server.local_addr().unwrap()
-        }
-
-        async fn connect(&self, client: &QuicClient) -> Connection {
-            client
-                .connect_with_cert(
-                    self.addr(),
-                    "localhost",
-                    self.server.server_cert_der(),
-                    &self.client_cert,
-                )
-                .await
-                .unwrap()
-        }
-    }
-
-    impl Drop for MtlsFixture {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self._auth_dir);
-        }
-    }
-
-    async fn quic_pair() -> (Connection, Connection, MtlsFixture, QuicClient) {
-        let fixture = MtlsFixture::new();
-
-        let accept = tokio::spawn({
-            let endpoint = fixture.server.endpoint.clone();
-            async move {
-                let incoming = endpoint.accept().await.unwrap();
-                incoming.await.unwrap()
-            }
-        });
-
-        let client = QuicClient::new().unwrap();
-        let client_conn = fixture.connect(&client).await;
-        let server_conn = accept.await.unwrap();
-
-        (client_conn, server_conn, fixture, client)
-    }
+    use crate::testutil::{MtlsFixture, connected_pair as quic_pair};
 
     #[tokio::test]
     async fn handshake() {

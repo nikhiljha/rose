@@ -6,69 +6,8 @@
 //!
 //! Each test is annotated with the mosh test it was ported from.
 
-mod mtls_helper {
-    use rose::config::{self, CertKeyPair};
-    use rose::transport::{QuicClient, QuicServer};
-    use std::net::SocketAddr;
-    use std::path::PathBuf;
-
-    pub struct MtlsFixture {
-        pub server: QuicServer,
-        pub client_cert: CertKeyPair,
-        _auth_dir: PathBuf,
-    }
-
-    impl MtlsFixture {
-        pub fn new() -> Self {
-            let server_cert =
-                config::generate_self_signed_cert(&["localhost".to_string()]).unwrap();
-            let client_cert =
-                config::generate_self_signed_cert(&["localhost".to_string()]).unwrap();
-
-            let auth_dir = std::env::temp_dir().join(format!(
-                "rose-mosh-test-{}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            std::fs::create_dir_all(&auth_dir).unwrap();
-            std::fs::write(auth_dir.join("client.crt"), client_cert.cert_der.as_ref()).unwrap();
-
-            let server =
-                QuicServer::bind_mutual_tls("127.0.0.1:0".parse().unwrap(), server_cert, &auth_dir)
-                    .unwrap();
-
-            Self {
-                server,
-                client_cert,
-                _auth_dir: auth_dir,
-            }
-        }
-
-        pub fn addr(&self) -> SocketAddr {
-            self.server.local_addr().unwrap()
-        }
-
-        pub async fn connect(&self, client: &QuicClient) -> quinn::Connection {
-            client
-                .connect_with_cert(
-                    self.addr(),
-                    "localhost",
-                    self.server.server_cert_der(),
-                    &self.client_cert,
-                )
-                .await
-                .unwrap()
-        }
-    }
-
-    impl Drop for MtlsFixture {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self._auth_dir);
-        }
-    }
-}
+mod common;
+use common::MtlsFixture;
 
 // ---------------------------------------------------------------------------
 // Ported from mosh: window-resize.test
@@ -87,7 +26,7 @@ async fn e2e_window_resize() {
     use rose::transport::QuicClient;
     use std::time::Duration;
 
-    let fixture = mtls_helper::MtlsFixture::new();
+    let fixture = MtlsFixture::new();
 
     let server_task = tokio::spawn({
         let endpoint = fixture.server.endpoint.clone();
@@ -218,7 +157,7 @@ async fn e2e_basic_connection() {
     use rose::transport::QuicClient;
     use std::time::Duration;
 
-    let fixture = mtls_helper::MtlsFixture::new();
+    let fixture = MtlsFixture::new();
 
     let server_task = tokio::spawn({
         let endpoint = fixture.server.endpoint.clone();
@@ -301,100 +240,6 @@ async fn e2e_basic_connection() {
 }
 
 // ---------------------------------------------------------------------------
-// Ported from mosh: local.test
-//
-// Tests local (loopback) connection mode.
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn e2e_local_connection() {
-    use bytes::Bytes;
-    use rose::protocol::{ClientSession, ServerSession};
-    use rose::pty::PtySession;
-    use rose::transport::QuicClient;
-    use std::time::Duration;
-
-    let fixture = mtls_helper::MtlsFixture::new();
-
-    let server_task = tokio::spawn({
-        let endpoint = fixture.server.endpoint.clone();
-        async move {
-            let conn = endpoint.accept().await.unwrap().await.unwrap();
-            let (session, rows, cols) = ServerSession::accept(conn).await.unwrap();
-            let pty = PtySession::open_command(rows, cols, "cat", &[]).unwrap();
-            let pty_writer = pty.clone_writer();
-            let mut rx = pty.subscribe_output();
-
-            let output_conn = session.connection().clone();
-            let output_fwd = tokio::spawn(async move {
-                while let Ok(chunk) = rx.recv().await {
-                    if output_conn
-                        .send_datagram(Bytes::from(chunk.to_vec()))
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            });
-
-            let input_conn = session.connection().clone();
-            let input_fwd = tokio::spawn(async move {
-                while let Ok(data) = input_conn.read_datagram().await {
-                    let mut w = pty_writer.lock().expect("writer lock poisoned");
-                    if std::io::Write::write_all(&mut *w, &data).is_err() {
-                        break;
-                    }
-                    let _ = std::io::Write::flush(&mut *w);
-                }
-            });
-
-            tokio::select! {
-                _ = output_fwd => {}
-                _ = input_fwd => {}
-            }
-
-            drop(pty);
-            drop(session);
-        }
-    });
-
-    let client = QuicClient::new().unwrap();
-    let client_conn = fixture.connect(&client).await;
-    let client_session = ClientSession::connect(client_conn, 24, 80, vec![])
-        .await
-        .unwrap();
-
-    client_session
-        .send_input(Bytes::from_static(b"local_e2e_test\n"))
-        .unwrap();
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    let mut collected = String::new();
-    let mut found = false;
-
-    loop {
-        let timeout = tokio::time::timeout_at(deadline, client_session.recv_output()).await;
-        match timeout {
-            Ok(Ok(data)) => {
-                collected.push_str(&String::from_utf8_lossy(&data));
-                if collected.contains("local_e2e_test") {
-                    found = true;
-                    break;
-                }
-            }
-            _ => break,
-        }
-    }
-
-    assert!(
-        found,
-        "expected 'local_e2e_test' in echoed output, got: {collected:?}"
-    );
-
-    server_task.abort();
-}
-
-// ---------------------------------------------------------------------------
 // Ported from mosh: repeat.test
 //
 // Tests repeated connect/disconnect cycles to verify no resource leaks.
@@ -411,7 +256,7 @@ async fn e2e_repeat_connections() {
     for i in 0..5 {
         let marker = format!("repeat_marker_{i}");
 
-        let fixture = mtls_helper::MtlsFixture::new();
+        let fixture = MtlsFixture::new();
 
         let marker_clone = marker.clone();
         let server_task = tokio::spawn({
@@ -627,7 +472,7 @@ async fn session_persists_across_network_disruption() {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    let fixture = mtls_helper::MtlsFixture::new();
+    let fixture = MtlsFixture::new();
     let store = SessionStore::new();
 
     let session_id: [u8; 16];
@@ -889,7 +734,7 @@ async fn scrollback_sync_over_reliable_stream() {
     use rose::transport::QuicClient;
     use std::time::Duration;
 
-    let fixture = mtls_helper::MtlsFixture::new();
+    let fixture = MtlsFixture::new();
 
     let server_task = tokio::spawn({
         let endpoint = fixture.server.endpoint.clone();

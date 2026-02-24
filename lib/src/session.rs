@@ -245,7 +245,9 @@ mod tests {
         let store = SessionStore::new();
         let id = [4u8; 16];
         let mut session = make_detached();
-        session.detached_at = Instant::now().checked_sub(Duration::from_secs(100)).unwrap();
+        session.detached_at = Instant::now()
+            .checked_sub(Duration::from_secs(100))
+            .unwrap();
         let _ = store.insert(id, session);
 
         assert_eq!(store.prune_idle(Duration::from_secs(50)), 1);

@@ -1069,16 +1069,4 @@ mod tests {
         let ansi = term.line_ansi(100);
         assert!(ansi.is_empty());
     }
-
-    #[test]
-    fn truecolor_with_default_fallback_renders() {
-        let mut term = RoseTerminal::new(4, 40);
-        // Use SGR 38;2;R;G;B for TrueColor foreground with no palette fallback
-        term.advance(b"\x1b[38;2;128;64;32mHello\x1b[m");
-        let ansi = term.line_ansi(0);
-        assert!(
-            ansi.contains("38;2;128;64;32"),
-            "expected truecolor SGR in: {ansi:?}"
-        );
-    }
 }

@@ -403,26 +403,7 @@ pub fn build_platform_verified_client_config_with_cert(
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let verifier = rustls_platform_verifier::Verifier::new(Arc::clone(&provider))
         .map_err(|e| ConfigError::QuicCrypto(format!("platform verifier: {e}")))?;
-    let rustls_config = rustls::ClientConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .map_err(|e| ConfigError::QuicCrypto(e.to_string()))?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(verifier))
-        .with_client_auth_cert(
-            vec![client_cert.cert_der.clone()],
-            PrivateKeyDer::Pkcs8(client_cert.key_der.clone().into()),
-        )?;
-
-    let quic_client_config = QuicClientConfig::try_from(rustls_config)
-        .map_err(|e| ConfigError::QuicCrypto(e.to_string()))?;
-
-    let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
-
-    let mut transport = quinn::TransportConfig::default();
-    transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
-    client_config.transport_config(Arc::new(transport));
-
-    Ok(client_config)
+    finish_client_config(provider, Arc::new(verifier), client_cert)
 }
 
 /// Builds a quinn `ServerConfig` that requires mutual TLS client authentication.
@@ -501,26 +482,7 @@ pub fn build_client_config_with_cert(
         expected_cert: server_cert_der.clone(),
         provider: Arc::clone(&provider),
     };
-    let rustls_config = rustls::ClientConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .map_err(|e| ConfigError::QuicCrypto(e.to_string()))?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(verifier))
-        .with_client_auth_cert(
-            vec![client_cert.cert_der.clone()],
-            PrivateKeyDer::Pkcs8(client_cert.key_der.clone().into()),
-        )?;
-
-    let quic_client_config = QuicClientConfig::try_from(rustls_config)
-        .map_err(|e| ConfigError::QuicCrypto(e.to_string()))?;
-
-    let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
-
-    let mut transport = quinn::TransportConfig::default();
-    transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
-    client_config.transport_config(Arc::new(transport));
-
-    Ok(client_config)
+    finish_client_config(provider, Arc::new(verifier), client_cert)
 }
 
 /// Builds a quinn `ClientConfig` that accepts any server certificate and provides
@@ -539,11 +501,22 @@ pub fn build_tofu_client_config_with_cert(
     let verifier = TofuFirstConnectionVerifier {
         provider: Arc::clone(&provider),
     };
+    finish_client_config(provider, Arc::new(verifier), client_cert)
+}
+
+/// Shared tail for all `build_*_client_config_*` functions: builds
+/// a `rustls::ClientConfig` with TLS 1.3 + mutual TLS, wraps it in
+/// a `quinn::ClientConfig` with keep-alive transport.
+fn finish_client_config(
+    provider: Arc<rustls::crypto::CryptoProvider>,
+    verifier: Arc<dyn rustls::client::danger::ServerCertVerifier>,
+    client_cert: &CertKeyPair,
+) -> Result<quinn::ClientConfig, ConfigError> {
     let rustls_config = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| ConfigError::QuicCrypto(e.to_string()))?
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(verifier))
+        .with_custom_certificate_verifier(verifier)
         .with_client_auth_cert(
             vec![client_cert.cert_der.clone()],
             PrivateKeyDer::Pkcs8(client_cert.key_der.clone().into()),
@@ -677,26 +650,15 @@ mod tests {
     }
 
     #[test]
-    fn cert_fingerprint_format() {
-        let data = b"test cert data";
-        let fp = cert_fingerprint(data);
-        assert!(fp.contains(':'));
+    fn cert_fingerprint_properties() {
+        let fp = cert_fingerprint(b"test cert data");
         let parts: Vec<&str> = fp.split(':').collect();
         assert_eq!(parts.len(), 32);
         for part in &parts {
             assert_eq!(part.len(), 2);
             assert!(part.chars().all(|c| c.is_ascii_hexdigit()));
         }
-    }
-
-    #[test]
-    fn cert_fingerprint_deterministic() {
-        let data = b"same input";
-        assert_eq!(cert_fingerprint(data), cert_fingerprint(data));
-    }
-
-    #[test]
-    fn cert_fingerprint_different_for_different_input() {
+        assert_eq!(cert_fingerprint(b"test cert data"), fp);
         assert_ne!(cert_fingerprint(b"cert-a"), cert_fingerprint(b"cert-b"));
     }
 
@@ -723,50 +685,54 @@ mod tests {
     }
 
     #[test]
-    fn config_default_does_not_require_ca() {
+    fn config_defaults() {
         let cfg = RoseConfig::default();
         assert!(!cfg.require_ca_certs);
+        assert!(cfg.stun_servers.is_none());
+        assert!(cfg.max_sessions.is_none());
+        assert_eq!(cfg.session_idle_timeout_secs, Some(604_800));
     }
 
     #[test]
     fn config_load_missing_file_returns_default() {
-        let dir = std::env::temp_dir().join(format!("rose-cfg-missing-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let cfg = RoseConfig::load(&dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nonexistent");
+        let cfg = RoseConfig::load(&missing).unwrap();
         assert_eq!(cfg, RoseConfig::default());
     }
 
     #[test]
     fn config_load_empty_file_returns_default() {
-        let dir = std::env::temp_dir().join(format!("rose-cfg-empty-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("config.toml"), "").unwrap();
-        let cfg = RoseConfig::load(&dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), "").unwrap();
+        let cfg = RoseConfig::load(dir.path()).unwrap();
         assert_eq!(cfg, RoseConfig::default());
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn config_load_require_ca_certs_true() {
-        let dir = std::env::temp_dir().join(format!("rose-cfg-ca-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("config.toml"), "require_ca_certs = true\n").unwrap();
-        let cfg = RoseConfig::load(&dir).unwrap();
+    fn config_load_all_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "require_ca_certs = true\nstun_servers = [\"stun.example.com:3478\"]\nmax_sessions = 5\nsession_idle_timeout_secs = 0\n",
+        )
+        .unwrap();
+        let cfg = RoseConfig::load(dir.path()).unwrap();
         assert!(cfg.require_ca_certs);
-        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(
+            cfg.stun_servers,
+            Some(vec!["stun.example.com:3478".to_string()])
+        );
+        assert_eq!(cfg.max_sessions, Some(5));
+        assert_eq!(cfg.session_idle_timeout_secs, Some(0));
     }
 
     #[test]
     fn config_load_invalid_toml() {
-        let dir = std::env::temp_dir().join(format!("rose-cfg-bad-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("config.toml"), "not valid {{{{ toml").unwrap();
-        let err = RoseConfig::load(&dir).unwrap_err();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), "not valid {{{{ toml").unwrap();
+        let err = RoseConfig::load(dir.path()).unwrap_err();
         assert!(matches!(err, ConfigError::ConfigParse(_)));
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -783,62 +749,6 @@ mod tests {
         let serialized = toml::to_string(&cfg).unwrap();
         let deserialized: RoseConfig = toml::from_str(&serialized).unwrap();
         assert_eq!(cfg, deserialized);
-    }
-
-    #[test]
-    fn config_load_stun_servers() {
-        let dir = std::env::temp_dir().join(format!("rose-cfg-stun-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("config.toml"),
-            "stun_servers = [\"stun.example.com:3478\"]\n",
-        )
-        .unwrap();
-        let cfg = RoseConfig::load(&dir).unwrap();
-        assert_eq!(
-            cfg.stun_servers,
-            Some(vec!["stun.example.com:3478".to_string()])
-        );
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn config_default_stun_servers_is_none() {
-        let cfg = RoseConfig::default();
-        assert!(cfg.stun_servers.is_none());
-    }
-
-    #[test]
-    fn config_default_max_sessions_is_none() {
-        let cfg = RoseConfig::default();
-        assert!(cfg.max_sessions.is_none());
-    }
-
-    #[test]
-    fn config_default_idle_timeout_is_seven_days() {
-        let cfg = RoseConfig::default();
-        assert_eq!(cfg.session_idle_timeout_secs, Some(604_800));
-    }
-
-    #[test]
-    fn config_load_max_sessions() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("config.toml"), "max_sessions = 5\n").unwrap();
-        let cfg = RoseConfig::load(dir.path()).unwrap();
-        assert_eq!(cfg.max_sessions, Some(5));
-    }
-
-    #[test]
-    fn config_load_idle_timeout_disabled() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("config.toml"),
-            "session_idle_timeout_secs = 0\n",
-        )
-        .unwrap();
-        let cfg = RoseConfig::load(dir.path()).unwrap();
-        assert_eq!(cfg.session_idle_timeout_secs, Some(0));
     }
 
     fn generate_cert_with_validity(

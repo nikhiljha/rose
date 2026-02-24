@@ -255,19 +255,14 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn spawn_echo_and_read_output() {
-        let mut session = PtySession::open_command(24, 80, "echo", &["hello_pty"]).unwrap();
-        let mut rx = session.subscribe_output();
-
-        // Collect output until we see our marker or timeout
+    fn poll_output_until(rx: &mut broadcast::Receiver<Bytes>, marker: &str) -> String {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let mut collected = String::new();
         while std::time::Instant::now() < deadline {
             match rx.try_recv() {
                 Ok(chunk) => {
                     collected.push_str(&String::from_utf8_lossy(&chunk));
-                    if collected.contains("hello_pty") {
+                    if collected.contains(marker) {
                         break;
                     }
                 }
@@ -277,6 +272,14 @@ mod tests {
                 Err(_) => break,
             }
         }
+        collected
+    }
+
+    #[test]
+    fn spawn_echo_and_read_output() {
+        let mut session = PtySession::open_command(24, 80, "echo", &["hello_pty"]).unwrap();
+        let mut rx = session.subscribe_output();
+        let collected = poll_output_until(&mut rx, "hello_pty");
         assert!(
             collected.contains("hello_pty"),
             "expected 'hello_pty' in output, got: {collected:?}"
@@ -296,22 +299,7 @@ mod tests {
 
         session.write(b"test_input\n").unwrap();
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let mut collected = String::new();
-        while std::time::Instant::now() < deadline {
-            match rx.try_recv() {
-                Ok(chunk) => {
-                    collected.push_str(&String::from_utf8_lossy(&chunk));
-                    if collected.contains("test_input") {
-                        break;
-                    }
-                }
-                Err(broadcast::error::TryRecvError::Empty) => {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(_) => break,
-            }
-        }
+        let collected = poll_output_until(&mut rx, "test_input");
         assert!(
             collected.contains("test_input"),
             "expected 'test_input' in output, got: {collected:?}"
@@ -338,21 +326,8 @@ mod tests {
         let mut rx1 = session.subscribe_output();
         let mut rx2 = session.subscribe_output();
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let mut c1 = String::new();
-        let mut c2 = String::new();
-        while std::time::Instant::now() < deadline {
-            if let Ok(chunk) = rx1.try_recv() {
-                c1.push_str(&String::from_utf8_lossy(&chunk));
-            }
-            if let Ok(chunk) = rx2.try_recv() {
-                c2.push_str(&String::from_utf8_lossy(&chunk));
-            }
-            if c1.contains("multi_sub") && c2.contains("multi_sub") {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        let c1 = poll_output_until(&mut rx1, "multi_sub");
+        let c2 = poll_output_until(&mut rx2, "multi_sub");
         assert!(
             c1.contains("multi_sub"),
             "subscriber 1 should see output: {c1:?}"
@@ -394,22 +369,7 @@ mod tests {
         let mut session = PtySession::open_command_with_env(24, 80, "env", &[], &env).unwrap();
         let mut rx = session.subscribe_output();
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let mut collected = String::new();
-        while std::time::Instant::now() < deadline {
-            match rx.try_recv() {
-                Ok(chunk) => {
-                    collected.push_str(&String::from_utf8_lossy(&chunk));
-                    if collected.contains("TERM=xterm-256color") {
-                        break;
-                    }
-                }
-                Err(broadcast::error::TryRecvError::Empty) => {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(_) => break,
-            }
-        }
+        let collected = poll_output_until(&mut rx, "TERM=xterm-256color");
         assert!(
             collected.contains("TERM=xterm-256color"),
             "env command should show TERM=xterm-256color, got: {collected:?}"
