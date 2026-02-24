@@ -30,36 +30,12 @@ pub enum TransportError {
 
 /// A QUIC server endpoint that accepts incoming connections.
 pub struct QuicServer {
-    pub(crate) endpoint: quinn::Endpoint,
+    /// The underlying QUIC endpoint.
+    pub endpoint: quinn::Endpoint,
     cert: CertKeyPair,
 }
 
 impl QuicServer {
-    /// Binds a QUIC server on `addr` with an auto-generated self-signed certificate.
-    ///
-    /// # Errors
-    ///
-    /// Returns `TransportError::Config` if cert generation fails, or
-    /// `TransportError::Bind` if the socket cannot be bound.
-    pub fn bind(addr: SocketAddr) -> Result<Self, TransportError> {
-        let san = vec!["localhost".to_string()];
-        let cert = config::generate_self_signed_cert(&san)?;
-        Self::bind_with_cert(addr, cert)
-    }
-
-    /// Binds a QUIC server on `addr` with a pre-existing certificate.
-    ///
-    /// # Errors
-    ///
-    /// Returns `TransportError::Config` if the TLS config is invalid, or
-    /// `TransportError::Bind` if the socket cannot be bound.
-    pub fn bind_with_cert(addr: SocketAddr, cert: CertKeyPair) -> Result<Self, TransportError> {
-        let server_config = config::build_server_config(&cert)?;
-        let endpoint =
-            quinn::Endpoint::server(server_config, addr).map_err(TransportError::Bind)?;
-        Ok(Self { endpoint, cert })
-    }
-
     /// Binds a QUIC server requiring mutual TLS client authentication.
     ///
     /// # Errors
@@ -160,11 +136,13 @@ impl PunchHandle {
 ///
 fn send_punch_packets(endpoint: quinn::Endpoint, target: SocketAddr) {
     tokio::spawn(async move {
-        let Ok(dummy_config) = config::build_tofu_client_config() else {
+        let Ok(dummy_cert) = config::generate_self_signed_cert(&["punch".to_string()]) else {
+            return;
+        };
+        let Ok(dummy_config) = config::build_tofu_client_config_with_cert(&dummy_cert) else {
             return;
         };
         if let Ok(connecting) = endpoint.connect_with(dummy_config, target, "punch") {
-            // Drive the handshake briefly so Initial packets are sent.
             let _ = tokio::time::timeout(std::time::Duration::from_secs(2), connecting).await;
         }
     });
@@ -207,26 +185,6 @@ impl QuicClient {
         Ok(Self { endpoint })
     }
 
-    /// Connects to a QUIC server at `addr`, trusting the given server certificate.
-    ///
-    /// # Errors
-    ///
-    /// Returns `TransportError::Config` if the TLS config is invalid,
-    /// `TransportError::Connect` if the connection cannot be initiated, or
-    /// `TransportError::Connection` if the handshake fails.
-    pub async fn connect(
-        &self,
-        addr: SocketAddr,
-        server_name: &str,
-        server_cert_der: &CertificateDer<'static>,
-    ) -> Result<quinn::Connection, TransportError> {
-        let client_config = config::build_client_config(server_cert_der)?;
-        let conn = self
-            .endpoint
-            .connect_with(client_config, addr, server_name)?
-            .await?;
-        Ok(conn)
-    }
     /// Connects to a QUIC server using a pre-built client config.
     ///
     /// Used for TOFU first-connection where the caller builds a custom TLS
@@ -290,38 +248,99 @@ mod tests {
     use super::*;
     use bytes::Bytes;
 
-    /// Helper: create a server + client pair connected on localhost.
-    async fn connected_pair() -> (quinn::Connection, quinn::Connection, QuicServer, QuicClient) {
-        let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let addr = server.local_addr().unwrap();
-        let cert = server.server_cert_der().clone();
-        let client = QuicClient::new().unwrap();
+    struct MtlsFixture {
+        server: QuicServer,
+        client_cert: CertKeyPair,
+        _auth_dir: std::path::PathBuf,
+    }
 
-        // Accept in a task so connect + accept run concurrently
+    impl MtlsFixture {
+        fn new() -> Self {
+            let server_cert =
+                config::generate_self_signed_cert(&["localhost".to_string()]).unwrap();
+            let client_cert =
+                config::generate_self_signed_cert(&["localhost".to_string()]).unwrap();
+
+            let auth_dir = std::env::temp_dir().join(format!(
+                "rose-transport-test-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&auth_dir).unwrap();
+            std::fs::write(auth_dir.join("client.crt"), client_cert.cert_der.as_ref()).unwrap();
+
+            let server =
+                QuicServer::bind_mutual_tls("127.0.0.1:0".parse().unwrap(), server_cert, &auth_dir)
+                    .unwrap();
+
+            Self {
+                server,
+                client_cert,
+                _auth_dir: auth_dir,
+            }
+        }
+
+        fn addr(&self) -> SocketAddr {
+            self.server.local_addr().unwrap()
+        }
+
+        fn server_cert_der(&self) -> &CertificateDer<'static> {
+            self.server.server_cert_der()
+        }
+
+        async fn connect(&self, client: &QuicClient) -> quinn::Connection {
+            client
+                .connect_with_cert(
+                    self.addr(),
+                    "localhost",
+                    self.server_cert_der(),
+                    &self.client_cert,
+                )
+                .await
+                .unwrap()
+        }
+    }
+
+    impl Drop for MtlsFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self._auth_dir);
+        }
+    }
+
+    async fn connected_pair() -> (
+        quinn::Connection,
+        quinn::Connection,
+        MtlsFixture,
+        QuicClient,
+    ) {
+        let fixture = MtlsFixture::new();
+
         let accept = tokio::spawn({
-            let endpoint = server.endpoint.clone();
+            let endpoint = fixture.server.endpoint.clone();
             async move {
                 let incoming = endpoint.accept().await.unwrap();
                 incoming.await.unwrap()
             }
         });
 
-        let client_conn = client.connect(addr, "localhost", &cert).await.unwrap();
+        let client = QuicClient::new().unwrap();
+        let client_conn = fixture.connect(&client).await;
         let server_conn = accept.await.unwrap();
 
-        (client_conn, server_conn, server, client)
+        (client_conn, server_conn, fixture, client)
     }
 
     #[tokio::test]
     async fn bind_and_accept() {
-        let (client_conn, _server_conn, server, _client) = connected_pair().await;
-        let addr = server.local_addr().unwrap();
-        assert_eq!(client_conn.remote_address(), addr);
+        let (client_conn, _server_conn, fixture, _client) = connected_pair().await;
+        assert_eq!(client_conn.remote_address(), fixture.addr());
     }
 
     #[tokio::test]
     async fn datagram_roundtrip() {
-        let (client_conn, server_conn, _server, _client) = connected_pair().await;
+        let (client_conn, server_conn, _fixture, _client) = connected_pair().await;
 
         client_conn
             .send_datagram(Bytes::from_static(b"hello datagram"))
@@ -337,17 +356,13 @@ mod tests {
 
     #[tokio::test]
     async fn bidirectional_stream() {
-        let (client_conn, server_conn, _server, _client) = connected_pair().await;
+        let (client_conn, server_conn, _fixture, _client) = connected_pair().await;
 
-        // Server echoes back data it receives on a bi-stream, keeping the
-        // connection alive until the client is done reading.
         let server_task = tokio::spawn(async move {
             let (mut send, mut recv) = server_conn.accept_bi().await.unwrap();
             let data = recv.read_to_end(1024).await.unwrap();
             send.write_all(&data).await.unwrap();
             send.finish().unwrap();
-            // Hold the connection open until client has read the response.
-            // The connection is kept alive as long as this value exists.
             server_conn
         });
 
@@ -363,12 +378,10 @@ mod tests {
 
     #[tokio::test]
     async fn from_socket_connects() {
-        let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let addr = server.local_addr().unwrap();
-        let cert = server.server_cert_der().clone();
+        let fixture = MtlsFixture::new();
 
         let accept = tokio::spawn({
-            let endpoint = server.endpoint.clone();
+            let endpoint = fixture.server.endpoint.clone();
             async move {
                 let incoming = endpoint.accept().await.unwrap();
                 incoming.await.unwrap()
@@ -377,63 +390,56 @@ mod tests {
 
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let client = QuicClient::from_socket(socket).unwrap();
-        let client_conn = client.connect(addr, "localhost", &cert).await.unwrap();
+        let client_conn = fixture.connect(&client).await;
         let _server_conn = accept.await.unwrap();
 
-        assert_eq!(client_conn.remote_address(), addr);
+        assert_eq!(client_conn.remote_address(), fixture.addr());
     }
 
     #[tokio::test]
     async fn punch_handle_creation() {
-        let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let handle = server.clone_for_punch();
-        // Just verify it can be created without panicking.
-        // Actual hole-punching is tested via e2e tests.
+        let fixture = MtlsFixture::new();
+        let handle = fixture.server.clone_for_punch();
         drop(handle);
     }
 
     #[tokio::test]
     async fn server_cert_pem_is_valid() {
-        let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let pem = server.server_cert_pem();
+        let fixture = MtlsFixture::new();
+        let pem = fixture.server.server_cert_pem();
         assert!(pem.contains("BEGIN CERTIFICATE"));
     }
 
     #[tokio::test]
     async fn accept_returns_none_on_close() {
-        let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        // Close the endpoint, then accept should return None
-        server.endpoint.close(0u32.into(), b"done");
-        let result = server.accept().await.unwrap();
+        let fixture = MtlsFixture::new();
+        fixture.server.endpoint.close(0u32.into(), b"done");
+        let result = fixture.server.accept().await.unwrap();
         assert!(result.is_none());
     }
 
     #[tokio::test]
     async fn punch_hole_sends_packets() {
-        let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        // Punch toward a dummy address — the connection will fail but
-        // the function should not panic.
-        server.punch_hole("127.0.0.1:1".parse().unwrap());
-        // Give the spawned task time to execute
+        let fixture = MtlsFixture::new();
+        fixture.server.punch_hole("127.0.0.1:1".parse().unwrap());
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
     #[tokio::test]
     async fn punch_handle_sends_packets() {
-        let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let handle = server.clone_for_punch();
+        let fixture = MtlsFixture::new();
+        let handle = fixture.server.clone_for_punch();
         handle.punch_hole("127.0.0.1:1".parse().unwrap());
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
     #[tokio::test]
     async fn connect_with_cert_rejects_wrong_pinned_cert() {
-        let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let addr = server.local_addr().unwrap();
+        let fixture = MtlsFixture::new();
         let client = QuicClient::new().unwrap();
 
         let accept = tokio::spawn({
-            let endpoint = server.endpoint.clone();
+            let endpoint = fixture.server.endpoint.clone();
             async move {
                 let incoming = endpoint.accept().await.unwrap();
                 incoming.await
@@ -441,9 +447,13 @@ mod tests {
         });
 
         let wrong_cert = config::generate_self_signed_cert(&["localhost".to_string()]).unwrap();
-        let client_cert = config::generate_self_signed_cert(&["localhost".to_string()]).unwrap();
         let result = client
-            .connect_with_cert(addr, "localhost", &wrong_cert.cert_der, &client_cert)
+            .connect_with_cert(
+                fixture.addr(),
+                "localhost",
+                &wrong_cert.cert_der,
+                &fixture.client_cert,
+            )
             .await;
         assert!(result.is_err());
         drop(accept);
@@ -451,26 +461,26 @@ mod tests {
 
     #[tokio::test]
     async fn connect_with_config_succeeds() {
-        let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let addr = server.local_addr().unwrap();
-        let cert = server.server_cert_der().clone();
+        let fixture = MtlsFixture::new();
         let client = QuicClient::new().unwrap();
 
         let accept = tokio::spawn({
-            let endpoint = server.endpoint.clone();
+            let endpoint = fixture.server.endpoint.clone();
             async move {
                 let incoming = endpoint.accept().await.unwrap();
                 incoming.await.unwrap()
             }
         });
 
-        let config = config::build_client_config(&cert).unwrap();
+        let config =
+            config::build_client_config_with_cert(fixture.server_cert_der(), &fixture.client_cert)
+                .unwrap();
         let client_conn = client
-            .connect_with_config(config, addr, "localhost")
+            .connect_with_config(config, fixture.addr(), "localhost")
             .await
             .unwrap();
         let _server_conn = accept.await.unwrap();
 
-        assert_eq!(client_conn.remote_address(), addr);
+        assert_eq!(client_conn.remote_address(), fixture.addr());
     }
 }

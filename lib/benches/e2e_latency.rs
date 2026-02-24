@@ -14,6 +14,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use criterion::{Criterion, criterion_group, criterion_main};
 
+use rose::config::generate_self_signed_cert;
 use rose::protocol::{ClientSession, ServerSession};
 use rose::pty::PtySession;
 use rose::ssp::{
@@ -23,16 +24,9 @@ use rose::ssp::{
 use rose::terminal::RoseTerminal;
 use rose::transport::{QuicClient, QuicServer};
 
-/// Full end-to-end keystroke round-trip through QUIC + PTY.
-///
-/// Measures: client sends keystroke datagram -> server writes to PTY -> PTY
-/// echoes -> server reads, advances terminal, computes SSP diff, sends
-/// datagram -> client receives and decodes frame.
 fn keystroke_roundtrip(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
 
-    // Optional: emit a Chrome trace file for detailed span analysis.
-    // Filtered to `rose::*` spans only (excludes quinn/tokio noise).
     let _trace_guard = if std::env::var("ROSE_BENCH_TRACE").is_ok() {
         use tracing_subscriber::prelude::*;
 
@@ -49,17 +43,20 @@ fn keystroke_roundtrip(c: &mut Criterion) {
         None
     };
 
-    // --- Setup: QUIC server + client, PTY with `cat`, server I/O tasks ---
-
-    // We store the client connection as a clone (quinn::Connection is
-    // reference-counted internally). The _keep_alive tuple prevents the
-    // QuicClient, ClientSession, and server task from being dropped.
     let (client_conn, _keep_alive) = rt.block_on(async {
-        let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let addr = server.local_addr().unwrap();
-        let cert = server.server_cert_der().clone();
+        let server_cert = generate_self_signed_cert(&["localhost".to_string()]).unwrap();
+        let client_cert = generate_self_signed_cert(&["bench-client".to_string()]).unwrap();
 
-        // Server: accept, handshake, and run I/O in background
+        let auth_dir = std::env::temp_dir().join(format!("rose-bench-auth-{}", std::process::id()));
+        std::fs::create_dir_all(&auth_dir).unwrap();
+        std::fs::write(auth_dir.join("client.crt"), client_cert.cert_der.as_ref()).unwrap();
+
+        let server =
+            QuicServer::bind_mutual_tls("127.0.0.1:0".parse().unwrap(), server_cert, &auth_dir)
+                .unwrap();
+        let addr = server.local_addr().unwrap();
+        let cert_der = server.server_cert_der().clone();
+
         let server_handle = tokio::spawn(async move {
             let conn = server.accept().await.unwrap().unwrap();
             let (session, rows, cols) = ServerSession::accept(conn).await.unwrap();
@@ -125,9 +122,11 @@ fn keystroke_roundtrip(c: &mut Criterion) {
             drop(session);
         });
 
-        // Client: connect + handshake
         let client = QuicClient::new().unwrap();
-        let client_conn = client.connect(addr, "localhost", &cert).await.unwrap();
+        let client_conn = client
+            .connect_with_cert(addr, "localhost", &cert_der, &client_cert)
+            .await
+            .unwrap();
         let client_session = ClientSession::connect(client_conn.clone(), 24, 80, vec![])
             .await
             .unwrap();

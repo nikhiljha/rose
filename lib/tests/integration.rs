@@ -2,6 +2,70 @@
 
 use std::time::Duration;
 
+mod mtls_helper {
+    use rose::config::{self, CertKeyPair};
+    use rose::transport::{QuicClient, QuicServer};
+    use std::net::SocketAddr;
+    use std::path::PathBuf;
+
+    pub struct MtlsFixture {
+        pub server: QuicServer,
+        pub client_cert: CertKeyPair,
+        _auth_dir: PathBuf,
+    }
+
+    impl MtlsFixture {
+        pub fn new() -> Self {
+            let server_cert =
+                config::generate_self_signed_cert(&["localhost".to_string()]).unwrap();
+            let client_cert =
+                config::generate_self_signed_cert(&["localhost".to_string()]).unwrap();
+
+            let auth_dir = std::env::temp_dir().join(format!(
+                "rose-integ-test-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&auth_dir).unwrap();
+            std::fs::write(auth_dir.join("client.crt"), client_cert.cert_der.as_ref()).unwrap();
+
+            let server =
+                QuicServer::bind_mutual_tls("127.0.0.1:0".parse().unwrap(), server_cert, &auth_dir)
+                    .unwrap();
+
+            Self {
+                server,
+                client_cert,
+                _auth_dir: auth_dir,
+            }
+        }
+
+        pub fn addr(&self) -> SocketAddr {
+            self.server.local_addr().unwrap()
+        }
+
+        pub async fn connect(&self, client: &QuicClient) -> quinn::Connection {
+            client
+                .connect_with_cert(
+                    self.addr(),
+                    "localhost",
+                    self.server.server_cert_der(),
+                    &self.client_cert,
+                )
+                .await
+                .unwrap()
+        }
+    }
+
+    impl Drop for MtlsFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self._auth_dir);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // PTY + Terminal: spawn a command in a PTY and feed output to RoseTerminal
 // ---------------------------------------------------------------------------
@@ -51,28 +115,25 @@ fn pty_output_renders_in_terminal() {
 async fn transport_protocol_handshake_and_datagram() {
     use bytes::Bytes;
     use rose::protocol::{ClientSession, ServerSession};
-    use rose::transport::{QuicClient, QuicServer};
+    use rose::transport::QuicClient;
 
-    let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-    let addr = server.local_addr().unwrap();
-    let cert = server.server_cert_der().clone();
-    let client = QuicClient::new().unwrap();
+    let fixture = mtls_helper::MtlsFixture::new();
 
-    // Server: accept in a background task
-    let server_accept = tokio::spawn(async move {
-        let conn = server.accept().await.unwrap().unwrap();
-        let result = ServerSession::accept(conn).await.unwrap();
-        // Return both the session and the server (to keep endpoint alive)
-        (result, server)
+    let server_accept = tokio::spawn({
+        let endpoint = fixture.server.endpoint.clone();
+        async move {
+            let conn = endpoint.accept().await.unwrap().await.unwrap();
+            ServerSession::accept(conn).await.unwrap()
+        }
     });
 
-    // Client: connect and handshake
-    let client_conn = client.connect(addr, "localhost", &cert).await.unwrap();
+    let client = QuicClient::new().unwrap();
+    let client_conn = fixture.connect(&client).await;
     let client_session = ClientSession::connect(client_conn, 24, 80, vec![])
         .await
         .unwrap();
 
-    let ((server_session, rows, cols), _server) = server_accept.await.unwrap();
+    let (server_session, rows, cols) = server_accept.await.unwrap();
     assert_eq!(rows, 24);
     assert_eq!(cols, 80);
 
@@ -410,44 +471,40 @@ async fn ssp_over_quic() {
     use bytes::Bytes;
     use rose::protocol::{ClientSession, ServerSession};
     use rose::ssp::{DATAGRAM_SSP_ACK, ScreenState, SspFrame, SspReceiver, SspSender};
-    use rose::transport::{QuicClient, QuicServer};
+    use rose::transport::QuicClient;
 
-    let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-    let addr = server.local_addr().unwrap();
-    let cert = server.server_cert_der().clone();
+    let fixture = mtls_helper::MtlsFixture::new();
 
-    // Server: accept, create SSP state, send frame
-    let server_task = tokio::spawn(async move {
-        let conn = server.accept().await.unwrap().unwrap();
-        let (session, _, _) = ServerSession::accept(conn).await.unwrap();
+    let server_task = tokio::spawn({
+        let endpoint = fixture.server.endpoint.clone();
+        async move {
+            let conn = endpoint.accept().await.unwrap().await.unwrap();
+            let (session, _, _) = ServerSession::accept(conn).await.unwrap();
 
-        let mut sender = SspSender::new();
-        let mut rows = vec![String::new(); 24];
-        rows[0] = "ssp over quic".into();
-        rows[1] = "line two".into();
-        sender.push_state(ScreenState {
-            rows,
-            cursor_x: 8,
-            cursor_y: 1,
-        });
+            let mut sender = SspSender::new();
+            let mut rows = vec![String::new(); 24];
+            rows[0] = "ssp over quic".into();
+            rows[1] = "line two".into();
+            sender.push_state(ScreenState {
+                rows,
+                cursor_x: 8,
+                cursor_y: 1,
+            });
 
-        let frame = sender.generate_frame().unwrap();
-        session.send_output(Bytes::from(frame.encode())).unwrap();
+            let frame = sender.generate_frame().unwrap();
+            session.send_output(Bytes::from(frame.encode())).unwrap();
 
-        // Wait for ACK
-        let ack_data = session.recv_input().await.unwrap();
-        assert_eq!(ack_data[0], DATAGRAM_SSP_ACK);
-        let ack_frame = SspFrame::decode(&ack_data[1..]).unwrap();
-        assert_eq!(ack_frame.ack_num, 1);
+            let ack_data = session.recv_input().await.unwrap();
+            assert_eq!(ack_data[0], DATAGRAM_SSP_ACK);
+            let ack_frame = SspFrame::decode(&ack_data[1..]).unwrap();
+            assert_eq!(ack_frame.ack_num, 1);
 
-        // Keep alive for clean shutdown
-        drop(session);
-        drop(server);
+            drop(session);
+        }
     });
 
-    // Client: connect, receive frame, verify state
     let client = QuicClient::new().unwrap();
-    let client_conn = client.connect(addr, "localhost", &cert).await.unwrap();
+    let client_conn = fixture.connect(&client).await;
     let client_session = ClientSession::connect(client_conn, 24, 80, vec![])
         .await
         .unwrap();
@@ -485,33 +542,30 @@ async fn e2e_echo_command() {
     use bytes::Bytes;
     use rose::protocol::{ClientSession, ServerSession};
     use rose::pty::PtySession;
-    use rose::transport::{QuicClient, QuicServer};
+    use rose::transport::QuicClient;
 
-    let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-    let addr = server.local_addr().unwrap();
-    let cert = server.server_cert_der().clone();
+    let fixture = mtls_helper::MtlsFixture::new();
 
-    // Server: accept connection, spawn PTY, forward I/O
-    let server_task = tokio::spawn(async move {
-        let conn = server.accept().await.unwrap().unwrap();
-        let (session, rows, cols) = ServerSession::accept(conn).await.unwrap();
-        let pty = PtySession::open_command(rows, cols, "echo", &["e2e_test_output"]).unwrap();
-        let mut rx = pty.subscribe_output();
+    let server_task = tokio::spawn({
+        let endpoint = fixture.server.endpoint.clone();
+        async move {
+            let conn = endpoint.accept().await.unwrap().await.unwrap();
+            let (session, rows, cols) = ServerSession::accept(conn).await.unwrap();
+            let pty = PtySession::open_command(rows, cols, "echo", &["e2e_test_output"]).unwrap();
+            let mut rx = pty.subscribe_output();
 
-        // Forward PTY output to client
-        while let Ok(chunk) = rx.recv().await {
-            if session.send_output(Bytes::from(chunk.to_vec())).is_err() {
-                break;
+            while let Ok(chunk) = rx.recv().await {
+                if session.send_output(Bytes::from(chunk.to_vec())).is_err() {
+                    break;
+                }
             }
+            drop(pty);
+            drop(session);
         }
-        // Keep everything alive until we finish
-        drop(pty);
-        drop(session);
     });
 
-    // Client: connect, send hello, read output
     let client = QuicClient::new().unwrap();
-    let client_conn = client.connect(addr, "localhost", &cert).await.unwrap();
+    let client_conn = fixture.connect(&client).await;
     let client_session = ClientSession::connect(client_conn, 24, 80, vec![])
         .await
         .unwrap();
@@ -553,50 +607,45 @@ async fn ssp_oversized_frame_via_stream() {
     use rose::protocol::{ClientSession, ServerSession};
     use rose::scrollback;
     use rose::ssp::{ScreenState, SspFrame, SspReceiver, SspSender};
-    use rose::transport::{QuicClient, QuicServer};
+    use rose::transport::QuicClient;
 
-    let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-    let addr = server.local_addr().unwrap();
-    let cert = server.server_cert_der().clone();
+    let fixture = mtls_helper::MtlsFixture::new();
 
-    // Server: accept, build a large screen state, send via uni stream
-    let server_task = tokio::spawn(async move {
-        let conn = server.accept().await.unwrap().unwrap();
-        let (session, _, _) = ServerSession::accept(conn).await.unwrap();
+    let server_task = tokio::spawn({
+        let endpoint = fixture.server.endpoint.clone();
+        async move {
+            let conn = endpoint.accept().await.unwrap().await.unwrap();
+            let (session, _, _) = ServerSession::accept(conn).await.unwrap();
 
-        let mut sender = SspSender::new();
-        // Create a state with long rows to produce an oversized frame
-        let rows: Vec<String> = (0..24)
-            .map(|i| format!("row_{i}_{}", "X".repeat(200)))
-            .collect();
-        sender.push_state(ScreenState {
-            rows,
-            cursor_x: 0,
-            cursor_y: 0,
-        });
+            let mut sender = SspSender::new();
+            let rows: Vec<String> = (0..24)
+                .map(|i| format!("row_{i}_{}", "X".repeat(200)))
+                .collect();
+            sender.push_state(ScreenState {
+                rows,
+                cursor_x: 0,
+                cursor_y: 0,
+            });
 
-        let frame = sender.generate_frame().unwrap();
-        let stream_data = frame.encode_for_stream();
+            let frame = sender.generate_frame().unwrap();
+            let stream_data = frame.encode_for_stream();
 
-        // Send via uni stream with type prefix (simulating the oversized fallback)
-        let conn = session.connection().clone();
-        let mut stream = conn.open_uni().await.unwrap();
-        stream
-            .write_all(&[scrollback::stream_type::SSP_FRAME])
-            .await
-            .unwrap();
-        stream.write_all(&stream_data).await.unwrap();
-        stream.finish().unwrap();
+            let conn = session.connection().clone();
+            let mut stream = conn.open_uni().await.unwrap();
+            stream
+                .write_all(&[scrollback::stream_type::SSP_FRAME])
+                .await
+                .unwrap();
+            stream.write_all(&stream_data).await.unwrap();
+            stream.finish().unwrap();
 
-        // Keep alive for client to read
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        drop(session);
-        drop(server);
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            drop(session);
+        }
     });
 
-    // Client: connect, accept uni stream, decode frame
     let client = QuicClient::new().unwrap();
-    let client_conn = client.connect(addr, "localhost", &cert).await.unwrap();
+    let client_conn = fixture.connect(&client).await;
     let _client_session = ClientSession::connect(client_conn.clone(), 24, 80, vec![])
         .await
         .unwrap();

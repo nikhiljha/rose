@@ -154,65 +154,6 @@ pub fn generate_self_signed_cert(san: &[String]) -> Result<CertKeyPair, ConfigEr
     })
 }
 
-/// Builds a quinn `ServerConfig` from a certificate and private key.
-///
-/// Datagrams are enabled by default in the transport config (quinn default).
-///
-/// # Errors
-///
-/// Returns `ConfigError::Tls` if the TLS configuration is invalid.
-pub fn build_server_config(cert: &CertKeyPair) -> Result<quinn::ServerConfig, ConfigError> {
-    let mut server_config = quinn::ServerConfig::with_single_cert(
-        vec![cert.cert_der.clone()],
-        PrivateKeyDer::Pkcs8(cert.key_der.clone().into()),
-    )?;
-
-    let mut transport = quinn::TransportConfig::default();
-    // Detect dead clients within 15s. The client sends keep-alives every 5s,
-    // so a live client will always respond in time.
-    transport.max_idle_timeout(Some(
-        // 15s is well within the valid range for IdleTimeout.
-        quinn::IdleTimeout::from(quinn::VarInt::from_u32(15_000)),
-    ));
-    server_config.transport_config(Arc::new(transport));
-
-    Ok(server_config)
-}
-
-/// Builds a quinn `ClientConfig` that trusts a specific server certificate.
-///
-/// This is used for the TOFU/pinned-cert model where the client knows the
-/// server's certificate in advance.
-///
-/// # Errors
-///
-/// Returns `ConfigError` if the TLS configuration cannot be built.
-pub fn build_client_config(
-    server_cert_der: &CertificateDer<'static>,
-) -> Result<quinn::ClientConfig, ConfigError> {
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.add(server_cert_der.clone())?;
-
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let rustls_config = rustls::ClientConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .map_err(|e| ConfigError::QuicCrypto(e.to_string()))?
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-
-    let quic_client_config = QuicClientConfig::try_from(rustls_config)
-        .map_err(|e| ConfigError::QuicCrypto(e.to_string()))?;
-
-    let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
-
-    // Use the same transport config defaults (datagrams enabled)
-    let mut transport = quinn::TransportConfig::default();
-    transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
-    client_config.transport_config(Arc::new(transport));
-
-    Ok(client_config)
-}
-
 /// Result of a TOFU (Trust On First Use) certificate check.
 #[derive(Debug, PartialEq, Eq)]
 pub enum TofuResult {
@@ -396,70 +337,6 @@ impl rustls::client::danger::ServerCertVerifier for TofuFirstConnectionVerifier 
             .signature_verification_algorithms
             .supported_schemes()
     }
-}
-
-/// Builds a quinn `ClientConfig` that accepts any server certificate (TOFU first connection).
-///
-/// After connecting, the caller should extract the server cert from the connection
-/// and pass it to [`tofu_check`] to save it.
-///
-/// # Errors
-///
-/// Returns `ConfigError` if the TLS configuration cannot be built.
-pub fn build_tofu_client_config() -> Result<quinn::ClientConfig, ConfigError> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let verifier = TofuFirstConnectionVerifier {
-        provider: Arc::clone(&provider),
-    };
-    let rustls_config = rustls::ClientConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .map_err(|e| ConfigError::QuicCrypto(e.to_string()))?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(verifier))
-        .with_no_client_auth();
-
-    let quic_client_config = QuicClientConfig::try_from(rustls_config)
-        .map_err(|e| ConfigError::QuicCrypto(e.to_string()))?;
-
-    let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
-
-    let mut transport = quinn::TransportConfig::default();
-    transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
-    client_config.transport_config(Arc::new(transport));
-
-    Ok(client_config)
-}
-
-/// Builds a quinn `ClientConfig` that verifies the server certificate against the
-/// OS platform trust store (system CA certificates).
-///
-/// Use this for servers with CA-signed certificates (e.g., from Let's Encrypt).
-/// Falls back to TOFU if the platform verifier is unavailable.
-///
-/// # Errors
-///
-/// Returns `ConfigError` if the TLS configuration cannot be built.
-pub fn build_platform_verified_client_config() -> Result<quinn::ClientConfig, ConfigError> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let verifier = rustls_platform_verifier::Verifier::new(Arc::clone(&provider))
-        .map_err(|e| ConfigError::QuicCrypto(format!("platform verifier: {e}")))?;
-    let rustls_config = rustls::ClientConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .map_err(|e| ConfigError::QuicCrypto(e.to_string()))?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(verifier))
-        .with_no_client_auth();
-
-    let quic_client_config = QuicClientConfig::try_from(rustls_config)
-        .map_err(|e| ConfigError::QuicCrypto(e.to_string()))?;
-
-    let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
-
-    let mut transport = quinn::TransportConfig::default();
-    transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
-    client_config.transport_config(Arc::new(transport));
-
-    Ok(client_config)
 }
 
 /// Builds a quinn `ClientConfig` that verifies the server certificate against
@@ -654,20 +531,6 @@ mod tests {
     }
 
     #[test]
-    fn build_server_config_succeeds() {
-        let cert = generate_self_signed_cert(&["localhost".to_string()]).unwrap();
-        let config = build_server_config(&cert);
-        assert!(config.is_ok());
-    }
-
-    #[test]
-    fn build_client_config_succeeds() {
-        let cert = generate_self_signed_cert(&["localhost".to_string()]).unwrap();
-        let config = build_client_config(&cert.cert_der);
-        assert!(config.is_ok());
-    }
-
-    #[test]
     fn paths_resolve() {
         let paths = RosePaths::resolve();
         assert!(paths.config_dir.ends_with("rose"));
@@ -724,18 +587,6 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn build_tofu_client_config_succeeds() {
-        let config = build_tofu_client_config();
-        assert!(config.is_ok());
-    }
-
-    #[test]
-    fn build_platform_verified_client_config_succeeds() {
-        let config = build_platform_verified_client_config();
-        assert!(config.is_ok());
     }
 
     #[test]

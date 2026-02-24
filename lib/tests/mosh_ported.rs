@@ -6,6 +6,70 @@
 //!
 //! Each test is annotated with the mosh test it was ported from.
 
+mod mtls_helper {
+    use rose::config::{self, CertKeyPair};
+    use rose::transport::{QuicClient, QuicServer};
+    use std::net::SocketAddr;
+    use std::path::PathBuf;
+
+    pub struct MtlsFixture {
+        pub server: QuicServer,
+        pub client_cert: CertKeyPair,
+        _auth_dir: PathBuf,
+    }
+
+    impl MtlsFixture {
+        pub fn new() -> Self {
+            let server_cert =
+                config::generate_self_signed_cert(&["localhost".to_string()]).unwrap();
+            let client_cert =
+                config::generate_self_signed_cert(&["localhost".to_string()]).unwrap();
+
+            let auth_dir = std::env::temp_dir().join(format!(
+                "rose-mosh-test-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&auth_dir).unwrap();
+            std::fs::write(auth_dir.join("client.crt"), client_cert.cert_der.as_ref()).unwrap();
+
+            let server =
+                QuicServer::bind_mutual_tls("127.0.0.1:0".parse().unwrap(), server_cert, &auth_dir)
+                    .unwrap();
+
+            Self {
+                server,
+                client_cert,
+                _auth_dir: auth_dir,
+            }
+        }
+
+        pub fn addr(&self) -> SocketAddr {
+            self.server.local_addr().unwrap()
+        }
+
+        pub async fn connect(&self, client: &QuicClient) -> quinn::Connection {
+            client
+                .connect_with_cert(
+                    self.addr(),
+                    "localhost",
+                    self.server.server_cert_der(),
+                    &self.client_cert,
+                )
+                .await
+                .unwrap()
+        }
+    }
+
+    impl Drop for MtlsFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self._auth_dir);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Ported from mosh: window-resize.test
 //
@@ -20,75 +84,74 @@ async fn e2e_window_resize() {
     use rose::protocol::{ClientSession, ControlMessage, ServerSession};
     use rose::pty::PtySession;
     use rose::ssp::DATAGRAM_KEYSTROKE;
-    use rose::transport::{QuicClient, QuicServer};
+    use rose::transport::QuicClient;
     use std::time::Duration;
 
-    let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-    let addr = server.local_addr().unwrap();
-    let cert = server.server_cert_der().clone();
+    let fixture = mtls_helper::MtlsFixture::new();
 
-    // Server: accept, spawn sh, handle resize + I/O
-    let server_task = tokio::spawn(async move {
-        let conn = server.accept().await.unwrap().unwrap();
-        let (mut session, rows, cols) = ServerSession::accept(conn).await.unwrap();
-        let pty = PtySession::open_command(rows, cols, "sh", &[]).unwrap();
-        let pty_writer = pty.clone_writer();
-        let mut rx = pty.subscribe_output();
+    let server_task = tokio::spawn({
+        let endpoint = fixture.server.endpoint.clone();
+        async move {
+            let conn = endpoint.accept().await.unwrap().await.unwrap();
+            let (mut session, rows, cols) = ServerSession::accept(conn).await.unwrap();
+            let pty = PtySession::open_command(rows, cols, "sh", &[]).unwrap();
+            let pty_writer = pty.clone_writer();
+            let mut rx = pty.subscribe_output();
 
-        // Forward PTY output -> client datagrams
-        let output_conn = session.connection().clone();
-        let output_fwd = tokio::spawn(async move {
-            while let Ok(chunk) = rx.recv().await {
-                if output_conn
-                    .send_datagram(Bytes::from(chunk.to_vec()))
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
-
-        // Forward client datagrams -> PTY input (strip keystroke prefix)
-        let input_conn = session.connection().clone();
-        let input_fwd = tokio::spawn(async move {
-            while let Ok(data) = input_conn.read_datagram().await {
-                if data.is_empty() {
-                    continue;
-                }
-                if data[0] == DATAGRAM_KEYSTROKE {
-                    let mut w = pty_writer.lock().expect("writer lock poisoned");
-                    if std::io::Write::write_all(&mut *w, &data[1..]).is_err() {
+            // Forward PTY output -> client datagrams
+            let output_conn = session.connection().clone();
+            let output_fwd = tokio::spawn(async move {
+                while let Ok(chunk) = rx.recv().await {
+                    if output_conn
+                        .send_datagram(Bytes::from(chunk.to_vec()))
+                        .is_err()
+                    {
                         break;
                     }
-                    let _ = std::io::Write::flush(&mut *w);
                 }
-            }
-        });
+            });
 
-        // Handle control messages (resize)
-        let control_task = tokio::spawn(async move {
-            loop {
-                match session.recv_control().await {
-                    Ok(Some(ControlMessage::Resize { rows, cols })) => {
-                        let _ = pty.resize(rows, cols);
+            // Forward client datagrams -> PTY input (strip keystroke prefix)
+            let input_conn = session.connection().clone();
+            let input_fwd = tokio::spawn(async move {
+                while let Ok(data) = input_conn.read_datagram().await {
+                    if data.is_empty() {
+                        continue;
                     }
-                    Ok(Some(ControlMessage::Goodbye) | None) => break,
-                    Ok(Some(_)) => {}
-                    Err(_) => break,
+                    if data[0] == DATAGRAM_KEYSTROKE {
+                        let mut w = pty_writer.lock().expect("writer lock poisoned");
+                        if std::io::Write::write_all(&mut *w, &data[1..]).is_err() {
+                            break;
+                        }
+                        let _ = std::io::Write::flush(&mut *w);
+                    }
                 }
-            }
-        });
+            });
 
-        tokio::select! {
-            _ = output_fwd => {}
-            _ = input_fwd => {}
-            _ = control_task => {}
+            // Handle control messages (resize)
+            let control_task = tokio::spawn(async move {
+                loop {
+                    match session.recv_control().await {
+                        Ok(Some(ControlMessage::Resize { rows, cols })) => {
+                            let _ = pty.resize(rows, cols);
+                        }
+                        Ok(Some(ControlMessage::Goodbye) | None) => break,
+                        Ok(Some(_)) => {}
+                        Err(_) => break,
+                    }
+                }
+            });
+
+            tokio::select! {
+                _ = output_fwd => {}
+                _ = input_fwd => {}
+                _ = control_task => {}
+            }
         }
     });
 
-    // Client: connect, send resize, then query columns
     let client = QuicClient::new().unwrap();
-    let client_conn = client.connect(addr, "localhost", &cert).await.unwrap();
+    let client_conn = fixture.connect(&client).await;
     let mut client_session = ClientSession::connect(client_conn, 24, 80, vec![])
         .await
         .unwrap();
@@ -152,58 +215,55 @@ async fn e2e_basic_connection() {
     use bytes::Bytes;
     use rose::protocol::{ClientSession, ServerSession};
     use rose::pty::PtySession;
-    use rose::transport::{QuicClient, QuicServer};
+    use rose::transport::QuicClient;
     use std::time::Duration;
 
-    let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-    let addr = server.local_addr().unwrap();
-    let cert = server.server_cert_der().clone();
+    let fixture = mtls_helper::MtlsFixture::new();
 
-    // Server: accept, spawn cat, forward I/O in both directions
-    let server_task = tokio::spawn(async move {
-        let conn = server.accept().await.unwrap().unwrap();
-        let (session, rows, cols) = ServerSession::accept(conn).await.unwrap();
-        let pty = PtySession::open_command(rows, cols, "cat", &[]).unwrap();
-        let pty_writer = pty.clone_writer();
-        let mut rx = pty.subscribe_output();
+    let server_task = tokio::spawn({
+        let endpoint = fixture.server.endpoint.clone();
+        async move {
+            let conn = endpoint.accept().await.unwrap().await.unwrap();
+            let (session, rows, cols) = ServerSession::accept(conn).await.unwrap();
+            let pty = PtySession::open_command(rows, cols, "cat", &[]).unwrap();
+            let pty_writer = pty.clone_writer();
+            let mut rx = pty.subscribe_output();
 
-        // Forward PTY output -> client datagrams
-        let output_conn = session.connection().clone();
-        let output_fwd = tokio::spawn(async move {
-            while let Ok(chunk) = rx.recv().await {
-                if output_conn
-                    .send_datagram(Bytes::from(chunk.to_vec()))
-                    .is_err()
-                {
-                    break;
+            let output_conn = session.connection().clone();
+            let output_fwd = tokio::spawn(async move {
+                while let Ok(chunk) = rx.recv().await {
+                    if output_conn
+                        .send_datagram(Bytes::from(chunk.to_vec()))
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
-            }
-        });
+            });
 
-        // Forward client datagrams -> PTY input
-        let input_conn = session.connection().clone();
-        let input_fwd = tokio::spawn(async move {
-            while let Ok(data) = input_conn.read_datagram().await {
-                let mut w = pty_writer.lock().expect("writer lock poisoned");
-                if std::io::Write::write_all(&mut *w, &data).is_err() {
-                    break;
+            let input_conn = session.connection().clone();
+            let input_fwd = tokio::spawn(async move {
+                while let Ok(data) = input_conn.read_datagram().await {
+                    let mut w = pty_writer.lock().expect("writer lock poisoned");
+                    if std::io::Write::write_all(&mut *w, &data).is_err() {
+                        break;
+                    }
+                    let _ = std::io::Write::flush(&mut *w);
                 }
-                let _ = std::io::Write::flush(&mut *w);
-            }
-        });
+            });
 
-        tokio::select! {
-            _ = output_fwd => {}
-            _ = input_fwd => {}
+            tokio::select! {
+                _ = output_fwd => {}
+                _ = input_fwd => {}
+            }
+
+            drop(pty);
+            drop(session);
         }
-
-        drop(pty);
-        drop(session);
     });
 
-    // Client: connect, send data, read echo
     let client = QuicClient::new().unwrap();
-    let client_conn = client.connect(addr, "localhost", &cert).await.unwrap();
+    let client_conn = fixture.connect(&client).await;
     let client_session = ClientSession::connect(client_conn, 24, 80, vec![])
         .await
         .unwrap();
@@ -251,55 +311,55 @@ async fn e2e_local_connection() {
     use bytes::Bytes;
     use rose::protocol::{ClientSession, ServerSession};
     use rose::pty::PtySession;
-    use rose::transport::{QuicClient, QuicServer};
+    use rose::transport::QuicClient;
     use std::time::Duration;
 
-    let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-    let addr = server.local_addr().unwrap();
-    let cert = server.server_cert_der().clone();
+    let fixture = mtls_helper::MtlsFixture::new();
 
-    // Server: accept, spawn cat, forward I/O
-    let server_task = tokio::spawn(async move {
-        let conn = server.accept().await.unwrap().unwrap();
-        let (session, rows, cols) = ServerSession::accept(conn).await.unwrap();
-        let pty = PtySession::open_command(rows, cols, "cat", &[]).unwrap();
-        let pty_writer = pty.clone_writer();
-        let mut rx = pty.subscribe_output();
+    let server_task = tokio::spawn({
+        let endpoint = fixture.server.endpoint.clone();
+        async move {
+            let conn = endpoint.accept().await.unwrap().await.unwrap();
+            let (session, rows, cols) = ServerSession::accept(conn).await.unwrap();
+            let pty = PtySession::open_command(rows, cols, "cat", &[]).unwrap();
+            let pty_writer = pty.clone_writer();
+            let mut rx = pty.subscribe_output();
 
-        let output_conn = session.connection().clone();
-        let output_fwd = tokio::spawn(async move {
-            while let Ok(chunk) = rx.recv().await {
-                if output_conn
-                    .send_datagram(Bytes::from(chunk.to_vec()))
-                    .is_err()
-                {
-                    break;
+            let output_conn = session.connection().clone();
+            let output_fwd = tokio::spawn(async move {
+                while let Ok(chunk) = rx.recv().await {
+                    if output_conn
+                        .send_datagram(Bytes::from(chunk.to_vec()))
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
-            }
-        });
+            });
 
-        let input_conn = session.connection().clone();
-        let input_fwd = tokio::spawn(async move {
-            while let Ok(data) = input_conn.read_datagram().await {
-                let mut w = pty_writer.lock().expect("writer lock poisoned");
-                if std::io::Write::write_all(&mut *w, &data).is_err() {
-                    break;
+            let input_conn = session.connection().clone();
+            let input_fwd = tokio::spawn(async move {
+                while let Ok(data) = input_conn.read_datagram().await {
+                    let mut w = pty_writer.lock().expect("writer lock poisoned");
+                    if std::io::Write::write_all(&mut *w, &data).is_err() {
+                        break;
+                    }
+                    let _ = std::io::Write::flush(&mut *w);
                 }
-                let _ = std::io::Write::flush(&mut *w);
-            }
-        });
+            });
 
-        tokio::select! {
-            _ = output_fwd => {}
-            _ = input_fwd => {}
+            tokio::select! {
+                _ = output_fwd => {}
+                _ = input_fwd => {}
+            }
+
+            drop(pty);
+            drop(session);
         }
-
-        drop(pty);
-        drop(session);
     });
 
     let client = QuicClient::new().unwrap();
-    let client_conn = client.connect(addr, "localhost", &cert).await.unwrap();
+    let client_conn = fixture.connect(&client).await;
     let client_session = ClientSession::connect(client_conn, 24, 80, vec![])
         .await
         .unwrap();
@@ -345,44 +405,40 @@ async fn e2e_repeat_connections() {
     use bytes::Bytes;
     use rose::protocol::{ClientSession, ServerSession};
     use rose::pty::PtySession;
-    use rose::transport::{QuicClient, QuicServer};
+    use rose::transport::QuicClient;
     use std::time::Duration;
 
     for i in 0..5 {
         let marker = format!("repeat_marker_{i}");
 
-        // Create a fresh server + client pair each iteration to verify
-        // clean resource lifecycle
-        let iter_server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let iter_addr = iter_server.local_addr().unwrap();
-        let iter_cert = iter_server.server_cert_der().clone();
+        let fixture = mtls_helper::MtlsFixture::new();
 
         let marker_clone = marker.clone();
-        let server_task = tokio::spawn(async move {
-            let conn = iter_server.accept().await.unwrap().unwrap();
-            let (session, rows, cols) = ServerSession::accept(conn).await.unwrap();
-            let pty = PtySession::open_command(rows, cols, "echo", &[&marker_clone]).unwrap();
-            let mut rx = pty.subscribe_output();
+        let server_task = tokio::spawn({
+            let endpoint = fixture.server.endpoint.clone();
+            async move {
+                let conn = endpoint.accept().await.unwrap().await.unwrap();
+                let (session, rows, cols) = ServerSession::accept(conn).await.unwrap();
+                let pty = PtySession::open_command(rows, cols, "echo", &[&marker_clone]).unwrap();
+                let mut rx = pty.subscribe_output();
 
-            let output_conn = session.connection().clone();
-            while let Ok(chunk) = rx.recv().await {
-                if output_conn
-                    .send_datagram(Bytes::from(chunk.to_vec()))
-                    .is_err()
-                {
-                    break;
+                let output_conn = session.connection().clone();
+                while let Ok(chunk) = rx.recv().await {
+                    if output_conn
+                        .send_datagram(Bytes::from(chunk.to_vec()))
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
-            }
 
-            drop(pty);
-            drop(session);
+                drop(pty);
+                drop(session);
+            }
         });
 
         let client = QuicClient::new().unwrap();
-        let client_conn = client
-            .connect(iter_addr, "localhost", &iter_cert)
-            .await
-            .unwrap();
+        let client_conn = fixture.connect(&client).await;
         let client_session = ClientSession::connect(client_conn, 24, 80, vec![])
             .await
             .unwrap();
@@ -567,100 +623,100 @@ async fn session_persists_across_network_disruption() {
     use rose::session::{DetachedSession, SessionStore};
     use rose::ssp::{DATAGRAM_KEYSTROKE, SspSender};
     use rose::terminal::RoseTerminal;
-    use rose::transport::{QuicClient, QuicServer};
+    use rose::transport::QuicClient;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-    let addr = server.local_addr().unwrap();
-    let cert = server.server_cert_der().clone();
+    let fixture = mtls_helper::MtlsFixture::new();
     let store = SessionStore::new();
 
-    // Phase 1: Initial connection — client connects, sends command, gets session ID
     let session_id: [u8; 16];
     {
         let store_clone = store.clone();
-        let server_task = tokio::spawn(async move {
-            let conn = server.accept().await.unwrap().unwrap();
-            let (mut session, handshake) = ServerSession::accept_any(conn).await.unwrap();
+        let server_task = tokio::spawn({
+            let endpoint = fixture.server.endpoint.clone();
+            async move {
+                let conn = endpoint.accept().await.unwrap().await.unwrap();
+                let (mut session, handshake) = ServerSession::accept_any(conn).await.unwrap();
 
-            let ControlMessage::Hello {
-                version: _,
-                rows,
-                cols,
-                ..
-            } = handshake
-            else {
-                panic!("expected Hello");
-            };
-
-            let sid = [42u8; 16]; // Deterministic for test
-            session
-                .send_control(&ControlMessage::SessionInfo {
-                    version: rose::protocol::PROTOCOL_VERSION,
-                    session_id: sid,
-                })
-                .await
-                .unwrap();
-
-            let pty = PtySession::open_command(rows, cols, "cat", &[]).unwrap();
-            let pty_writer = pty.clone_writer();
-            let terminal = Arc::new(Mutex::new(RoseTerminal::new(rows, cols)));
-            let ssp_sender = Arc::new(Mutex::new(SspSender::new()));
-            let mut rx = pty.subscribe_output();
-
-            // Forward I/O
-            let output_conn = session.connection().clone();
-            let output_fwd = tokio::spawn(async move {
-                while let Ok(chunk) = rx.recv().await {
-                    if output_conn
-                        .send_datagram(Bytes::from(chunk.to_vec()))
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            });
-
-            let input_conn = session.connection().clone();
-            let input_fwd = tokio::spawn(async move {
-                while let Ok(data) = input_conn.read_datagram().await {
-                    if data.is_empty() {
-                        continue;
-                    }
-                    if data[0] == DATAGRAM_KEYSTROKE {
-                        let mut w = pty_writer.lock().expect("writer lock poisoned");
-                        if std::io::Write::write_all(&mut *w, &data[1..]).is_err() {
-                            break;
-                        }
-                        let _ = std::io::Write::flush(&mut *w);
-                    }
-                }
-            });
-
-            tokio::select! {
-                _ = output_fwd => {}
-                _ = input_fwd => {}
-            }
-
-            // Connection lost — detach session
-            let _ = store_clone.insert(
-                sid,
-                DetachedSession {
-                    pty,
-                    terminal,
-                    ssp_sender,
+                let ControlMessage::Hello {
+                    version: _,
                     rows,
                     cols,
-                    owner_cert_der: None,
-                },
-            );
+                    ..
+                } = handshake
+                else {
+                    panic!("expected Hello");
+                };
 
-            (sid, server)
+                let sid = [42u8; 16]; // Deterministic for test
+                session
+                    .send_control(&ControlMessage::SessionInfo {
+                        version: rose::protocol::PROTOCOL_VERSION,
+                        session_id: sid,
+                    })
+                    .await
+                    .unwrap();
+
+                let pty = PtySession::open_command(rows, cols, "cat", &[]).unwrap();
+                let pty_writer = pty.clone_writer();
+                let terminal = Arc::new(Mutex::new(RoseTerminal::new(rows, cols)));
+                let ssp_sender = Arc::new(Mutex::new(SspSender::new()));
+                let mut rx = pty.subscribe_output();
+
+                // Forward I/O
+                let output_conn = session.connection().clone();
+                let output_fwd = tokio::spawn(async move {
+                    while let Ok(chunk) = rx.recv().await {
+                        if output_conn
+                            .send_datagram(Bytes::from(chunk.to_vec()))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+
+                let input_conn = session.connection().clone();
+                let input_fwd = tokio::spawn(async move {
+                    while let Ok(data) = input_conn.read_datagram().await {
+                        if data.is_empty() {
+                            continue;
+                        }
+                        if data[0] == DATAGRAM_KEYSTROKE {
+                            let mut w = pty_writer.lock().expect("writer lock poisoned");
+                            if std::io::Write::write_all(&mut *w, &data[1..]).is_err() {
+                                break;
+                            }
+                            let _ = std::io::Write::flush(&mut *w);
+                        }
+                    }
+                });
+
+                tokio::select! {
+                    _ = output_fwd => {}
+                    _ = input_fwd => {}
+                }
+
+                // Connection lost — detach session
+                let _ = store_clone.insert(
+                    sid,
+                    DetachedSession {
+                        pty,
+                        terminal,
+                        ssp_sender,
+                        rows,
+                        cols,
+                        owner_cert_der: None,
+                    },
+                );
+
+                sid
+            }
         });
 
         let client = QuicClient::new().unwrap();
-        let client_conn = client.connect(addr, "localhost", &cert).await.unwrap();
+        let client_conn = fixture.connect(&client).await;
         let mut client_session = ClientSession::connect(client_conn, 24, 80, vec![])
             .await
             .unwrap();
@@ -706,79 +762,80 @@ async fn session_persists_across_network_disruption() {
         drop(client);
 
         // Wait for server to detach
-        let (_, returned_server) = server_task.await.unwrap();
+        let _ = server_task.await.unwrap();
 
         // Phase 2: Reconnect with same session_id
         let store_clone2 = store.clone();
-        let addr2 = returned_server.local_addr().unwrap();
-        let cert2 = returned_server.server_cert_der().clone();
 
-        let server_task2 = tokio::spawn(async move {
-            let conn = returned_server.accept().await.unwrap().unwrap();
-            let (mut session, handshake) = ServerSession::accept_any(conn).await.unwrap();
+        let server_task2 = tokio::spawn({
+            let endpoint = fixture.server.endpoint.clone();
+            async move {
+                let conn = endpoint.accept().await.unwrap().await.unwrap();
+                let (mut session, handshake) = ServerSession::accept_any(conn).await.unwrap();
 
-            let ControlMessage::Reconnect {
-                version: _,
-                rows: _,
-                cols: _,
-                session_id: rsid,
-                ..
-            } = handshake
-            else {
-                panic!("expected Reconnect, got {handshake:?}");
-            };
-            assert_eq!(rsid, session_id);
-
-            let detached = store_clone2.remove(&rsid).unwrap();
-
-            session
-                .send_control(&ControlMessage::SessionInfo {
-                    version: rose::protocol::PROTOCOL_VERSION,
+                let ControlMessage::Reconnect {
+                    version: _,
+                    rows: _,
+                    cols: _,
                     session_id: rsid,
-                })
-                .await
-                .unwrap();
+                    ..
+                } = handshake
+                else {
+                    panic!("expected Reconnect, got {handshake:?}");
+                };
+                assert_eq!(rsid, session_id);
 
-            // The PTY is still alive — send another command through it
-            let pty_writer = detached.pty.clone_writer();
-            let mut rx = detached.pty.subscribe_output();
+                let detached = store_clone2.remove(&rsid).unwrap();
 
-            let output_conn = session.connection().clone();
-            let output_fwd = tokio::spawn(async move {
-                while let Ok(chunk) = rx.recv().await {
-                    if output_conn
-                        .send_datagram(Bytes::from(chunk.to_vec()))
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            });
+                session
+                    .send_control(&ControlMessage::SessionInfo {
+                        version: rose::protocol::PROTOCOL_VERSION,
+                        session_id: rsid,
+                    })
+                    .await
+                    .unwrap();
 
-            let input_conn = session.connection().clone();
-            let input_fwd = tokio::spawn(async move {
-                while let Ok(data) = input_conn.read_datagram().await {
-                    if data.is_empty() {
-                        continue;
-                    }
-                    if data[0] == DATAGRAM_KEYSTROKE {
-                        let mut w = pty_writer.lock().expect("writer lock poisoned");
-                        if std::io::Write::write_all(&mut *w, &data[1..]).is_err() {
+                // The PTY is still alive — send another command through it
+                let pty_writer = detached.pty.clone_writer();
+                let mut rx = detached.pty.subscribe_output();
+
+                let output_conn = session.connection().clone();
+                let output_fwd = tokio::spawn(async move {
+                    while let Ok(chunk) = rx.recv().await {
+                        if output_conn
+                            .send_datagram(Bytes::from(chunk.to_vec()))
+                            .is_err()
+                        {
                             break;
                         }
-                        let _ = std::io::Write::flush(&mut *w);
                     }
-                }
-            });
+                });
 
-            tokio::select! {
-                _ = output_fwd => {}
-                _ = input_fwd => {}
+                let input_conn = session.connection().clone();
+                let input_fwd = tokio::spawn(async move {
+                    while let Ok(data) = input_conn.read_datagram().await {
+                        if data.is_empty() {
+                            continue;
+                        }
+                        if data[0] == DATAGRAM_KEYSTROKE {
+                            let mut w = pty_writer.lock().expect("writer lock poisoned");
+                            if std::io::Write::write_all(&mut *w, &data[1..]).is_err() {
+                                break;
+                            }
+                            let _ = std::io::Write::flush(&mut *w);
+                        }
+                    }
+                });
+
+                tokio::select! {
+                    _ = output_fwd => {}
+                    _ = input_fwd => {}
+                }
             }
         });
 
         let client2 = QuicClient::new().unwrap();
-        let client_conn2 = client2.connect(addr2, "localhost", &cert2).await.unwrap();
+        let client_conn2 = fixture.connect(&client2).await;
         let mut client_session2 =
             ClientSession::reconnect(client_conn2, 24, 80, session_id, vec![])
                 .await
@@ -828,50 +885,48 @@ async fn scrollback_sync_over_reliable_stream() {
     use rose::protocol::{ClientSession, ServerSession};
     use rose::scrollback::{self, ScrollbackLine, ScrollbackSender};
     use rose::terminal::RoseTerminal;
-    use rose::transport::{QuicClient, QuicServer};
+    use rose::transport::QuicClient;
     use std::time::Duration;
 
-    let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-    let addr = server.local_addr().unwrap();
-    let cert = server.server_cert_der().clone();
+    let fixture = mtls_helper::MtlsFixture::new();
 
-    // Server: accept, feed terminal with enough output to generate scrollback,
-    // then send scrollback lines over a uni stream.
-    let server_task = tokio::spawn(async move {
-        let conn = server.accept().await.unwrap().unwrap();
-        let (session, _, _) = ServerSession::accept(conn).await.unwrap();
+    let server_task = tokio::spawn({
+        let endpoint = fixture.server.endpoint.clone();
+        async move {
+            let conn = endpoint.accept().await.unwrap().await.unwrap();
+            let (session, _, _) = ServerSession::accept(conn).await.unwrap();
 
-        let mut term = RoseTerminal::new(4, 80);
-        let mut sb_sender = ScrollbackSender::new();
+            let mut term = RoseTerminal::new(4, 80);
+            let mut sb_sender = ScrollbackSender::new();
 
-        // Generate scrollback by writing more lines than terminal height
-        for i in 0..20 {
-            term.advance(format!("scrollback line {i}\r\n").as_bytes());
+            // Generate scrollback by writing more lines than terminal height
+            for i in 0..20 {
+                term.advance(format!("scrollback line {i}\r\n").as_bytes());
+            }
+
+            let new_lines = sb_sender.collect_new_lines(&term);
+            assert!(!new_lines.is_empty(), "should have scrollback lines");
+
+            // Open a scrollback uni stream
+            let conn = session.connection().clone();
+            let mut stream = conn.open_uni().await.unwrap();
+            stream
+                .write_all(&[scrollback::stream_type::SCROLLBACK])
+                .await
+                .unwrap();
+            for line in &new_lines {
+                stream.write_all(&line.encode()).await.unwrap();
+            }
+            stream.finish().unwrap();
+
+            // Keep alive for client to read
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            (session, new_lines.len())
         }
-
-        let new_lines = sb_sender.collect_new_lines(&term);
-        assert!(!new_lines.is_empty(), "should have scrollback lines");
-
-        // Open a scrollback uni stream
-        let conn = session.connection().clone();
-        let mut stream = conn.open_uni().await.unwrap();
-        stream
-            .write_all(&[scrollback::stream_type::SCROLLBACK])
-            .await
-            .unwrap();
-        for line in &new_lines {
-            stream.write_all(&line.encode()).await.unwrap();
-        }
-        stream.finish().unwrap();
-
-        // Keep alive for client to read
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        (session, server, new_lines.len())
     });
 
-    // Client: connect, accept scrollback uni stream, decode lines
     let client = QuicClient::new().unwrap();
-    let client_conn = client.connect(addr, "localhost", &cert).await.unwrap();
+    let client_conn = fixture.connect(&client).await;
     let _client_session = ClientSession::connect(client_conn.clone(), 4, 80, vec![])
         .await
         .unwrap();
@@ -904,7 +959,7 @@ async fn scrollback_sync_over_reliable_stream() {
         lines[0].text
     );
 
-    let (_, _, server_line_count) = server_task.await.unwrap();
+    let (_, server_line_count) = server_task.await.unwrap();
     assert_eq!(
         lines.len(),
         server_line_count,

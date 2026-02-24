@@ -751,30 +751,85 @@ mod tests {
         assert!(env_vars.is_empty());
     }
 
-    /// Helper: create connected QUIC pair for protocol tests.
-    async fn quic_pair() -> (Connection, Connection, QuicServer, QuicClient) {
-        let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let addr = server.local_addr().unwrap();
-        let cert = server.server_cert_der().clone();
-        let client = QuicClient::new().unwrap();
+    use crate::config::{self as cfg, CertKeyPair};
+    use std::net::SocketAddr;
+
+    struct MtlsFixture {
+        server: QuicServer,
+        client_cert: CertKeyPair,
+        _auth_dir: std::path::PathBuf,
+    }
+
+    impl MtlsFixture {
+        fn new() -> Self {
+            let server_cert = cfg::generate_self_signed_cert(&["localhost".to_string()]).unwrap();
+            let client_cert = cfg::generate_self_signed_cert(&["localhost".to_string()]).unwrap();
+
+            let auth_dir = std::env::temp_dir().join(format!(
+                "rose-proto-test-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&auth_dir).unwrap();
+            std::fs::write(auth_dir.join("client.crt"), client_cert.cert_der.as_ref()).unwrap();
+
+            let server =
+                QuicServer::bind_mutual_tls("127.0.0.1:0".parse().unwrap(), server_cert, &auth_dir)
+                    .unwrap();
+
+            Self {
+                server,
+                client_cert,
+                _auth_dir: auth_dir,
+            }
+        }
+
+        fn addr(&self) -> SocketAddr {
+            self.server.local_addr().unwrap()
+        }
+
+        async fn connect(&self, client: &QuicClient) -> Connection {
+            client
+                .connect_with_cert(
+                    self.addr(),
+                    "localhost",
+                    self.server.server_cert_der(),
+                    &self.client_cert,
+                )
+                .await
+                .unwrap()
+        }
+    }
+
+    impl Drop for MtlsFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self._auth_dir);
+        }
+    }
+
+    async fn quic_pair() -> (Connection, Connection, MtlsFixture, QuicClient) {
+        let fixture = MtlsFixture::new();
 
         let accept = tokio::spawn({
-            let endpoint = server.endpoint.clone();
+            let endpoint = fixture.server.endpoint.clone();
             async move {
                 let incoming = endpoint.accept().await.unwrap();
                 incoming.await.unwrap()
             }
         });
 
-        let client_conn = client.connect(addr, "localhost", &cert).await.unwrap();
+        let client = QuicClient::new().unwrap();
+        let client_conn = fixture.connect(&client).await;
         let server_conn = accept.await.unwrap();
 
-        (client_conn, server_conn, server, client)
+        (client_conn, server_conn, fixture, client)
     }
 
     #[tokio::test]
     async fn handshake() {
-        let (client_conn, server_conn, _s, _c) = quic_pair().await;
+        let (client_conn, server_conn, _f, _c) = quic_pair().await;
 
         let server_task = tokio::spawn(async move { ServerSession::accept(server_conn).await });
 
@@ -785,13 +840,12 @@ mod tests {
         assert_eq!(rows, 24);
         assert_eq!(cols, 80);
 
-        // Keep sessions alive for clean shutdown
         drop(server_session);
     }
 
     #[tokio::test]
     async fn version_mismatch_hello_rejected() {
-        let (client_conn, server_conn, _s, _c) = quic_pair().await;
+        let (client_conn, server_conn, _f, _c) = quic_pair().await;
 
         let server_task = tokio::spawn(async move { ServerSession::accept_any(server_conn).await });
 
@@ -819,7 +873,7 @@ mod tests {
 
     #[tokio::test]
     async fn version_mismatch_reconnect_rejected() {
-        let (client_conn, server_conn, _s, _c) = quic_pair().await;
+        let (client_conn, server_conn, _f, _c) = quic_pair().await;
 
         let server_task = tokio::spawn(async move { ServerSession::accept_any(server_conn).await });
 
@@ -847,7 +901,7 @@ mod tests {
 
     #[tokio::test]
     async fn datagram_io() {
-        let (client_conn, server_conn, _s, _c) = quic_pair().await;
+        let (client_conn, server_conn, _f, _c) = quic_pair().await;
 
         let server_task =
             tokio::spawn(async move { ServerSession::accept(server_conn).await.unwrap() });
@@ -874,7 +928,7 @@ mod tests {
 
     #[tokio::test]
     async fn resize_control_message() {
-        let (client_conn, server_conn, _s, _c) = quic_pair().await;
+        let (client_conn, server_conn, _f, _c) = quic_pair().await;
 
         let server_task =
             tokio::spawn(async move { ServerSession::accept(server_conn).await.unwrap() });
@@ -919,21 +973,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_control_oversized_message() {
-        // Set up a QUIC connection to test read_control with oversized length
-        let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let addr = server.local_addr().unwrap();
-        let cert = server.server_cert_der().clone();
-        let client = QuicClient::new().unwrap();
-
-        let accept = tokio::spawn({
-            let endpoint = server.endpoint.clone();
-            async move {
-                let incoming = endpoint.accept().await.unwrap();
-                incoming.await.unwrap()
-            }
-        });
-        let client_conn = client.connect(addr, "localhost", &cert).await.unwrap();
-        let server_conn = accept.await.unwrap();
+        let (client_conn, server_conn, _f, _c) = quic_pair().await;
 
         // Client sends an oversized length prefix (> 65536)
         let (mut send, _recv) = client_conn.open_bi().await.unwrap();
@@ -948,21 +988,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_control_stream_closed_early() {
-        // Test that read_control returns None when stream closes before any data
-        let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let addr = server.local_addr().unwrap();
-        let cert = server.server_cert_der().clone();
-        let client = QuicClient::new().unwrap();
-
-        let accept = tokio::spawn({
-            let endpoint = server.endpoint.clone();
-            async move {
-                let incoming = endpoint.accept().await.unwrap();
-                incoming.await.unwrap()
-            }
-        });
-        let client_conn = client.connect(addr, "localhost", &cert).await.unwrap();
-        let server_conn = accept.await.unwrap();
+        let (client_conn, server_conn, _f, _c) = quic_pair().await;
 
         // Client opens bi-stream and immediately finishes (no data)
         let (mut send, _recv) = client_conn.open_bi().await.unwrap();
@@ -975,21 +1001,17 @@ mod tests {
 
     #[tokio::test]
     async fn accept_non_hello_rejected() {
-        // ServerSession::accept should reject non-Hello messages
-        let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let addr = server.local_addr().unwrap();
-        let cert = server.server_cert_der().clone();
-        let client = QuicClient::new().unwrap();
-
+        let fixture = MtlsFixture::new();
         let accept = tokio::spawn({
-            let endpoint = server.endpoint.clone();
+            let endpoint = fixture.server.endpoint.clone();
             async move {
                 let incoming = endpoint.accept().await.unwrap();
                 let conn = incoming.await.unwrap();
                 ServerSession::accept(conn).await
             }
         });
-        let client_conn = client.connect(addr, "localhost", &cert).await.unwrap();
+        let client = QuicClient::new().unwrap();
+        let client_conn = fixture.connect(&client).await;
 
         // Send a Resize instead of Hello (invalid for handshake)
         let (mut send, _recv) = client_conn.open_bi().await.unwrap();
@@ -1002,21 +1024,17 @@ mod tests {
 
     #[tokio::test]
     async fn accept_rejects_reconnect() {
-        // ServerSession::accept expects Hello only — Reconnect should be rejected
-        let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let addr = server.local_addr().unwrap();
-        let cert = server.server_cert_der().clone();
-        let client = QuicClient::new().unwrap();
-
+        let fixture = MtlsFixture::new();
         let accept = tokio::spawn({
-            let endpoint = server.endpoint.clone();
+            let endpoint = fixture.server.endpoint.clone();
             async move {
                 let incoming = endpoint.accept().await.unwrap();
                 let conn = incoming.await.unwrap();
                 ServerSession::accept(conn).await
             }
         });
-        let client_conn = client.connect(addr, "localhost", &cert).await.unwrap();
+        let client = QuicClient::new().unwrap();
+        let client_conn = fixture.connect(&client).await;
 
         // Send a Reconnect with correct version — valid for accept_any but not accept
         let (mut send, _recv) = client_conn.open_bi().await.unwrap();
@@ -1035,21 +1053,17 @@ mod tests {
 
     #[tokio::test]
     async fn accept_any_stream_closed_before_handshake() {
-        // accept_any should return error when stream closes before any message
-        let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let addr = server.local_addr().unwrap();
-        let cert = server.server_cert_der().clone();
-        let client = QuicClient::new().unwrap();
-
+        let fixture = MtlsFixture::new();
         let accept = tokio::spawn({
-            let endpoint = server.endpoint.clone();
+            let endpoint = fixture.server.endpoint.clone();
             async move {
                 let incoming = endpoint.accept().await.unwrap();
                 let conn = incoming.await.unwrap();
                 ServerSession::accept_any(conn).await
             }
         });
-        let client_conn = client.connect(addr, "localhost", &cert).await.unwrap();
+        let client = QuicClient::new().unwrap();
+        let client_conn = fixture.connect(&client).await;
 
         // Open bi-stream and immediately close it — no message sent
         let (mut send, _recv) = client_conn.open_bi().await.unwrap();
@@ -1061,45 +1075,38 @@ mod tests {
 
     #[tokio::test]
     async fn client_session_connection_accessor() {
-        let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let addr = server.local_addr().unwrap();
-        let cert = server.server_cert_der().clone();
-        let client = QuicClient::new().unwrap();
+        let fixture = MtlsFixture::new();
 
         let accept = tokio::spawn({
-            let endpoint = server.endpoint.clone();
+            let endpoint = fixture.server.endpoint.clone();
             async move {
                 let incoming = endpoint.accept().await.unwrap();
                 incoming.await.unwrap()
             }
         });
-        let client_conn = client.connect(addr, "localhost", &cert).await.unwrap();
+        let client = QuicClient::new().unwrap();
+        let client_conn = fixture.connect(&client).await;
         let _server_conn = accept.await.unwrap();
 
         let session = ClientSession::connect(client_conn, 24, 80, vec![])
             .await
             .unwrap();
-        // connection() should return a reference to the underlying connection
-        assert_eq!(session.connection().remote_address(), addr);
+        assert_eq!(session.connection().remote_address(), fixture.addr());
     }
 
     #[tokio::test]
     async fn accept_any_non_hello_non_reconnect_rejected() {
-        // ServerSession::accept_any should reject non-Hello/Reconnect messages
-        let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let addr = server.local_addr().unwrap();
-        let cert = server.server_cert_der().clone();
-        let client = QuicClient::new().unwrap();
-
+        let fixture = MtlsFixture::new();
         let accept = tokio::spawn({
-            let endpoint = server.endpoint.clone();
+            let endpoint = fixture.server.endpoint.clone();
             async move {
                 let incoming = endpoint.accept().await.unwrap();
                 let conn = incoming.await.unwrap();
                 ServerSession::accept_any(conn).await
             }
         });
-        let client_conn = client.connect(addr, "localhost", &cert).await.unwrap();
+        let client = QuicClient::new().unwrap();
+        let client_conn = fixture.connect(&client).await;
 
         // Send Goodbye (not Hello or Reconnect)
         let (mut send, _recv) = client_conn.open_bi().await.unwrap();
