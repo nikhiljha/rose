@@ -220,17 +220,19 @@ async fn run_server(
             cert
         };
 
-        // Write the client cert to a temp dir for mutual TLS authorization
-        let auth_dir = std::env::temp_dir().join(format!("rose-bootstrap-{}", std::process::id()));
-        std::fs::create_dir_all(&auth_dir)?;
-        std::fs::write(auth_dir.join("bootstrap-client.crt"), &client_cert_der)?;
+        // Write the client cert to a secure temp dir for mutual TLS authorization
+        let auth_dir = tempfile::tempdir()?;
+        std::fs::write(
+            auth_dir.path().join("bootstrap-client.crt"),
+            &client_cert_der,
+        )?;
 
         // Try random ports in the mosh range (60000-61000) with mutual TLS
         let mut bound = None;
         for _ in 0..100 {
             let port = 60000 + (rand_u16() % 1000);
             let addr: SocketAddr = format!("0.0.0.0:{port}").parse()?;
-            match QuicServer::bind_mutual_tls(addr, server_cert.clone(), &auth_dir) {
+            match QuicServer::bind_mutual_tls(addr, server_cert.clone(), auth_dir.path()) {
                 Ok(s) => {
                     bound = Some(s);
                     break;
@@ -238,8 +240,8 @@ async fn run_server(
                 Err(_) => continue,
             }
         }
-        // Clean up temp dir (server already loaded the certs)
-        let _ = std::fs::remove_dir_all(&auth_dir);
+        // TempDir auto-cleans on drop (server already loaded the certs)
+        drop(auth_dir);
 
         let server =
             bound.ok_or_else(|| anyhow::anyhow!("failed to bind to any port in 60000-61000"))?;
@@ -296,6 +298,13 @@ async fn run_server(
     }
 
     let store = SessionStore::new();
+    let rose_config =
+        config::RoseConfig::load(&RosePaths::resolve().config_dir).unwrap_or_default();
+    let max_sessions = rose_config.max_sessions;
+    let idle_timeout = rose_config
+        .session_idle_timeout_secs
+        .map(Duration::from_secs);
+    let active_sessions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     // In bootstrap mode, watch stdin for a STUN hole-punch request.
     // Uses a native thread instead of tokio::io::stdin() because the
@@ -330,24 +339,45 @@ async fn run_server(
         let peer = conn.remote_address();
         tracing::info!(%peer, "new connection");
 
+        // Prune idle and exited sessions before checking limits
+        if let Some(timeout) = idle_timeout {
+            let pruned = store.prune_idle(timeout);
+            if pruned > 0 {
+                tracing::info!(pruned, "pruned idle detached sessions");
+            }
+        }
+        let _ = store.prune_exited();
+
         if bootstrap {
             // Bootstrap mode: handle session inline so we can exit when
             // the shell dies. Loop back to accept reconnections after detach.
             if let Err(e) = handle_server_session(conn, store.clone(), true).await {
                 tracing::error!(%peer, "session error: {e}");
             }
-            let _ = store.prune_exited();
             if store.is_empty() {
                 break;
             }
         } else {
+            // Check max sessions limit (active + detached)
+            if let Some(limit) = max_sessions {
+                let total =
+                    active_sessions.load(std::sync::atomic::Ordering::Relaxed) + store.len();
+                if total >= limit {
+                    tracing::warn!(%peer, total, limit, "max sessions reached, refusing");
+                    conn.close(0u32.into(), b"max sessions reached");
+                    continue;
+                }
+            }
             // Native mode: spawn each session so the server can handle
             // multiple concurrent clients.
             let store = store.clone();
+            let active = Arc::clone(&active_sessions);
+            active.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tokio::spawn(async move {
                 if let Err(e) = handle_server_session(conn, store, false).await {
                     tracing::error!(%peer, "session error: {e}");
                 }
+                active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             });
         }
     }
@@ -926,6 +956,7 @@ async fn handle_server_session(
                     rows,
                     cols,
                     owner_cert_der: peer_cert,
+                    detached_at: std::time::Instant::now(),
                 },
             );
         }

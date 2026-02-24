@@ -19,7 +19,6 @@ use serde::{Deserialize, Serialize};
 /// to an empty one.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
-#[derive(Default)]
 pub struct RoseConfig {
     /// Require CA-signed server certificates verified against the OS trust
     /// store. When `true`, TOFU and pinned self-signed certs are rejected.
@@ -29,6 +28,29 @@ pub struct RoseConfig {
     /// `["stun.example.com:3478"]`). When `None`, the built-in Google STUN
     /// servers are used.
     pub stun_servers: Option<Vec<String>>,
+
+    /// Maximum number of concurrent sessions (active + detached). When the
+    /// limit is reached, new connections are refused. `None` means no limit.
+    pub max_sessions: Option<usize>,
+
+    /// Idle timeout for detached sessions in seconds. Sessions detached
+    /// longer than this are automatically pruned. `None` disables idle
+    /// pruning. Defaults to 7 days (604800 seconds).
+    pub session_idle_timeout_secs: Option<u64>,
+}
+
+/// Seven days in seconds (default idle timeout for detached sessions).
+const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 7 * 24 * 60 * 60;
+
+impl Default for RoseConfig {
+    fn default() -> Self {
+        Self {
+            require_ca_certs: false,
+            stun_servers: None,
+            max_sessions: None,
+            session_idle_timeout_secs: Some(DEFAULT_IDLE_TIMEOUT_SECS),
+        }
+    }
 }
 
 impl RoseConfig {
@@ -214,12 +236,38 @@ pub fn cert_fingerprint(cert_der: &[u8]) -> String {
         .join(":")
 }
 
+/// Checks that a DER-encoded certificate is currently valid (not expired,
+/// not yet valid). Used by both [`PinnedCertVerifier`] and
+/// [`TofuFirstConnectionVerifier`] to enforce expiry on self-signed certs.
+pub(crate) fn check_cert_expiry(
+    cert_der: &CertificateDer<'_>,
+    now: UnixTime,
+) -> Result<(), rustls::Error> {
+    use x509_parser::prelude::FromDer;
+    let (_, cert) = x509_parser::certificate::X509Certificate::from_der(cert_der.as_ref())
+        .map_err(|_| rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding))?;
+    let validity = cert.validity();
+    let now_secs = now.as_secs() as i64;
+    if now_secs < validity.not_before.timestamp() {
+        return Err(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::NotValidYet,
+        ));
+    }
+    if now_secs > validity.not_after.timestamp() {
+        return Err(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::Expired,
+        ));
+    }
+    Ok(())
+}
+
 /// A server certificate verifier that checks the cert matches a pinned certificate.
 ///
 /// Unlike root-store verification, this ignores Subject Alternative Names and
 /// hostname checks — the security comes from the exact cert byte match, not
 /// the certificate's claimed identity. TLS handshake signatures are still
-/// verified cryptographically.
+/// verified cryptographically. Certificate expiry is enforced via
+/// [`check_cert_expiry`].
 #[derive(Debug)]
 struct PinnedCertVerifier {
     expected_cert: CertificateDer<'static>,
@@ -233,15 +281,15 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
         _intermediates: &[CertificateDer<'_>],
         _server_name: &ServerName<'_>,
         _ocsp_response: &[u8],
-        _now: UnixTime,
+        now: UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        if end_entity.as_ref() == self.expected_cert.as_ref() {
-            Ok(rustls::client::danger::ServerCertVerified::assertion())
-        } else {
-            Err(rustls::Error::InvalidCertificate(
+        if end_entity.as_ref() != self.expected_cert.as_ref() {
+            return Err(rustls::Error::InvalidCertificate(
                 rustls::CertificateError::ApplicationVerificationFailure,
-            ))
+            ));
         }
+        check_cert_expiry(end_entity, now)?;
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
 
     fn verify_tls12_signature(
@@ -280,13 +328,13 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
 }
 
 /// A server certificate verifier that accepts any certificate identity but
-/// still cryptographically verifies TLS handshake signatures.
+/// still cryptographically verifies TLS handshake signatures and enforces
+/// certificate expiry via [`check_cert_expiry`].
 ///
 /// Used for the TOFU first-connection flow: we don't know which cert to
 /// expect, but we must verify the server actually holds the private key
 /// for the cert it presents (otherwise a MITM could present an arbitrary
 /// cert and the client would cache it permanently).
-///
 #[derive(Debug)]
 struct TofuFirstConnectionVerifier {
     provider: Arc<rustls::crypto::CryptoProvider>,
@@ -295,12 +343,13 @@ struct TofuFirstConnectionVerifier {
 impl rustls::client::danger::ServerCertVerifier for TofuFirstConnectionVerifier {
     fn verify_server_cert(
         &self,
-        _end_entity: &CertificateDer<'_>,
+        end_entity: &CertificateDer<'_>,
         _intermediates: &[CertificateDer<'_>],
         _server_name: &ServerName<'_>,
         _ocsp_response: &[u8],
-        _now: UnixTime,
+        now: UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        check_cert_expiry(end_entity, now)?;
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
 
@@ -728,6 +777,8 @@ mod tests {
                 "stun.example.com:3478".to_string(),
                 "stun2.example.com:3478".to_string(),
             ]),
+            max_sessions: Some(10),
+            session_idle_timeout_secs: Some(3600),
         };
         let serialized = toml::to_string(&cfg).unwrap();
         let deserialized: RoseConfig = toml::from_str(&serialized).unwrap();
@@ -756,5 +807,93 @@ mod tests {
     fn config_default_stun_servers_is_none() {
         let cfg = RoseConfig::default();
         assert!(cfg.stun_servers.is_none());
+    }
+
+    #[test]
+    fn config_default_max_sessions_is_none() {
+        let cfg = RoseConfig::default();
+        assert!(cfg.max_sessions.is_none());
+    }
+
+    #[test]
+    fn config_default_idle_timeout_is_seven_days() {
+        let cfg = RoseConfig::default();
+        assert_eq!(cfg.session_idle_timeout_secs, Some(604_800));
+    }
+
+    #[test]
+    fn config_load_max_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), "max_sessions = 5\n").unwrap();
+        let cfg = RoseConfig::load(dir.path()).unwrap();
+        assert_eq!(cfg.max_sessions, Some(5));
+    }
+
+    #[test]
+    fn config_load_idle_timeout_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "session_idle_timeout_secs = 0\n",
+        )
+        .unwrap();
+        let cfg = RoseConfig::load(dir.path()).unwrap();
+        assert_eq!(cfg.session_idle_timeout_secs, Some(0));
+    }
+
+    fn generate_cert_with_validity(
+        san: &[String],
+        not_before: time::OffsetDateTime,
+        not_after: time::OffsetDateTime,
+    ) -> CertKeyPair {
+        let mut params = rcgen::CertificateParams::new(san.to_vec()).unwrap();
+        params.not_before = not_before;
+        params.not_after = not_after;
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+        CertKeyPair {
+            cert_pem: cert.pem(),
+            key_pem: key_pair.serialize_pem(),
+            cert_der: cert.der().clone(),
+            key_der: key_pair.serialize_der(),
+        }
+    }
+
+    #[test]
+    fn check_cert_expiry_accepts_valid_cert() {
+        let cert = generate_self_signed_cert(&["localhost".to_string()]).unwrap();
+        let result = check_cert_expiry(&cert.cert_der, UnixTime::now());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn check_cert_expiry_rejects_expired_cert() {
+        let now = time::OffsetDateTime::now_utc();
+        let expired = generate_cert_with_validity(
+            &["localhost".to_string()],
+            now - time::Duration::days(730),
+            now - time::Duration::days(365),
+        );
+        let result = check_cert_expiry(&expired.cert_der, UnixTime::now());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn check_cert_expiry_rejects_not_yet_valid_cert() {
+        let now = time::OffsetDateTime::now_utc();
+        let future = generate_cert_with_validity(
+            &["localhost".to_string()],
+            now + time::Duration::days(365),
+            now + time::Duration::days(730),
+        );
+        let result = check_cert_expiry(&future.cert_der, UnixTime::now());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn check_cert_expiry_bad_encoding() {
+        let bad_der = CertificateDer::from(vec![0xFF, 0xFE, 0xFD]);
+        let result = check_cert_expiry(&bad_der, UnixTime::now());
+        assert!(result.is_err());
     }
 }

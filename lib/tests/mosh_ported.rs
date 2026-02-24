@@ -708,6 +708,7 @@ async fn session_persists_across_network_disruption() {
                         rows,
                         cols,
                         owner_cert_der: None,
+                        detached_at: std::time::Instant::now(),
                     },
                 );
 

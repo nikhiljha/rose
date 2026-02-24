@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::pty::PtySession;
 use crate::ssp::SspSender;
@@ -30,6 +31,8 @@ pub struct DetachedSession {
     /// DER-encoded TLS client certificate of the session owner.
     /// Used to verify that only the original client can reconnect.
     pub owner_cert_der: Option<Vec<u8>>,
+    /// When this session was detached (for idle timeout pruning).
+    pub detached_at: Instant,
 }
 
 /// Thread-safe store of detached sessions indexed by session ID.
@@ -118,6 +121,20 @@ impl SessionStore {
         sessions.remove(&id).map(|session| (id, session))
     }
 
+    /// Removes detached sessions that have been idle longer than `timeout`.
+    /// Returns the number of removed sessions.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the session store mutex is poisoned.
+    #[must_use]
+    pub fn prune_idle(&self, timeout: Duration) -> usize {
+        let mut sessions = self.sessions.lock().expect("session store lock poisoned");
+        let before = sessions.len();
+        sessions.retain(|_, detached| detached.detached_at.elapsed() < timeout);
+        before.saturating_sub(sessions.len())
+    }
+
     /// Removes detached sessions whose PTY child has already exited.
     /// Returns the number of removed sessions.
     ///
@@ -155,6 +172,7 @@ mod tests {
             rows: 24,
             cols: 80,
             owner_cert_der: None,
+            detached_at: Instant::now(),
         }
     }
 
@@ -210,6 +228,7 @@ mod tests {
             rows: 24,
             cols: 80,
             owner_cert_der: None,
+            detached_at: Instant::now(),
         };
         let _ = store.insert(id, session);
         for _ in 0..50 {
@@ -219,5 +238,27 @@ mod tests {
             }
         }
         assert!(store.is_empty());
+    }
+
+    #[test]
+    fn prune_idle_removes_old_sessions() {
+        let store = SessionStore::new();
+        let id = [4u8; 16];
+        let mut session = make_detached();
+        session.detached_at = Instant::now().checked_sub(Duration::from_secs(100)).unwrap();
+        let _ = store.insert(id, session);
+
+        assert_eq!(store.prune_idle(Duration::from_secs(50)), 1);
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn prune_idle_keeps_recent_sessions() {
+        let store = SessionStore::new();
+        let id = [5u8; 16];
+        let _ = store.insert(id, make_detached());
+
+        assert_eq!(store.prune_idle(Duration::from_secs(3600)), 0);
+        assert_eq!(store.len(), 1);
     }
 }
