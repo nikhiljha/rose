@@ -931,6 +931,18 @@ async fn handle_server_session(
         }
     }
 
+    // Give the QUIC I/O driver a chance to flush the CONNECTION_CLOSE
+    // frame before we return.  In bootstrap mode the caller exits the
+    // accept loop as soon as this function returns (when the store is
+    // empty), which can tear down the runtime before the close frame
+    // reaches the wire.
+    //
+    // Note: we cannot use `close_conn.closed().await` here because
+    // quinn resolves it immediately after `close()` (the connection is
+    // already locally closed).  A brief sleep lets the I/O task
+    // serialise and send the UDP packet.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
     Ok(())
 }
 
@@ -1707,15 +1719,27 @@ async fn client_session_loop_inner(
         // When the server closes the connection gracefully (shell exited),
         // any task may win the select race. Check the connection's close
         // reason regardless of which task finished first.
+        //
+        // The close frame may still be in-flight when the select fires, so
+        // wait briefly for it to arrive before falling back to reconnect.
         let exit = match exit {
-            SessionExit::ConnectionLost => match check_conn.close_reason() {
-                Some(quinn::ConnectionError::ApplicationClosed(ref close))
-                    if close.error_code == quinn::VarInt::from_u32(0) =>
-                {
-                    SessionExit::ShellExited
+            SessionExit::ConnectionLost => {
+                // If close_reason is not yet available, give the QUIC close
+                // frame a moment to arrive (typically < 1 ms on localhost,
+                // bounded by network RTT on remote connections).
+                if check_conn.close_reason().is_none() {
+                    let _ =
+                        tokio::time::timeout(Duration::from_millis(200), check_conn.closed()).await;
                 }
-                _ => SessionExit::ConnectionLost,
-            },
+                match check_conn.close_reason() {
+                    Some(quinn::ConnectionError::ApplicationClosed(ref close))
+                        if close.error_code == quinn::VarInt::from_u32(0) =>
+                    {
+                        SessionExit::ShellExited
+                    }
+                    _ => SessionExit::ConnectionLost,
+                }
+            }
             other => other,
         };
 
@@ -1733,6 +1757,14 @@ async fn client_session_loop_inner(
                 break Ok(());
             }
             SessionExit::UserDetach => {
+                // Close the QUIC connection immediately so the server
+                // detects the detach and returns to its accept loop.
+                // Without this, the server waits for the idle timeout
+                // (15 s) before it can accept reconnections.
+                check_conn.close(0u32.into(), b"detaching");
+                // Let the I/O driver flush the close frame before we
+                // return and the process exits.
+                tokio::time::sleep(Duration::from_millis(50)).await;
                 // Restore terminal mode before printing
                 let _ = terminal::disable_raw_mode();
                 let mut stdout = std::io::stdout();
@@ -1799,7 +1831,13 @@ async fn run_ssh_bootstrap(
         .arg("--bootstrap")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
+        // Use Stdio::null rather than inherit so that the SSH child
+        // (and the nohup server it launches) does not hold a copy of the
+        // parent's PTY slave FD.  With inherit(), the server keeps the
+        // slave FD open after ssh.kill(), which prevents the PTY reader
+        // from seeing EOF and causes the rose client process to hang on
+        // exit (especially visible under llvm-cov instrumentation).
+        .stderr(std::process::Stdio::null())
         .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn ssh: {e}"))?;
 

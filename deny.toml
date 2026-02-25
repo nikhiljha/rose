@@ -3,6 +3,7 @@
 ignore = [
     "RUSTSEC-2025-0056", # adler unmaintained (via wezterm → image → png → flate2)
     "RUSTSEC-2024-0436", # paste unmaintained (via wezterm)
+    "RUSTSEC-2023-0071", # rsa timing sidechannel (via russh — no safe upgrade available)
 ]
 
 [licenses]
