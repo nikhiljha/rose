@@ -577,6 +577,9 @@ async fn handle_server_session(
 
     if shell_exited {
         close_conn.close(0u32.into(), b"shell exited");
+        // Give the I/O driver a moment to flush the CONNECTION_CLOSE
+        // frame so the client receives it before we return.
+        tokio::time::sleep(Duration::from_millis(50)).await;
     } else {
         close_conn.close(0u32.into(), b"detaching session");
         if let Some(pty) = detached_pty {

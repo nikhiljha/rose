@@ -31,6 +31,12 @@ pub struct PtySession {
     child: Box<dyn Child + Send + Sync>,
     killer: Box<dyn ChildKiller + Send + Sync>,
     output_tx: broadcast::Sender<Bytes>,
+    /// The initial broadcast receiver, created before the reader thread
+    /// starts.  Handed to the first caller of [`subscribe_output`] so it
+    /// receives all output from the very start of the PTY — avoiding a
+    /// race where a fast command (e.g. `echo`) completes before the
+    /// caller has a chance to subscribe.
+    initial_rx: Mutex<Option<broadcast::Receiver<Bytes>>>,
     /// Notified when the PTY reader thread exits (shell closed).
     pty_closed: Arc<Notify>,
     _reader_handle: std::thread::JoinHandle<()>,
@@ -123,7 +129,7 @@ impl PtySession {
             .map_err(|e| PtyError::Io(std::io::Error::other(e.to_string())))?;
         let writer = Arc::new(Mutex::new(writer));
 
-        let (output_tx, _) = broadcast::channel(256);
+        let (output_tx, initial_rx) = broadcast::channel(256);
         let tx = output_tx.clone();
 
         let mut reader = pair
@@ -164,16 +170,30 @@ impl PtySession {
             child,
             killer,
             output_tx,
+            initial_rx: Mutex::new(Some(initial_rx)),
             pty_closed,
             _reader_handle: reader_handle,
         })
     }
 
-    /// Subscribes to PTY output. Each subscriber receives all output
-    /// produced after subscribing.
+    /// Subscribes to PTY output.
+    ///
+    /// The **first** call returns a receiver created before the reader
+    /// thread started, so it is guaranteed to contain every byte the
+    /// child has produced.  Subsequent calls create a new receiver that
+    /// only sees output produced after the call.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a thread panicked while
+    /// holding it).
     #[must_use]
     pub fn subscribe_output(&self) -> broadcast::Receiver<Bytes> {
-        self.output_tx.subscribe()
+        self.initial_rx
+            .lock()
+            .expect("initial_rx lock poisoned")
+            .take()
+            .unwrap_or_else(|| self.output_tx.subscribe())
     }
 
     /// Returns a handle that is notified when the PTY reader exits

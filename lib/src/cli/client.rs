@@ -721,14 +721,28 @@ async fn client_session_loop_inner(
         };
 
         let exit = match exit {
-            SessionExit::ConnectionLost => match check_conn.close_reason() {
-                Some(quinn::ConnectionError::ApplicationClosed(ref close))
-                    if close.error_code == quinn::VarInt::from_u32(0) =>
-                {
-                    SessionExit::ShellExited
+            SessionExit::ConnectionLost => {
+                // The CONNECTION_CLOSE frame may still be in-flight when the
+                // select fires.  Wait briefly so quinn can process it before
+                // we inspect `close_reason()`.
+                let close_reason =
+                    tokio::time::timeout(Duration::from_millis(200), check_conn.closed())
+                        .await
+                        .ok()
+                        .and_then(|_| check_conn.close_reason());
+
+                // Fall back to an immediate check if the timeout elapsed.
+                let close_reason = close_reason.or_else(|| check_conn.close_reason());
+
+                match close_reason {
+                    Some(quinn::ConnectionError::ApplicationClosed(ref close))
+                        if close.error_code == quinn::VarInt::from_u32(0) =>
+                    {
+                        SessionExit::ShellExited
+                    }
+                    _ => SessionExit::ConnectionLost,
                 }
-                _ => SessionExit::ConnectionLost,
-            },
+            }
             other => other,
         };
 
@@ -746,6 +760,13 @@ async fn client_session_loop_inner(
                 break Ok(());
             }
             SessionExit::UserDetach => {
+                // Explicitly close the QUIC connection so the server
+                // receives a CONNECTION_CLOSE frame and immediately
+                // returns to accept() for the reconnecting client.
+                check_conn.close(0u32.into(), b"detaching");
+                // Give the I/O driver a moment to flush the frame.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+
                 let _ = terminal::disable_raw_mode();
                 let mut stdout = std::io::stdout();
                 let _ = stdout.write_all(

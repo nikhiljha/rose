@@ -52,7 +52,11 @@ pub(super) async fn run_ssh_bootstrap(
         .arg("--bootstrap")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
+        // Use Stdio::null() instead of Stdio::inherit() to avoid leaking
+        // the PTY slave FD to the nohup server process.  When stderr is
+        // inherited the server keeps the FD open after `ssh.kill()`, which
+        // prevents clean PTY EOF detection under llvm-cov instrumentation.
+        .stderr(std::process::Stdio::null())
         .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn ssh: {e}"))?;
 
