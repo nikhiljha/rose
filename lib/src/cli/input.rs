@@ -66,6 +66,7 @@ pub(super) fn key_event_to_bytes(key: &crossterm::event::KeyEvent) -> Vec<u8> {
     // Ctrl+letter maps to ASCII control codes (0x01-0x1a).
     // With the kitty keyboard protocol enabled, crossterm may report uppercase
     // characters for Ctrl+Shift+letter, so we normalize to lowercase first.
+    // Alt+Ctrl+letter prepends ESC before the control byte.
     if key.modifiers.contains(KeyModifiers::CONTROL)
         && let KeyCode::Char(c) = key.code
         && c.is_ascii_alphabetic()
@@ -73,6 +74,9 @@ pub(super) fn key_event_to_bytes(key: &crossterm::event::KeyEvent) -> Vec<u8> {
         let ctrl_byte = (c.to_ascii_lowercase() as u8)
             .wrapping_sub(b'a')
             .wrapping_add(1);
+        if key.modifiers.contains(KeyModifiers::ALT) {
+            return vec![0x1b, ctrl_byte];
+        }
         return vec![ctrl_byte];
     }
 
@@ -92,7 +96,17 @@ pub(super) fn key_event_to_bytes(key: &crossterm::event::KeyEvent) -> Vec<u8> {
         KeyCode::Char(c) => {
             let mut buf = [0u8; 4];
             let s = c.encode_utf8(&mut buf);
-            s.as_bytes().to_vec()
+            let char_bytes = s.as_bytes();
+            // Alt+char: prefix ESC before the character bytes.
+            // With kitty keyboard protocol, Alt+char arrives as a structured
+            // KeyEvent with ALT modifier instead of terminal-emitted ESC prefix.
+            if key.modifiers.contains(KeyModifiers::ALT) {
+                let mut result = Vec::with_capacity(1 + char_bytes.len());
+                result.push(0x1b);
+                result.extend_from_slice(char_bytes);
+                return result;
+            }
+            char_bytes.to_vec()
         }
         KeyCode::Enter => vec![b'\r'],
         KeyCode::Backspace => vec![127],
@@ -413,6 +427,33 @@ mod tests {
         // Ctrl+] -> GS (0x1d)
         let key = crossterm::event::KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL);
         assert_eq!(key_event_to_bytes(&key), vec![0x1d]);
+    }
+
+    #[test]
+    fn key_event_alt_char() {
+        // Alt+x should send ESC followed by 'x' (0x1b 0x78)
+        let key = crossterm::event::KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT);
+        assert_eq!(key_event_to_bytes(&key), b"\x1bx");
+    }
+
+    #[test]
+    fn key_event_alt_uppercase_char() {
+        // Alt+Shift+A (reported as Alt + 'A') should send ESC followed by 'A'
+        let key = crossterm::event::KeyEvent::new(
+            KeyCode::Char('A'),
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+        );
+        assert_eq!(key_event_to_bytes(&key), b"\x1bA");
+    }
+
+    #[test]
+    fn key_event_alt_ctrl_letter() {
+        // Alt+Ctrl+c should send ESC followed by Ctrl+C (0x1b 0x03)
+        let key = crossterm::event::KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::ALT | KeyModifiers::CONTROL,
+        );
+        assert_eq!(key_event_to_bytes(&key), vec![0x1b, 0x03]);
     }
 
     #[test]
