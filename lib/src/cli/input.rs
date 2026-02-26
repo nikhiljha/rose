@@ -88,7 +88,11 @@ pub(super) fn key_event_to_bytes(key: &crossterm::event::KeyEvent) -> Vec<u8> {
     {
         let b = c as u32;
         if (0x40..=0x5f).contains(&b) {
-            return vec![(b as u8) & 0x1f];
+            let ctrl_byte = (b as u8) & 0x1f;
+            if key.modifiers.contains(KeyModifiers::ALT) {
+                return vec![0x1b, ctrl_byte];
+            }
+            return vec![ctrl_byte];
         }
     }
 
@@ -454,6 +458,36 @@ mod tests {
             KeyModifiers::ALT | KeyModifiers::CONTROL,
         );
         assert_eq!(key_event_to_bytes(&key), vec![0x1b, 0x03]);
+    }
+
+    #[test]
+    fn key_event_alt_ctrl_bracket_sends_esc_esc() {
+        // Alt+Ctrl+[ should send ESC ESC (0x1b 0x1b)
+        let key = crossterm::event::KeyEvent::new(
+            KeyCode::Char('['),
+            KeyModifiers::ALT | KeyModifiers::CONTROL,
+        );
+        assert_eq!(key_event_to_bytes(&key), vec![0x1b, 0x1b]);
+    }
+
+    #[test]
+    fn key_event_alt_ctrl_backslash() {
+        // Alt+Ctrl+\ should send ESC FS (0x1b 0x1c)
+        let key = crossterm::event::KeyEvent::new(
+            KeyCode::Char('\\'),
+            KeyModifiers::ALT | KeyModifiers::CONTROL,
+        );
+        assert_eq!(key_event_to_bytes(&key), vec![0x1b, 0x1c]);
+    }
+
+    #[test]
+    fn key_event_alt_ctrl_close_bracket() {
+        // Alt+Ctrl+] should send ESC GS (0x1b 0x1d)
+        let key = crossterm::event::KeyEvent::new(
+            KeyCode::Char(']'),
+            KeyModifiers::ALT | KeyModifiers::CONTROL,
+        );
+        assert_eq!(key_event_to_bytes(&key), vec![0x1b, 0x1d]);
     }
 
     #[test]
