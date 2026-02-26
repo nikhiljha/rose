@@ -1200,6 +1200,19 @@ async fn ssh_bootstrap_mode() {
         pty.captured_output()
     );
 
+    // Wait for the shell prompt before sending Ctrl-D.  The "Bootstrap:
+    // server on port" message is printed *before* the QUIC connection is
+    // established and raw mode is enabled.  If Ctrl-D arrives while the
+    // terminal is still in cooked mode the line discipline interprets it
+    // as EOF on the process's stdin instead of forwarding it as a keystroke
+    // to the server.  Waiting for "$" (the shell prompt) proves the full
+    // pipeline (QUIC → server PTY → shell → SSP → client stdout) is up.
+    assert!(
+        wait_for_output_contains(&pty, "$", 15).await,
+        "shell prompt not detected. output:\n{}",
+        pty.captured_output()
+    );
+
     let w = pty.writer.as_mut().unwrap();
     std::io::Write::write_all(w, &[4]).unwrap();
     std::io::Write::flush(w).unwrap();
