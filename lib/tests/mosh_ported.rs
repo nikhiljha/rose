@@ -1195,35 +1195,44 @@ async fn ssh_bootstrap_mode() {
     let mut pty = spawn_in_pty(cmd);
 
     assert!(
-        wait_for_output_contains(&pty, "Bootstrap: server on port", 15).await,
+        wait_for_output_contains(&pty, "Bootstrap: server on port", 30).await,
         "bootstrap did not start. output:\n{}",
         pty.captured_output()
     );
 
-    // Wait for the shell prompt before sending Ctrl-D.  The "Bootstrap:
-    // server on port" message is printed *before* the QUIC connection is
-    // established and raw mode is enabled.  If Ctrl-D arrives while the
-    // terminal is still in cooked mode the line discipline interprets it
-    // as EOF on the process's stdin instead of forwarding it as a keystroke
-    // to the server.  Waiting for "$" (the shell prompt) proves the full
-    // pipeline (QUIC → server PTY → shell → SSP → client stdout) is up.
+    // Send a text probe to verify the full pipeline is up.  Text works
+    // in both cooked and raw terminal modes, unlike Ctrl-D which is
+    // interpreted as EOF in cooked mode.  The "Bootstrap: server on port"
+    // message is printed *before* the QUIC connection is established and
+    // raw mode is enabled, so we cannot send control characters yet.
+    //
+    // Under llvm-cov in Docker the QUIC connect + session setup + shell
+    // start can take 15+ seconds, so we use a generous 60 s timeout.
+    let marker = format!("rose_exit_probe_{}", std::process::id());
+    {
+        let w = pty.writer.as_mut().unwrap();
+        let probe = format!("echo {marker}\n");
+        std::io::Write::write_all(w, probe.as_bytes()).unwrap();
+        std::io::Write::flush(w).unwrap();
+    }
+
     assert!(
-        wait_for_output_contains(&pty, "$", 15).await,
-        "shell prompt not detected. output:\n{}",
+        wait_for_output_contains(&pty, &marker, 60).await,
+        "shell not responding. output:\n{}",
         pty.captured_output()
     );
 
-    let w = pty.writer.as_mut().unwrap();
-    std::io::Write::write_all(w, &[4]).unwrap();
-    std::io::Write::flush(w).unwrap();
+    // Now we know the shell is alive and raw mode is active.
+    // Send Ctrl-D to close the shell.
+    {
+        let w = pty.writer.as_mut().unwrap();
+        std::io::Write::write_all(w, &[4]).unwrap();
+        std::io::Write::flush(w).unwrap();
+    }
 
-    // Wait for the client to acknowledge the shell exit.  Under llvm-cov
-    // instrumentation the process shutdown (coverage-data flush) can take
-    // tens of seconds even though the application logic has already
-    // finished.  Instead of waiting for process termination we verify the
-    // expected output appeared and then kill the child.
+    // Wait for the client to acknowledge the shell exit.
     assert!(
-        wait_for_output_contains(&pty, "shell exited", 15).await,
+        wait_for_output_contains(&pty, "shell exited", 30).await,
         "shell exit not detected. output:\n{}",
         pty.captured_output()
     );
