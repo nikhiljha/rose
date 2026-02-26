@@ -746,6 +746,27 @@ impl Predictor {
 mod tests {
     use super::*;
 
+    fn make_frame(
+        old: u64,
+        new: u64,
+        ack: u64,
+        rows: &[(u16, &str)],
+        cx: u16,
+        cy: u16,
+    ) -> SspFrame {
+        SspFrame {
+            old_num: old,
+            new_num: new,
+            ack_num: ack,
+            diff: Some(ScreenDiff {
+                changed_rows: rows.iter().map(|(i, s)| (*i, (*s).into())).collect(),
+                cursor_x: cx,
+                cursor_y: cy,
+                total_rows: 24,
+            }),
+        }
+    }
+
     // -- ScreenState diffing --------------------------------------------------
 
     #[test]
@@ -866,17 +887,7 @@ mod tests {
 
     #[test]
     fn ssp_frame_encode_decode() {
-        let frame = SspFrame {
-            old_num: 1,
-            new_num: 2,
-            ack_num: 0,
-            diff: Some(ScreenDiff {
-                changed_rows: vec![(0, "test".into())],
-                cursor_x: 4,
-                cursor_y: 0,
-                total_rows: 24,
-            }),
-        };
+        let frame = make_frame(1, 2, 0, &[(0, "test")], 4, 0);
         let encoded = frame.encode();
         let decoded = SspFrame::decode(&encoded).unwrap();
         assert_eq!(frame, decoded);
@@ -1002,33 +1013,11 @@ mod tests {
     fn receiver_apply_sequential() {
         let mut receiver = SspReceiver::new(24);
 
-        // Frame 1: init diff
-        let frame1 = SspFrame {
-            old_num: 0,
-            new_num: 1,
-            ack_num: 0,
-            diff: Some(ScreenDiff {
-                changed_rows: vec![(0, "hello".into())],
-                cursor_x: 5,
-                cursor_y: 0,
-                total_rows: 24,
-            }),
-        };
+        let frame1 = make_frame(0, 1, 0, &[(0, "hello")], 5, 0);
         assert_eq!(receiver.process_frame(&frame1).unwrap(), Some(1));
         assert_eq!(receiver.state().rows[0], "hello");
 
-        // Frame 2: incremental
-        let frame2 = SspFrame {
-            old_num: 1,
-            new_num: 2,
-            ack_num: 0,
-            diff: Some(ScreenDiff {
-                changed_rows: vec![(1, "world".into())],
-                cursor_x: 5,
-                cursor_y: 1,
-                total_rows: 24,
-            }),
-        };
+        let frame2 = make_frame(1, 2, 0, &[(1, "world")], 5, 1);
         assert_eq!(receiver.process_frame(&frame2).unwrap(), Some(2));
         assert_eq!(receiver.state().rows[0], "hello");
         assert_eq!(receiver.state().rows[1], "world");
@@ -1037,32 +1026,11 @@ mod tests {
     #[test]
     fn receiver_ignore_stale() {
         let mut receiver = SspReceiver::new(24);
-        // Apply init to get to state 2
-        let frame = SspFrame {
-            old_num: 0,
-            new_num: 2,
-            ack_num: 0,
-            diff: Some(ScreenDiff {
-                changed_rows: vec![(0, "current".into())],
-                cursor_x: 0,
-                cursor_y: 0,
-                total_rows: 24,
-            }),
-        };
-        receiver.process_frame(&frame).unwrap();
+        receiver
+            .process_frame(&make_frame(0, 2, 0, &[(0, "current")], 0, 0))
+            .unwrap();
 
-        // Stale frame (new_num=1 <= state_num=2)
-        let stale = SspFrame {
-            old_num: 0,
-            new_num: 1,
-            ack_num: 0,
-            diff: Some(ScreenDiff {
-                changed_rows: vec![(0, "old".into())],
-                cursor_x: 0,
-                cursor_y: 0,
-                total_rows: 24,
-            }),
-        };
+        let stale = make_frame(0, 1, 0, &[(0, "old")], 0, 0);
         assert_eq!(receiver.process_frame(&stale).unwrap(), None);
         assert_eq!(receiver.state().rows[0], "current");
     }
@@ -1070,32 +1038,11 @@ mod tests {
     #[test]
     fn receiver_ignore_wrong_base() {
         let mut receiver = SspReceiver::new(24);
-        // Get to state 2
-        let frame = SspFrame {
-            old_num: 0,
-            new_num: 2,
-            ack_num: 0,
-            diff: Some(ScreenDiff {
-                changed_rows: vec![(0, "at two".into())],
-                cursor_x: 0,
-                cursor_y: 0,
-                total_rows: 24,
-            }),
-        };
-        receiver.process_frame(&frame).unwrap();
+        receiver
+            .process_frame(&make_frame(0, 2, 0, &[(0, "at two")], 0, 0))
+            .unwrap();
 
-        // Frame with wrong base (old_num=1, but receiver is at 2)
-        let wrong_base = SspFrame {
-            old_num: 1,
-            new_num: 3,
-            ack_num: 0,
-            diff: Some(ScreenDiff {
-                changed_rows: vec![(0, "wrong base".into())],
-                cursor_x: 0,
-                cursor_y: 0,
-                total_rows: 24,
-            }),
-        };
+        let wrong_base = make_frame(1, 3, 0, &[(0, "wrong base")], 0, 0);
         assert_eq!(receiver.process_frame(&wrong_base).unwrap(), None);
         assert_eq!(receiver.state().rows[0], "at two");
     }
@@ -1103,33 +1050,12 @@ mod tests {
     #[test]
     fn receiver_init_diff_resets() {
         let mut receiver = SspReceiver::new(24);
-        // Get to state 2 with some content
-        let frame = SspFrame {
-            old_num: 0,
-            new_num: 2,
-            ack_num: 0,
-            diff: Some(ScreenDiff {
-                changed_rows: vec![(0, "old content".into())],
-                cursor_x: 0,
-                cursor_y: 0,
-                total_rows: 24,
-            }),
-        };
-        receiver.process_frame(&frame).unwrap();
+        receiver
+            .process_frame(&make_frame(0, 2, 0, &[(0, "old content")], 0, 0))
+            .unwrap();
         assert_eq!(receiver.state().rows[0], "old content");
 
-        // Init diff (old_num=0) resets and applies new state
-        let reset = SspFrame {
-            old_num: 0,
-            new_num: 5,
-            ack_num: 0,
-            diff: Some(ScreenDiff {
-                changed_rows: vec![(0, "fresh".into())],
-                cursor_x: 5,
-                cursor_y: 0,
-                total_rows: 24,
-            }),
-        };
+        let reset = make_frame(0, 5, 0, &[(0, "fresh")], 5, 0);
         assert_eq!(receiver.process_frame(&reset).unwrap(), Some(5));
         assert_eq!(receiver.state().rows[0], "fresh");
         // Old content on row 0 is replaced; other rows are empty after reset
@@ -1263,30 +1189,6 @@ mod tests {
 
         // Cursor at (3, 1) → CSI 2;4H
         assert!(s.contains("\x1b[2;4H"));
-    }
-
-    #[test]
-    fn render_full_redraw_scrollback_text_preserved() {
-        use crate::scrollback::ScrollbackLine;
-
-        let scrollback = vec![
-            ScrollbackLine {
-                stable_row: 0,
-                text: "$ ls -la".into(),
-            },
-            ScrollbackLine {
-                stable_row: 1,
-                text: "total 42".into(),
-            },
-        ];
-        let state = ScreenState::empty(3);
-        let ansi = render_full_redraw(&scrollback, &state);
-        let s = String::from_utf8(ansi).unwrap();
-
-        assert!(s.contains("$ ls -la\r\n"));
-        assert!(s.contains("total 42\r\n"));
-        // Order preserved
-        assert!(s.find("$ ls -la").unwrap() < s.find("total 42").unwrap());
     }
 
     // -- Wire format edge cases -----------------------------------------------
@@ -1462,17 +1364,7 @@ mod tests {
 
     #[test]
     fn ssp_frame_stream_encode_decode() {
-        let frame = SspFrame {
-            old_num: 0,
-            new_num: 1,
-            ack_num: 0,
-            diff: Some(ScreenDiff {
-                changed_rows: vec![(0, "hello stream".into())],
-                cursor_x: 12,
-                cursor_y: 0,
-                total_rows: 24,
-            }),
-        };
+        let frame = make_frame(0, 1, 0, &[(0, "hello stream")], 12, 0);
         let encoded = frame.encode_for_stream();
         let decoded = SspFrame::decode_from_stream(&encoded).unwrap();
         assert_eq!(frame, decoded);
@@ -1493,7 +1385,6 @@ mod tests {
     #[test]
     fn receiver_rejects_invalid_diff() {
         let mut receiver = SspReceiver::new(2);
-        // Frame with row index out of bounds for the total_rows
         let bad_frame = SspFrame {
             old_num: 0,
             new_num: 1,

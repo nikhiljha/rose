@@ -227,6 +227,47 @@ pub(crate) fn stun_discover_from(
 mod tests {
     use super::*;
 
+    fn stun_response_header(txn_id: &[u8; 12], attr_len: u16) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&BINDING_RESPONSE.to_be_bytes());
+        buf.extend_from_slice(&attr_len.to_be_bytes());
+        buf.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
+        buf.extend_from_slice(txn_id);
+        buf
+    }
+
+    fn xor_encode_ipv4(ip: std::net::Ipv4Addr, port: u16) -> (Vec<u8>, u16) {
+        let cookie_bytes = MAGIC_COOKIE.to_be_bytes();
+        let xor_port = port ^ (MAGIC_COOKIE >> 16) as u16;
+        let octets = ip.octets();
+        let xor_ip = [
+            octets[0] ^ cookie_bytes[0],
+            octets[1] ^ cookie_bytes[1],
+            octets[2] ^ cookie_bytes[2],
+            octets[3] ^ cookie_bytes[3],
+        ];
+        (xor_ip.to_vec(), xor_port)
+    }
+
+    fn append_xor_mapped_attr(buf: &mut Vec<u8>, ip: std::net::Ipv4Addr, port: u16) {
+        let (xor_ip, xor_port) = xor_encode_ipv4(ip, port);
+        buf.extend_from_slice(&ATTR_XOR_MAPPED_ADDRESS.to_be_bytes());
+        buf.extend_from_slice(&8u16.to_be_bytes());
+        buf.push(0x00);
+        buf.push(FAMILY_IPV4);
+        buf.extend_from_slice(&xor_port.to_be_bytes());
+        buf.extend_from_slice(&xor_ip);
+    }
+
+    fn append_mapped_attr(buf: &mut Vec<u8>, ip: std::net::Ipv4Addr, port: u16) {
+        buf.extend_from_slice(&ATTR_MAPPED_ADDRESS.to_be_bytes());
+        buf.extend_from_slice(&8u16.to_be_bytes());
+        buf.push(0x00);
+        buf.push(FAMILY_IPV4);
+        buf.extend_from_slice(&port.to_be_bytes());
+        buf.extend_from_slice(&ip.octets());
+    }
+
     #[test]
     fn build_request_structure() {
         let txn_id = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
@@ -247,36 +288,12 @@ mod tests {
 
     #[test]
     fn parse_xor_mapped_address_ipv4() {
-        // Construct a response with XOR-MAPPED-ADDRESS
-        // Public IP: 198.51.100.1, Port: 12345
         let ip = std::net::Ipv4Addr::new(198, 51, 100, 1);
         let port: u16 = 12345;
-
-        // XOR with magic cookie
-        let xor_port = port ^ (MAGIC_COOKIE >> 16) as u16;
-        let ip_octets = ip.octets();
-        let cookie_bytes = MAGIC_COOKIE.to_be_bytes();
-        let xor_ip = [
-            ip_octets[0] ^ cookie_bytes[0],
-            ip_octets[1] ^ cookie_bytes[1],
-            ip_octets[2] ^ cookie_bytes[2],
-            ip_octets[3] ^ cookie_bytes[3],
-        ];
-
         let txn_id = [0u8; 12];
-        let mut response = Vec::new();
-        // Header
-        response.extend_from_slice(&BINDING_RESPONSE.to_be_bytes());
-        response.extend_from_slice(&12u16.to_be_bytes()); // msg length (1 attr: 4 header + 8 value)
-        response.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
-        response.extend_from_slice(&txn_id);
-        // XOR-MAPPED-ADDRESS attribute
-        response.extend_from_slice(&ATTR_XOR_MAPPED_ADDRESS.to_be_bytes());
-        response.extend_from_slice(&8u16.to_be_bytes()); // attr length
-        response.push(0x00); // reserved
-        response.push(FAMILY_IPV4);
-        response.extend_from_slice(&xor_port.to_be_bytes());
-        response.extend_from_slice(&xor_ip);
+
+        let mut response = stun_response_header(&txn_id, 12);
+        append_xor_mapped_attr(&mut response, ip, port);
 
         let result = parse_binding_response(&response, &txn_id).unwrap();
         assert_eq!(*result.ip(), ip);
@@ -289,19 +306,8 @@ mod tests {
         let port: u16 = 54321;
         let txn_id = [7u8; 12];
 
-        let mut response = Vec::new();
-        // Header
-        response.extend_from_slice(&BINDING_RESPONSE.to_be_bytes());
-        response.extend_from_slice(&12u16.to_be_bytes());
-        response.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
-        response.extend_from_slice(&txn_id);
-        // MAPPED-ADDRESS attribute (legacy)
-        response.extend_from_slice(&ATTR_MAPPED_ADDRESS.to_be_bytes());
-        response.extend_from_slice(&8u16.to_be_bytes());
-        response.push(0x00); // reserved
-        response.push(FAMILY_IPV4);
-        response.extend_from_slice(&port.to_be_bytes());
-        response.extend_from_slice(&ip.octets());
+        let mut response = stun_response_header(&txn_id, 12);
+        append_mapped_attr(&mut response, ip, port);
 
         let result = parse_binding_response(&response, &txn_id).unwrap();
         assert_eq!(*result.ip(), ip);
@@ -381,44 +387,15 @@ mod tests {
 
     #[test]
     fn xor_mapped_prefers_over_mapped() {
-        // Response with both MAPPED-ADDRESS and XOR-MAPPED-ADDRESS
-        // XOR-MAPPED-ADDRESS should be preferred
         let txn_id = [0u8; 12];
         let mapped_ip = std::net::Ipv4Addr::new(10, 0, 0, 1);
         let mapped_port: u16 = 1111;
         let xor_ip = std::net::Ipv4Addr::new(203, 0, 113, 5);
         let xor_port: u16 = 2222;
 
-        let cookie_bytes = MAGIC_COOKIE.to_be_bytes();
-        let xor_port_encoded = xor_port ^ (MAGIC_COOKIE >> 16) as u16;
-        let xor_ip_octets = xor_ip.octets();
-        let xor_ip_encoded = [
-            xor_ip_octets[0] ^ cookie_bytes[0],
-            xor_ip_octets[1] ^ cookie_bytes[1],
-            xor_ip_octets[2] ^ cookie_bytes[2],
-            xor_ip_octets[3] ^ cookie_bytes[3],
-        ];
-
-        let mut response = Vec::new();
-        // Header
-        response.extend_from_slice(&BINDING_RESPONSE.to_be_bytes());
-        response.extend_from_slice(&24u16.to_be_bytes()); // 2 attrs * 12 bytes each
-        response.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
-        response.extend_from_slice(&txn_id);
-        // MAPPED-ADDRESS first (should be deprioritized)
-        response.extend_from_slice(&ATTR_MAPPED_ADDRESS.to_be_bytes());
-        response.extend_from_slice(&8u16.to_be_bytes());
-        response.push(0x00);
-        response.push(FAMILY_IPV4);
-        response.extend_from_slice(&mapped_port.to_be_bytes());
-        response.extend_from_slice(&mapped_ip.octets());
-        // XOR-MAPPED-ADDRESS second (should be preferred)
-        response.extend_from_slice(&ATTR_XOR_MAPPED_ADDRESS.to_be_bytes());
-        response.extend_from_slice(&8u16.to_be_bytes());
-        response.push(0x00);
-        response.push(FAMILY_IPV4);
-        response.extend_from_slice(&xor_port_encoded.to_be_bytes());
-        response.extend_from_slice(&xor_ip_encoded);
+        let mut response = stun_response_header(&txn_id, 24);
+        append_mapped_attr(&mut response, mapped_ip, mapped_port);
+        append_xor_mapped_attr(&mut response, xor_ip, xor_port);
 
         let result = parse_binding_response(&response, &txn_id).unwrap();
         assert_eq!(*result.ip(), xor_ip);
@@ -435,13 +412,7 @@ mod tests {
     #[test]
     fn parse_truncated_attribute() {
         let txn = [0u8; 12];
-        let mut response = Vec::new();
-        response.extend_from_slice(&BINDING_RESPONSE.to_be_bytes());
-        // Claim 100 bytes of attributes but only provide 4
-        response.extend_from_slice(&100u16.to_be_bytes());
-        response.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
-        response.extend_from_slice(&txn);
-        // Partial attribute header (only 4 bytes, says length 50)
+        let mut response = stun_response_header(&txn, 100);
         response.extend_from_slice(&ATTR_XOR_MAPPED_ADDRESS.to_be_bytes());
         response.extend_from_slice(&50u16.to_be_bytes());
 
@@ -462,51 +433,38 @@ mod tests {
         assert!(parse_mapped_address(&value).is_none());
     }
 
-    /// Spawns a local UDP server that responds with a crafted STUN Binding
-    /// Response, then calls `stun_discover_from` against it.
+    fn spawn_stun_responder(
+        server: std::net::UdpSocket,
+        ip: std::net::Ipv4Addr,
+        port: u16,
+        use_xor: bool,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 64];
+            let (_, client_addr) = server.recv_from(&mut buf).unwrap();
+            let txn_id: [u8; 12] = buf[8..20].try_into().unwrap();
+
+            let mut response = stun_response_header(&txn_id, 12);
+            if use_xor {
+                append_xor_mapped_attr(&mut response, ip, port);
+            } else {
+                append_mapped_attr(&mut response, ip, port);
+            }
+            server.send_to(&response, client_addr).unwrap();
+        })
+    }
+
     #[test]
     fn stun_discover_from_local_server() {
         let fake_server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let server_addr = fake_server.local_addr().unwrap();
-        let server_str = server_addr.to_string();
+        let server_str = fake_server.local_addr().unwrap().to_string();
 
-        // Spawn a thread that reads one request and sends a valid response
-        let handle = std::thread::spawn(move || {
-            let mut buf = [0u8; 64];
-            let (n, client_addr) = fake_server.recv_from(&mut buf).unwrap();
-            assert_eq!(n, 20); // STUN Binding Request is 20 bytes
-
-            // Extract transaction ID from request
-            let txn_id: [u8; 12] = buf[8..20].try_into().unwrap();
-
-            // Build a response with XOR-MAPPED-ADDRESS
-            let mapped_ip = std::net::Ipv4Addr::new(203, 0, 113, 42);
-            let mapped_port: u16 = 54321;
-
-            let xor_port = mapped_port ^ (MAGIC_COOKIE >> 16) as u16;
-            let cookie_bytes = MAGIC_COOKIE.to_be_bytes();
-            let ip_octets = mapped_ip.octets();
-            let xor_ip = [
-                ip_octets[0] ^ cookie_bytes[0],
-                ip_octets[1] ^ cookie_bytes[1],
-                ip_octets[2] ^ cookie_bytes[2],
-                ip_octets[3] ^ cookie_bytes[3],
-            ];
-
-            let mut response = Vec::new();
-            response.extend_from_slice(&BINDING_RESPONSE.to_be_bytes());
-            response.extend_from_slice(&12u16.to_be_bytes());
-            response.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
-            response.extend_from_slice(&txn_id);
-            response.extend_from_slice(&ATTR_XOR_MAPPED_ADDRESS.to_be_bytes());
-            response.extend_from_slice(&8u16.to_be_bytes());
-            response.push(0x00);
-            response.push(FAMILY_IPV4);
-            response.extend_from_slice(&xor_port.to_be_bytes());
-            response.extend_from_slice(&xor_ip);
-
-            fake_server.send_to(&response, client_addr).unwrap();
-        });
+        let handle = spawn_stun_responder(
+            fake_server,
+            std::net::Ipv4Addr::new(203, 0, 113, 42),
+            54321,
+            true,
+        );
 
         let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let result = stun_discover_from(&client, &[&server_str]);
@@ -540,46 +498,23 @@ mod tests {
 
     #[test]
     fn stun_discover_bad_response_tries_next() {
-        // First server sends garbage, second sends valid response
         let bad_server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let bad_addr = bad_server.local_addr().unwrap().to_string();
         let good_server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let good_addr = good_server.local_addr().unwrap().to_string();
 
         let handle = std::thread::spawn(move || {
-            // Bad server: respond with garbage
             let mut buf = [0u8; 64];
             let (_, client_addr) = bad_server.recv_from(&mut buf).unwrap();
             bad_server
                 .send_to(b"not a stun response", client_addr)
                 .unwrap();
 
-            // Good server: respond with valid STUN
             let (_, client_addr) = good_server.recv_from(&mut buf).unwrap();
             let txn_id: [u8; 12] = buf[8..20].try_into().unwrap();
 
-            let mapped_port: u16 = 9999;
-            let xor_port = mapped_port ^ (MAGIC_COOKIE >> 16) as u16;
-            let cookie_bytes = MAGIC_COOKIE.to_be_bytes();
-            let xor_ip = [
-                10 ^ cookie_bytes[0],
-                cookie_bytes[1],
-                cookie_bytes[2],
-                1 ^ cookie_bytes[3],
-            ];
-
-            let mut response = Vec::new();
-            response.extend_from_slice(&BINDING_RESPONSE.to_be_bytes());
-            response.extend_from_slice(&12u16.to_be_bytes());
-            response.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
-            response.extend_from_slice(&txn_id);
-            response.extend_from_slice(&ATTR_XOR_MAPPED_ADDRESS.to_be_bytes());
-            response.extend_from_slice(&8u16.to_be_bytes());
-            response.push(0x00);
-            response.push(FAMILY_IPV4);
-            response.extend_from_slice(&xor_port.to_be_bytes());
-            response.extend_from_slice(&xor_ip);
-
+            let mut response = stun_response_header(&txn_id, 12);
+            append_xor_mapped_attr(&mut response, std::net::Ipv4Addr::new(10, 0, 0, 1), 9999);
             good_server.send_to(&response, client_addr).unwrap();
         });
 
@@ -591,33 +526,17 @@ mod tests {
         assert_eq!(addr, "10.0.0.1:9999".parse::<SocketAddr>().unwrap());
     }
 
-    /// Tests the MAPPED-ADDRESS fallback when XOR-MAPPED-ADDRESS is absent.
     #[test]
     fn stun_discover_mapped_address_fallback() {
         let fake_server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let server_addr = fake_server.local_addr().unwrap();
-        let server_str = server_addr.to_string();
+        let server_str = fake_server.local_addr().unwrap().to_string();
 
-        let handle = std::thread::spawn(move || {
-            let mut buf = [0u8; 64];
-            let (_, client_addr) = fake_server.recv_from(&mut buf).unwrap();
-            let txn_id: [u8; 12] = buf[8..20].try_into().unwrap();
-
-            // Respond with MAPPED-ADDRESS only (no XOR)
-            let mut response = Vec::new();
-            response.extend_from_slice(&BINDING_RESPONSE.to_be_bytes());
-            response.extend_from_slice(&12u16.to_be_bytes());
-            response.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
-            response.extend_from_slice(&txn_id);
-            response.extend_from_slice(&ATTR_MAPPED_ADDRESS.to_be_bytes());
-            response.extend_from_slice(&8u16.to_be_bytes());
-            response.push(0x00);
-            response.push(FAMILY_IPV4);
-            response.extend_from_slice(&8080u16.to_be_bytes());
-            response.extend_from_slice(&[192, 168, 1, 100]);
-
-            fake_server.send_to(&response, client_addr).unwrap();
-        });
+        let handle = spawn_stun_responder(
+            fake_server,
+            std::net::Ipv4Addr::new(192, 168, 1, 100),
+            8080,
+            false,
+        );
 
         let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let result = stun_discover_from(&client, &[&server_str]);

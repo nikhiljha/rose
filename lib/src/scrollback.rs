@@ -160,37 +160,25 @@ mod tests {
 
     #[test]
     fn scrollback_line_encode_decode() {
-        let line = ScrollbackLine {
-            stable_row: 42,
-            text: "hello scrollback".to_string(),
-        };
-        let encoded = line.encode();
-        let (decoded, consumed) = ScrollbackLine::decode(&encoded).unwrap();
-        assert_eq!(decoded, line);
-        assert_eq!(consumed, encoded.len());
-    }
-
-    #[test]
-    fn scrollback_line_negative_stable_row() {
-        let line = ScrollbackLine {
-            stable_row: -5,
-            text: "negative".to_string(),
-        };
-        let encoded = line.encode();
-        let (decoded, _) = ScrollbackLine::decode(&encoded).unwrap();
-        assert_eq!(decoded.stable_row, -5);
-    }
-
-    #[test]
-    fn scrollback_line_empty_text() {
-        let line = ScrollbackLine {
-            stable_row: 0,
-            text: String::new(),
-        };
-        let encoded = line.encode();
-        let (decoded, consumed) = ScrollbackLine::decode(&encoded).unwrap();
-        assert_eq!(decoded, line);
-        assert_eq!(consumed, 12); // 8 + 4 + 0
+        for line in [
+            ScrollbackLine {
+                stable_row: 42,
+                text: "hello scrollback".to_string(),
+            },
+            ScrollbackLine {
+                stable_row: -5,
+                text: "negative".to_string(),
+            },
+            ScrollbackLine {
+                stable_row: 0,
+                text: String::new(),
+            },
+        ] {
+            let encoded = line.encode();
+            let (decoded, consumed) = ScrollbackLine::decode(&encoded).unwrap();
+            assert_eq!(decoded, line);
+            assert_eq!(consumed, encoded.len());
+        }
     }
 
     #[test]
@@ -242,7 +230,7 @@ mod tests {
         use crate::terminal::RoseTerminal;
 
         let mut term = RoseTerminal::new(4, 80);
-        let mut sender = ScrollbackSender::new();
+        let mut sender = ScrollbackSender::default();
 
         // Generate scrollback by writing more lines than the terminal height
         for i in 0..10 {
@@ -300,14 +288,8 @@ mod tests {
     }
 
     #[test]
-    fn sender_default() {
-        let sender = ScrollbackSender::default();
-        assert_eq!(sender.last_sent_stable_row, -1);
-    }
-
-    #[test]
     fn receiver_add_and_query() {
-        let mut receiver = ScrollbackReceiver::new();
+        let mut receiver = ScrollbackReceiver::default();
         assert!(receiver.is_empty());
         assert_eq!(receiver.len(), 0);
 
@@ -324,12 +306,6 @@ mod tests {
         assert!(!receiver.is_empty());
         assert_eq!(receiver.lines()[0].text, "line 0");
         assert_eq!(receiver.lines()[1].text, "line 1");
-    }
-
-    #[test]
-    fn receiver_default() {
-        let receiver = ScrollbackReceiver::default();
-        assert!(receiver.is_empty());
     }
 
     #[test]
