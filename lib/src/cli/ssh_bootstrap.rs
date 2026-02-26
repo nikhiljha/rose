@@ -1,8 +1,6 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use crossterm::terminal;
-
 use super::client::{
     StunReconnectContext, client_session_loop_with_client, client_session_loop_with_conn,
 };
@@ -189,8 +187,7 @@ pub(super) async fn run_ssh_bootstrap(
 
     let _ = ssh.kill().await;
 
-    terminal::enable_raw_mode()?;
-    let _raw_guard = RawModeGuard;
+    let _raw_guard = RawModeGuard::enable()?;
 
     let client_config = config::build_client_config_with_cert(&server_cert_der, &client_cert)?;
 

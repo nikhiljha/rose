@@ -189,11 +189,60 @@ pub(super) fn rand_session_id() -> [u8; 16] {
 }
 
 /// RAII guard to restore terminal mode on drop.
-pub(super) struct RawModeGuard;
+///
+/// When the kitty keyboard protocol is available, it is automatically
+/// enabled on creation and disabled on drop.
+pub(super) struct RawModeGuard {
+    /// Whether the kitty keyboard protocol was enabled and needs to be popped.
+    kitty_enabled: bool,
+}
+
+impl RawModeGuard {
+    /// Enters raw mode and optionally enables the kitty keyboard protocol
+    /// if the terminal supports it. The protocol is automatically disabled
+    /// when the guard is dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if enabling raw mode fails.
+    pub(super) fn enable() -> anyhow::Result<Self> {
+        terminal::enable_raw_mode()?;
+        let kitty_enabled = enable_kitty_keyboard();
+        Ok(Self { kitty_enabled })
+    }
+}
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
+        if self.kitty_enabled {
+            let _ = crossterm::execute!(
+                std::io::stdout(),
+                crossterm::event::PopKeyboardEnhancementFlags
+            );
+        }
         let _ = terminal::disable_raw_mode();
+    }
+}
+
+/// Attempts to enable the kitty keyboard protocol for richer key events.
+///
+/// Returns `true` if enhancement was successfully pushed, `false` otherwise
+/// (e.g. terminal does not support the protocol).
+///
+/// COVERAGE: Requires a real terminal to test keyboard enhancement detection.
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn enable_kitty_keyboard() -> bool {
+    if terminal::supports_keyboard_enhancement().unwrap_or(false) {
+        crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::PushKeyboardEnhancementFlags(
+                crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | crossterm::event::KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+            )
+        )
+        .is_ok()
+    } else {
+        false
     }
 }
 

@@ -117,8 +117,7 @@ pub(super) async fn run_client(
         config::build_client_config_with_cert(&cert_der, &client_cert)?
     };
 
-    terminal::enable_raw_mode()?;
-    let _raw_guard = RawModeGuard;
+    let _raw_guard = RawModeGuard::enable()?;
 
     client_session_loop(addr, host, client_config).await
 }
