@@ -33,14 +33,27 @@ steps:
     commands:
       - cargo +nightly llvm-cov-easy nextest --workspace --branch
       - cargo test --workspace --doc
+      - cargo +nightly llvm-cov report --codecov --output-path codecov.json
+      - curl https://keybase.io/codecovsecurity/pgp_keys.asc | gpg --no-default-keyring --keyring trustedkeys.gpg --import
+      - curl -Os https://cli.codecov.io/latest/linux/codecov
+      - curl -Os https://cli.codecov.io/latest/linux/codecov.SHA256SUM
+      - curl -Os https://cli.codecov.io/latest/linux/codecov.SHA256SUM.sig
+      - gpgv codecov.SHA256SUM.sig codecov.SHA256SUM
+      - sha256sum -c codecov.SHA256SUM
+      - chmod +x codecov
+      - ./codecov upload-process --fail-on-error -t "$CODECOV_TOKEN" -f codecov.json
     if_changed:
       - "**.rs"
       - Cargo.toml
       - Cargo.lock
+    secrets:
+      - CODECOV_TOKEN
     plugins:
       - docker#v5.11.0:
           image: "ghcr.io/nikhiljha/rose-ci:latest"
           mount-checkout: true
+          environment:
+            - CODECOV_TOKEN
 
   - label: ":shield: Security"
     command: cargo deny check
