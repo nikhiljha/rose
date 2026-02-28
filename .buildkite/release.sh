@@ -10,7 +10,6 @@ set -euo pipefail
 #   GITHUB_TOKEN    - A GitHub token with permission to create releases
 
 TAG="${BUILDKITE_TAG:?BUILDKITE_TAG is required}"
-VERSION="${TAG#v}"
 
 BINARY_NAME="rose"
 CRATE_NAME="rose-cli"
@@ -124,17 +123,19 @@ done
 # ---------------------------------------------------------------------------
 echo "--- :github: Creating GitHub release"
 
-RELEASE_JSON=$(python3 -c "
-import json
-meta = json.load(open('/tmp/release_meta.json'))
+export RELEASE_TAG="$TAG"
+RELEASE_JSON=$(python3 << 'PYEOF'
+import json, os
+meta = json.load(open("/tmp/release_meta.json"))
 print(json.dumps({
-    'tag_name': '${TAG}',
-    'name': meta['title'],
-    'body': meta['body'],
-    'draft': False,
-    'prerelease': False,
+    "tag_name": os.environ["RELEASE_TAG"],
+    "name": meta["title"],
+    "body": meta["body"],
+    "draft": False,
+    "prerelease": False,
 }))
-")
+PYEOF
+)
 
 RESPONSE=$(curl -sSf \
     -X POST \
