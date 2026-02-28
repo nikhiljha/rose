@@ -53,6 +53,19 @@ steps:
           image: "ghcr.io/nikhiljha/rose-ci:latest"
           mount-checkout: true
 
+  - label: ":rocket: Release"
+    if: build.tag != null
+    command: bash .buildkite/release.sh
+    secrets:
+      - GITHUB_TOKEN
+    plugins:
+      - docker#v5.11.0:
+          image: "ghcr.io/nikhiljha/rose-ci:latest"
+          mount-checkout: true
+          environment:
+            - GITHUB_TOKEN
+            - BUILDKITE_TAG
+
   - label: ":zap: Build & Deploy Site"
     if: build.branch == "main" && build.pull_request.id == null
     if_changed:

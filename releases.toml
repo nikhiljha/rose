@@ -1,0 +1,15 @@
+# Release metadata for GitHub releases.
+#
+# When a new git tag is pushed, the CI will look up the tag in this file
+# and use the metadata to create a GitHub release with cross-compiled binaries.
+#
+# Format:
+#   ["vX.Y.Z"]
+#   title = "Release Title"
+#   blurb = "Short description that appears at the top of the release notes."
+#
+#   # Optional callouts for important notices (renders as GitHub admonitions)
+#   # Supported kinds: note, tip, important, warning, caution
+#   [["vX.Y.Z".callouts]]
+#   kind = "warning"
+#   text = "Description of the callout."
