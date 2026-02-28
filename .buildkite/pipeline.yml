@@ -33,14 +33,20 @@ steps:
     commands:
       - cargo +nightly llvm-cov-easy nextest --workspace --branch
       - cargo test --workspace --doc
+      - cargo +nightly llvm-cov report --codecov --output-path codecov.json
+      - codecov upload-process --fail-on-error -t "$CODECOV_TOKEN" -f codecov.json
     if_changed:
       - "**.rs"
       - Cargo.toml
       - Cargo.lock
+    secrets:
+      - CODECOV_TOKEN
     plugins:
       - docker#v5.11.0:
           image: "ghcr.io/nikhiljha/rose-ci:latest"
           mount-checkout: true
+          environment:
+            - CODECOV_TOKEN
 
   - label: ":shield: Security"
     command: cargo deny check
