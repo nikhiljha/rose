@@ -370,9 +370,10 @@ impl RoseTerminal {
             let phys = screen.phys_row(row as i64);
             let phys_lines = screen.lines_in_phys_range(phys..phys + 1);
             if let Some(line) = phys_lines.first()
-                && line.changed_since(seqno) {
-                    self.cached_rows[row] = format_line_cells(line);
-                }
+                && line.changed_since(seqno)
+            {
+                self.cached_rows[row] = format_line_cells(line);
+            }
         }
 
         self.last_seqno = self.inner.current_seqno();
