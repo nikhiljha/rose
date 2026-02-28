@@ -250,6 +250,10 @@ async fn client_session_loop_inner(
     const MAX_INITIAL_RETRIES: u32 = 10;
     let mut initial_retries: u32 = 0;
 
+    // Persistent client screen state across reconnects so the user sees
+    // the last known content instead of a blank screen while reconnecting.
+    let mut prev_client_screen: Option<ScreenState> = None;
+
     let (key_tx, key_rx) = tokio::sync::mpsc::unbounded_channel();
     let key_rx = Arc::new(tokio::sync::Mutex::new(key_rx));
     std::thread::spawn(move || {
@@ -427,20 +431,27 @@ async fn client_session_loop_inner(
             }
         }
 
-        if session_id.is_some() && backoff > Duration::from_millis(100) {
+        let is_reconnect = session_id.is_some() && backoff > Duration::from_millis(100);
+        if is_reconnect {
             tracing::info!("reconnected");
         } else {
             tracing::info!("connected");
         }
 
-        {
+        // Only clear the screen on first connect. On reconnect, preserve
+        // the last known content so the user doesn't see a blank screen.
+        if prev_client_screen.is_none() {
             let mut stdout = std::io::stdout();
             let _ = stdout.write_all(b"\x1b[3J\x1b[2J\x1b[H");
             let _ = stdout.flush();
         }
 
         let receiver = Arc::new(Mutex::new(SspReceiver::new(rows)));
-        let client_screen = Arc::new(Mutex::new(ScreenState::empty(rows)));
+        let client_screen = Arc::new(Mutex::new(
+            prev_client_screen
+                .take()
+                .unwrap_or_else(|| ScreenState::empty(rows)),
+        ));
 
         let scrollback_rx = Arc::new(Mutex::new(ScrollbackReceiver::new()));
         let rendered_sb_count = Arc::new(Mutex::new(0usize));
@@ -782,6 +793,14 @@ async fn client_session_loop_inner(
             }
             SessionExit::ConnectionLost => {
                 tracing::debug!("connection lost, reconnecting");
+                // Preserve the last rendered screen so it can be shown
+                // while reconnecting instead of a blank terminal.
+                prev_client_screen = Some(
+                    client_screen
+                        .lock()
+                        .expect("client screen lock poisoned")
+                        .clone(),
+                );
             }
         }
     }
