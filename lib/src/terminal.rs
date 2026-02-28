@@ -11,6 +11,9 @@ use wezterm_term::{
     Blink, CellAttributes, Intensity, Terminal, TerminalConfiguration, TerminalSize, Underline,
 };
 
+/// Monotonically increasing sequence number used by wezterm for dirty tracking.
+type SequenceNo = usize;
+
 use crate::ssp::ScreenState;
 
 /// Configuration for the wezterm terminal emulator.
@@ -173,8 +176,22 @@ fn format_line_cells(line: &wezterm_term::Line) -> String {
 }
 
 /// Wraps a wezterm [`Terminal`] for use in `RoSE`'s state synchronization.
+///
+/// Maintains an internal cache of ANSI-rendered rows so that [`snapshot`](RoseTerminal::snapshot)
+/// only re-renders rows that wezterm marks as changed (via [`SequenceNo`] dirty
+/// tracking). This avoids the cost of calling [`format_line_cells`] for every
+/// visible row on every frame.
 pub struct RoseTerminal {
     inner: Terminal,
+    /// Cached ANSI strings for each visible row, indexed by visible row number.
+    cached_rows: Vec<String>,
+    /// The wezterm [`SequenceNo`] at the time of the last snapshot.
+    /// Rows with a seqno newer than this value are dirty and need re-rendering.
+    last_seqno: SequenceNo,
+    /// The physical row index of visible row 0 at the time of the last
+    /// snapshot.  When the viewport scrolls, `phys_row(0)` increases and
+    /// we shift the cached rows to match before checking dirty flags.
+    last_phys_offset: usize,
 }
 
 impl RoseTerminal {
@@ -192,7 +209,12 @@ impl RoseTerminal {
 
         let terminal = Terminal::new(size, config, "RoSE", "0.1.0", Box::new(DummyWriter));
 
-        Self { inner: terminal }
+        Self {
+            inner: terminal,
+            cached_rows: vec![String::new(); rows as usize],
+            last_seqno: 0,
+            last_phys_offset: 0,
+        }
     }
 
     /// Feeds raw bytes (PTY output) into the terminal emulator.
@@ -202,6 +224,8 @@ impl RoseTerminal {
     }
 
     /// Resizes the terminal to the given dimensions.
+    ///
+    /// Invalidates the snapshot cache since all rows may have changed.
     pub fn resize(&mut self, rows: u16, cols: u16) {
         self.inner.resize(TerminalSize {
             rows: rows as usize,
@@ -210,6 +234,11 @@ impl RoseTerminal {
             pixel_height: 0,
             dpi: 0,
         });
+        // Invalidate cache: reset seqno so all rows are considered dirty,
+        // and resize the cache vector to match the new row count.
+        self.last_seqno = 0;
+        self.last_phys_offset = 0;
+        self.cached_rows = vec![String::new(); rows as usize];
     }
 
     /// Returns the text content of a single visible row.
@@ -291,17 +320,68 @@ impl RoseTerminal {
     /// Captures the current visible screen state as a [`ScreenState`].
     ///
     /// Each row includes ANSI SGR escape sequences for colors and attributes.
+    ///
+    /// Uses wezterm's [`SequenceNo`]-based dirty tracking to avoid
+    /// re-rendering rows that have not changed since the last snapshot.
+    /// Only rows where `Line::changed_since(last_seqno)` returns `true` are
+    /// passed through [`format_line_cells`]; all other rows reuse the cached
+    /// ANSI string from the previous call.
     #[must_use]
     #[tracing::instrument(level = "trace", skip_all)]
-    pub fn snapshot(&self) -> ScreenState {
+    pub fn snapshot(&mut self) -> ScreenState {
         let size = self.inner.get_size();
-        let mut rows = Vec::with_capacity(size.rows);
-        for row in 0..size.rows {
-            rows.push(self.line_ansi(row));
+        let screen = self.inner.screen();
+        let seqno = self.last_seqno;
+
+        // Compute the physical row offset for visible row 0.
+        let first_phys = screen.phys_row(0);
+
+        // Detect viewport scroll: if the physical offset of visible row 0
+        // has increased, the terminal has scrolled up. Shift the cache so
+        // that entries still correspond to the correct physical lines.
+        let scroll = first_phys.saturating_sub(self.last_phys_offset);
+        if scroll > 0 {
+            if scroll >= size.rows {
+                // Scrolled by more than a full screen — invalidate everything.
+                for row in &mut self.cached_rows {
+                    row.clear();
+                }
+            } else {
+                // Shift cached rows up by `scroll` positions.
+                self.cached_rows.rotate_left(scroll);
+                // The trailing rows that scrolled in are unknown — clear them
+                // so they are re-rendered below.
+                for row in &mut self.cached_rows[size.rows - scroll..] {
+                    row.clear();
+                }
+            }
         }
+
+        // Ensure the cache vector matches the current row count.
+        if self.cached_rows.len() != size.rows {
+            self.cached_rows.resize(size.rows, String::new());
+        }
+
+        // Re-render only rows whose underlying Line has been modified since
+        // the last snapshot. We iterate visible rows individually via
+        // `lines_in_phys_range(row..row+1)`, which safely handles scrollback
+        // pruning (unlike `with_phys_lines` over the full range).
+        for row in 0..size.rows {
+            let phys = screen.phys_row(row as i64);
+            let phys_lines = screen.lines_in_phys_range(phys..phys + 1);
+            if let Some(line) = phys_lines.first() {
+                if line.changed_since(seqno) {
+                    self.cached_rows[row] = format_line_cells(line);
+                }
+            }
+        }
+
+        self.last_seqno = self.inner.current_seqno();
+        self.last_phys_offset = first_phys;
+
         let (cx, cy) = self.cursor_pos();
         ScreenState {
-            rows,
+            rows: self.cached_rows.clone(),
             cursor_x: cx as u16,
             cursor_y: cy as u16,
         }

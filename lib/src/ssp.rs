@@ -718,7 +718,7 @@ impl Predictor {
 
     /// Returns the current predicted screen state.
     #[must_use]
-    pub fn predicted_state(&self) -> ScreenState {
+    pub fn predicted_state(&mut self) -> ScreenState {
         self.terminal.snapshot()
     }
 
