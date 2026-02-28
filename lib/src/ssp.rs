@@ -675,6 +675,14 @@ impl Predictor {
         }
     }
 
+    /// Sets the confirmed (baseline) state used for prediction.
+    ///
+    /// Call this on reconnect so that predictions start from the last
+    /// known screen content instead of an empty screen.
+    pub fn set_confirmed_state(&mut self, state: &ScreenState) {
+        self.confirmed_state = state.clone();
+    }
+
     /// Feeds a keystroke into the local terminal for prediction.
     ///
     /// Returns the predicted screen state after this keystroke.

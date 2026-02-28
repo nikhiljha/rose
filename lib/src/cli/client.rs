@@ -450,12 +450,17 @@ async fn client_session_loop_inner(
         }
 
         let receiver = Arc::new(Mutex::new(SspReceiver::new(rows)));
+        let prev_screen = prev_client_screen.take();
         let client_screen = Arc::new(Mutex::new(
-            prev_client_screen
-                .take()
+            prev_screen
+                .clone()
                 .unwrap_or_else(|| ScreenState::empty(rows)),
         ));
-        let predictor = Arc::new(Mutex::new(Predictor::new(rows, cols)));
+        let mut pred = Predictor::new(rows, cols);
+        if let Some(ref prev) = prev_screen {
+            pred.set_confirmed_state(prev);
+        }
+        let predictor = Arc::new(Mutex::new(pred));
 
         // Send any keystrokes buffered during reconnection backoff.
         for key_bytes in pending_keys.drain(..) {
