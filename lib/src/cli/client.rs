@@ -877,43 +877,85 @@ async fn wait_or_disconnect(
 ) -> bool {
     let deadline = tokio::time::Instant::now() + duration;
     let mut escape = EscapeState::Normal;
+    // Keys deferred while an escape sequence is in progress.
+    // Flushed to `pending_keys` when the sequence is abandoned.
+    let mut deferred: Vec<Vec<u8>> = Vec::new();
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
+            // Flush any deferred keys — the escape sequence was never
+            // completed so these are ordinary user input.
+            pending_keys.append(&mut deferred);
             return false;
         }
         tokio::select! {
             event = async { key_rx.lock().await.recv().await } => {
                 if let Some(Event::Key(ref key)) = event {
+                    let bytes = key_event_to_bytes(key);
                     match escape {
                         EscapeState::Normal => {
                             if key.code == KeyCode::Enter {
                                 escape = EscapeState::AfterEnter;
+                                // Defer the Enter — it might be the start
+                                // of an escape sequence.
+                                if !bytes.is_empty() {
+                                    deferred.push(bytes);
+                                }
+                            } else {
+                                // Normal key, buffer immediately.
+                                if !bytes.is_empty() {
+                                    pending_keys.push(bytes);
+                                }
                             }
                         }
                         EscapeState::AfterEnter => match key.code {
-                            KeyCode::Char('~') => escape = EscapeState::AfterTilde,
-                            KeyCode::Enter => {}
-                            _ => escape = EscapeState::Normal,
+                            KeyCode::Char('~') => {
+                                escape = EscapeState::AfterTilde;
+                                // Defer the ~ — it might be an escape prefix.
+                                if !bytes.is_empty() {
+                                    deferred.push(bytes);
+                                }
+                            }
+                            KeyCode::Enter => {
+                                // Another Enter — flush previous deferred
+                                // keys (they were real input) and defer
+                                // this new Enter.
+                                pending_keys.append(&mut deferred);
+                                if !bytes.is_empty() {
+                                    deferred.push(bytes);
+                                }
+                            }
+                            _ => {
+                                escape = EscapeState::Normal;
+                                // Escape abandoned — flush deferred keys
+                                // and buffer this key.
+                                pending_keys.append(&mut deferred);
+                                if !bytes.is_empty() {
+                                    pending_keys.push(bytes);
+                                }
+                            }
                         },
                         EscapeState::AfterTilde => {
                             if key.code == KeyCode::Char('.') {
+                                // Disconnect — discard deferred keys
+                                // (they were part of the escape sequence).
                                 return true;
                             }
+                            // Escape abandoned — flush deferred keys
+                            // and buffer this key.
                             escape = EscapeState::Normal;
+                            pending_keys.append(&mut deferred);
+                            if !bytes.is_empty() {
+                                pending_keys.push(bytes);
+                            }
                         }
-                    }
-                }
-                // Buffer non-escape keystrokes so they can be sent
-                // after reconnection instead of being lost.
-                if let Some(Event::Key(ref key)) = event {
-                    let bytes = key_event_to_bytes(key);
-                    if !bytes.is_empty() {
-                        pending_keys.push(bytes);
                     }
                 }
             }
             () = tokio::time::sleep(remaining) => {
+                // Flush any deferred keys — the escape sequence was
+                // never completed so these are ordinary user input.
+                pending_keys.append(&mut deferred);
                 return false;
             }
         }
