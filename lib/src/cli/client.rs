@@ -14,8 +14,8 @@ use crate::config::{self, CertKeyPair, RosePaths};
 use crate::protocol::{ClientSession, ControlMessage};
 use crate::scrollback::{self, ScrollbackLine, ScrollbackReceiver};
 use crate::ssp::{
-    DATAGRAM_KEYSTROKE, DATAGRAM_SSP_ACK, ScreenState, SspFrame, SspReceiver, render_diff_ansi,
-    render_full_redraw,
+    DATAGRAM_KEYSTROKE, DATAGRAM_SSP_ACK, Predictor, ScreenState, SspFrame, SspReceiver,
+    render_diff_ansi, render_full_redraw,
 };
 use crate::transport::QuicClient;
 
@@ -254,6 +254,9 @@ async fn client_session_loop_inner(
     // the last known content instead of a blank screen while reconnecting.
     let mut prev_client_screen: Option<ScreenState> = None;
 
+    // Keystrokes buffered during reconnection backoff so they are not lost.
+    let mut pending_keys: Vec<Vec<u8>> = Vec::new();
+
     let (key_tx, key_rx) = tokio::sync::mpsc::unbounded_channel();
     let key_rx = Arc::new(tokio::sync::Mutex::new(key_rx));
     std::thread::spawn(move || {
@@ -303,7 +306,7 @@ async fn client_session_loop_inner(
                         }
                         Ok(Err(e)) => {
                             tracing::debug!(?backoff, "STUN reconnect failed: {e}");
-                            if wait_or_disconnect(&key_rx, backoff).await {
+                            if wait_or_disconnect(&key_rx, backoff, &mut pending_keys).await {
                                 let mut stdout = std::io::stdout();
                                 let _ = stdout.write_all(b"\r\n[RoSE: disconnected]\r\n");
                                 let _ = stdout.flush();
@@ -314,7 +317,7 @@ async fn client_session_loop_inner(
                         }
                         Err(_) => {
                             tracing::debug!(?backoff, "STUN reconnect timed out");
-                            if wait_or_disconnect(&key_rx, backoff).await {
+                            if wait_or_disconnect(&key_rx, backoff, &mut pending_keys).await {
                                 let mut stdout = std::io::stdout();
                                 let _ = stdout.write_all(b"\r\n[RoSE: disconnected]\r\n");
                                 let _ = stdout.flush();
@@ -327,7 +330,7 @@ async fn client_session_loop_inner(
                 }
                 Err(e) => {
                     tracing::debug!(?backoff, "STUN rediscovery failed: {e}");
-                    if wait_or_disconnect(&key_rx, backoff).await {
+                    if wait_or_disconnect(&key_rx, backoff, &mut pending_keys).await {
                         let mut stdout = std::io::stdout();
                         let _ = stdout.write_all(b"\r\n[RoSE: disconnected]\r\n");
                         let _ = stdout.flush();
@@ -342,7 +345,7 @@ async fn client_session_loop_inner(
                 Ok(c) => c,
                 Err(e) => {
                     tracing::debug!(?backoff, "failed to create endpoint: {e}");
-                    if wait_or_disconnect(&key_rx, backoff).await {
+                    if wait_or_disconnect(&key_rx, backoff, &mut pending_keys).await {
                         let mut stdout = std::io::stdout();
                         let _ = stdout.write_all(b"\r\n[RoSE: disconnected]\r\n");
                         let _ = stdout.flush();
@@ -364,7 +367,7 @@ async fn client_session_loop_inner(
                 }
                 Ok(Err(e)) => {
                     eprintln!("[RoSE: {e}]");
-                    if wait_or_disconnect(&key_rx, backoff).await {
+                    if wait_or_disconnect(&key_rx, backoff, &mut pending_keys).await {
                         let mut stdout = std::io::stdout();
                         let _ = stdout.write_all(b"\r\n[RoSE: disconnected]\r\n");
                         let _ = stdout.flush();
@@ -375,7 +378,7 @@ async fn client_session_loop_inner(
                 }
                 Err(_) => {
                     eprintln!("[RoSE: connection timed out]");
-                    if wait_or_disconnect(&key_rx, backoff).await {
+                    if wait_or_disconnect(&key_rx, backoff, &mut pending_keys).await {
                         let mut stdout = std::io::stdout();
                         let _ = stdout.write_all(b"\r\n[RoSE: disconnected]\r\n");
                         let _ = stdout.flush();
@@ -394,7 +397,7 @@ async fn client_session_loop_inner(
                 Ok(s) => s,
                 Err(e) => {
                     tracing::debug!(?backoff, "reconnect handshake failed: {e}");
-                    if wait_or_disconnect(&key_rx, backoff).await {
+                    if wait_or_disconnect(&key_rx, backoff, &mut pending_keys).await {
                         let mut stdout = std::io::stdout();
                         let _ = stdout.write_all(b"\r\n[RoSE: disconnected]\r\n");
                         let _ = stdout.flush();
@@ -420,7 +423,7 @@ async fn client_session_loop_inner(
             }
             Ok(Ok(None) | Err(_)) | Err(_) => {
                 tracing::debug!(?backoff, "handshake timed out");
-                if wait_or_disconnect(&key_rx, backoff).await {
+                if wait_or_disconnect(&key_rx, backoff, &mut pending_keys).await {
                     let mut stdout = std::io::stdout();
                     let _ = stdout.write_all(b"\r\n[RoSE: disconnected]\r\n");
                     let _ = stdout.flush();
@@ -452,6 +455,18 @@ async fn client_session_loop_inner(
                 .take()
                 .unwrap_or_else(|| ScreenState::empty(rows)),
         ));
+        let predictor = Arc::new(Mutex::new(Predictor::new(rows, cols)));
+
+        // Send any keystrokes buffered during reconnection backoff.
+        for key_bytes in pending_keys.drain(..) {
+            let mut data = vec![DATAGRAM_KEYSTROKE];
+            data.extend_from_slice(&key_bytes);
+            let _ = session.connection().send_datagram(Bytes::from(data));
+            predictor
+                .lock()
+                .expect("predictor lock poisoned")
+                .predict_keystroke(&key_bytes);
+        }
 
         let scrollback_rx = Arc::new(Mutex::new(ScrollbackReceiver::new()));
         let rendered_sb_count = Arc::new(Mutex::new(0usize));
@@ -459,6 +474,7 @@ async fn client_session_loop_inner(
         let output_conn = session.connection().clone();
         let recv_dgram = Arc::clone(&receiver);
         let client_dgram = Arc::clone(&client_screen);
+        let pred_dgram = Arc::clone(&predictor);
         let sb_rx_dgram = Arc::clone(&scrollback_rx);
         let sb_count_dgram = Arc::clone(&rendered_sb_count);
         let output_task = tokio::spawn(async move {
@@ -485,6 +501,7 @@ async fn client_session_loop_inner(
                                         frame,
                                         &recv_dgram,
                                         &client_dgram,
+                                        &pred_dgram,
                                         &output_conn,
                                         &sb_rx_dgram,
                                         &sb_count_dgram,
@@ -498,6 +515,7 @@ async fn client_session_loop_inner(
                         maybe_render_scrollback(
                             &recv_dgram,
                             &client_dgram,
+                            &pred_dgram,
                             &sb_rx_dgram,
                             &sb_count_dgram,
                         );
@@ -509,6 +527,7 @@ async fn client_session_loop_inner(
         let stream_conn = session.connection().clone();
         let recv_stream = Arc::clone(&receiver);
         let client_stream = Arc::clone(&client_screen);
+        let pred_stream = Arc::clone(&predictor);
         let sb_rx_stream = Arc::clone(&scrollback_rx);
         let sb_count_stream = Arc::clone(&rendered_sb_count);
         let stream_task = tokio::spawn(async move {
@@ -531,6 +550,7 @@ async fn client_session_loop_inner(
                                         &frame,
                                         &recv_stream,
                                         &client_stream,
+                                        &pred_stream,
                                         &stream_conn,
                                         &sb_rx_stream,
                                         &sb_count_stream,
@@ -576,6 +596,8 @@ async fn client_session_loop_inner(
 
         let input_conn = session.connection().clone();
         let input_key_rx = Arc::clone(&key_rx);
+        let pred_input = Arc::clone(&predictor);
+        let client_input = Arc::clone(&client_screen);
         #[derive(Clone, Copy)]
         enum InputResult {
             Disconnect,
@@ -590,6 +612,27 @@ async fn client_session_loop_inner(
                 let mut data = vec![DATAGRAM_KEYSTROKE];
                 data.extend_from_slice(bytes);
                 conn.send_datagram(Bytes::from(data)).is_ok()
+            }
+
+            /// Feeds a keystroke to the predictor and renders the predicted
+            /// state to stdout so the user sees immediate local echo.
+            fn predict_and_render(
+                key_bytes: &[u8],
+                predictor: &Mutex<Predictor>,
+                client_screen: &Mutex<ScreenState>,
+            ) {
+                let predicted = predictor
+                    .lock()
+                    .expect("predictor lock poisoned")
+                    .predict_keystroke(key_bytes);
+                let mut screen = client_screen.lock().expect("client screen lock poisoned");
+                let ansi = render_diff_ansi(&screen, &predicted);
+                if !ansi.is_empty() {
+                    let mut out = std::io::BufWriter::new(std::io::stdout());
+                    let _ = out.write_all(&ansi);
+                    let _ = out.flush();
+                }
+                *screen = predicted;
             }
 
             loop {
@@ -608,8 +651,12 @@ async fn client_session_loop_inner(
                                     if !send_keys(&input_conn, &key_bytes) {
                                         break;
                                     }
-                                } else if !send_keys(&input_conn, &key_bytes) {
-                                    break;
+                                    predict_and_render(&key_bytes, &pred_input, &client_input);
+                                } else {
+                                    if !send_keys(&input_conn, &key_bytes) {
+                                        break;
+                                    }
+                                    predict_and_render(&key_bytes, &pred_input, &client_input);
                                 }
                             }
                             EscapeState::AfterEnter => {
@@ -619,11 +666,13 @@ async fn client_session_loop_inner(
                                     if !send_keys(&input_conn, &key_bytes) {
                                         break;
                                     }
+                                    predict_and_render(&key_bytes, &pred_input, &client_input);
                                 } else {
                                     escape = EscapeState::Normal;
                                     if !send_keys(&input_conn, &key_bytes) {
                                         break;
                                     }
+                                    predict_and_render(&key_bytes, &pred_input, &client_input);
                                 }
                             }
                             EscapeState::AfterTilde => match key.code {
@@ -638,6 +687,7 @@ async fn client_session_loop_inner(
                                     if !send_keys(&input_conn, b"~") {
                                         break;
                                     }
+                                    predict_and_render(b"~", &pred_input, &client_input);
                                 }
                                 crossterm::event::KeyCode::Char('?') => {
                                     let mut stdout = std::io::stdout();
@@ -659,6 +709,8 @@ async fn client_session_loop_inner(
                                     if !send_keys(&input_conn, &key_bytes) {
                                         break;
                                     }
+                                    predict_and_render(b"~", &pred_input, &client_input);
+                                    predict_and_render(&key_bytes, &pred_input, &client_input);
                                 }
                             },
                         }
@@ -672,6 +724,7 @@ async fn client_session_loop_inner(
         });
 
         let check_conn = session.connection().clone();
+        let pred_ctrl = Arc::clone(&predictor);
 
         let control_task = tokio::spawn(async move {
             let mut last_size = (cols, rows);
@@ -683,6 +736,10 @@ async fn client_session_loop_inner(
                             && new_size != last_size
                         {
                             last_size = new_size;
+                            pred_ctrl
+                                .lock()
+                                .expect("predictor lock poisoned")
+                                .resize(new_size.1, new_size.0);
                             let msg = ControlMessage::Resize {
                                 rows: new_size.1,
                                 cols: new_size.0,
@@ -816,6 +873,7 @@ async fn client_session_loop_inner(
 async fn wait_or_disconnect(
     key_rx: &Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Event>>>,
     duration: Duration,
+    pending_keys: &mut Vec<Vec<u8>>,
 ) -> bool {
     let deadline = tokio::time::Instant::now() + duration;
     let mut escape = EscapeState::Normal;
@@ -826,7 +884,7 @@ async fn wait_or_disconnect(
         }
         tokio::select! {
             event = async { key_rx.lock().await.recv().await } => {
-                if let Some(Event::Key(key)) = event {
+                if let Some(Event::Key(ref key)) = event {
                     match escape {
                         EscapeState::Normal => {
                             if key.code == KeyCode::Enter {
@@ -844,6 +902,14 @@ async fn wait_or_disconnect(
                             }
                             escape = EscapeState::Normal;
                         }
+                    }
+                }
+                // Buffer non-escape keystrokes so they can be sent
+                // after reconnection instead of being lost.
+                if let Some(Event::Key(ref key)) = event {
+                    let bytes = key_event_to_bytes(key);
+                    if !bytes.is_empty() {
+                        pending_keys.push(bytes);
                     }
                 }
             }
@@ -893,6 +959,7 @@ fn do_full_redraw(
 fn maybe_render_scrollback(
     receiver: &Arc<Mutex<SspReceiver>>,
     client_screen: &Arc<Mutex<ScreenState>>,
+    predictor: &Arc<Mutex<Predictor>>,
     scrollback_rx: &Arc<Mutex<ScrollbackReceiver>>,
     rendered_sb_count: &Arc<Mutex<usize>>,
 ) {
@@ -908,11 +975,21 @@ fn maybe_render_scrollback(
     }
 
     let recv = receiver.lock().expect("receiver lock poisoned");
-    let state = recv.state().clone();
+    let server_state = recv.state().clone();
     drop(recv);
 
+    let display_state = predictor
+        .lock()
+        .expect("predictor lock poisoned")
+        .reconcile(&server_state);
+
     let mut screen = client_screen.lock().expect("client screen lock poisoned");
-    do_full_redraw(scrollback_rx, rendered_sb_count, &state, &mut screen);
+    do_full_redraw(
+        scrollback_rx,
+        rendered_sb_count,
+        &display_state,
+        &mut screen,
+    );
 }
 
 /// Processes an SSP frame: applies diff, renders to stdout, sends ACK.
@@ -929,6 +1006,7 @@ fn process_ssp_frame(
     frame: &SspFrame,
     receiver: &Arc<Mutex<SspReceiver>>,
     client_screen: &Arc<Mutex<ScreenState>>,
+    predictor: &Arc<Mutex<Predictor>>,
     conn: &quinn::Connection,
     scrollback_rx: &Arc<Mutex<ScrollbackReceiver>>,
     rendered_sb_count: &Arc<Mutex<usize>>,
@@ -937,6 +1015,15 @@ fn process_ssp_frame(
     match recv.process_frame(frame) {
         Ok(Some(_)) => {
             let new_state = recv.state().clone();
+            let ack_num = recv.ack_num();
+            drop(recv);
+
+            // Reconcile server state with any active prediction.
+            let display_state = predictor
+                .lock()
+                .expect("predictor lock poisoned")
+                .reconcile(&new_state);
+
             let mut screen = client_screen.lock().expect("client screen lock poisoned");
 
             let needs_full_redraw = {
@@ -944,20 +1031,25 @@ fn process_ssp_frame(
                 let count = rendered_sb_count
                     .lock()
                     .expect("rendered count lock poisoned");
-                sb.len() != *count || new_state.rows.len() != screen.rows.len()
+                sb.len() != *count || display_state.rows.len() != screen.rows.len()
             };
 
             if needs_full_redraw {
-                do_full_redraw(scrollback_rx, rendered_sb_count, &new_state, &mut screen);
+                do_full_redraw(
+                    scrollback_rx,
+                    rendered_sb_count,
+                    &display_state,
+                    &mut screen,
+                );
             } else {
-                let ansi = render_diff_ansi(&screen, &new_state);
+                let ansi = render_diff_ansi(&screen, &display_state);
                 let mut out = std::io::BufWriter::new(std::io::stdout());
                 let _ = out.write_all(&ansi);
                 let _ = out.flush();
-                *screen = new_state;
+                *screen = display_state;
             }
 
-            let ack = SspFrame::ack_only(recv.ack_num());
+            let ack = SspFrame::ack_only(ack_num);
             let mut ack_data = vec![DATAGRAM_SSP_ACK];
             ack_data.extend_from_slice(&ack.encode());
             let _ = conn.send_datagram(Bytes::from(ack_data));
