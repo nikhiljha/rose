@@ -261,6 +261,16 @@ async fn reattach_session(
     {
         let mut sender = detached.ssp_sender.lock().expect("sender lock poisoned");
         *sender = SspSender::new();
+
+        // Push the current terminal state so the retransmit loop has a frame
+        // to send immediately. Without this, a reconnecting client sees a
+        // blank screen until the PTY produces new output.
+        let state = detached
+            .terminal
+            .lock()
+            .expect("terminal lock poisoned")
+            .snapshot();
+        sender.push_state(state);
     }
 
     Ok((
