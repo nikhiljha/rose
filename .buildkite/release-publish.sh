@@ -26,7 +26,8 @@ echo "--- :arrow_down: Downloading build artifacts"
 
 mkdir -p dist
 buildkite-agent artifact download "dist/*.tar.gz" . --step build-linux
-buildkite-agent artifact download "dist/*.tar.gz" . --step build-macos
+# macOS artifacts are optional — only available when a macOS agent is configured
+buildkite-agent artifact download "dist/*.tar.gz" . --step build-macos 2>/dev/null || echo "No macOS artifacts (macOS build step not configured)"
 
 echo "Collected artifacts:"
 ls -lh dist/

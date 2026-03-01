@@ -66,20 +66,25 @@ steps:
           environment:
             - BUILDKITE_TAG
 
-  - label: ":apple: Build macOS Release"
-    key: "build-macos"
-    if: build.tag != null
-    command: bash .buildkite/release-build-macos.sh
-    artifact_paths:
-      - "dist/*.tar.gz"
-    agents:
-      queue: "macos"
+  # To enable macOS builds:
+  # 1. Create a "macos" queue in your Buildkite cluster
+  # 2. Connect a macOS agent to that queue (only needs Rust installed)
+  # 3. Uncomment the step below and add "build-macos" to the publish depends_on
+  #
+  # - label: ":apple: Build macOS Release"
+  #   key: "build-macos"
+  #   if: build.tag != null
+  #   command: bash .buildkite/release-build-macos.sh
+  #   artifact_paths:
+  #     - "dist/*.tar.gz"
+  #   agents:
+  #     queue: "macos"
 
   - label: ":rocket: Publish GitHub Release"
     if: build.tag != null
     depends_on:
       - "build-linux"
-      - "build-macos"
+      # - "build-macos"  # uncomment when macOS queue is available
     command: bash .buildkite/release-publish.sh
     secrets:
       - GITHUB_TOKEN
