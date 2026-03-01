@@ -4,6 +4,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 ///
 /// Detects `Enter ~ .` to disconnect, `Enter ~ ~` to send literal `~`,
 /// and `Enter ~ ?` for help.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum EscapeState {
     /// No escape sequence in progress.
     Normal,

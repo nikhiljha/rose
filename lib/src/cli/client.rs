@@ -872,53 +872,64 @@ async fn wait_or_disconnect(
         tokio::select! {
             event = async { key_rx.lock().await.recv().await } => {
                 if let Some(Event::Key(ref key)) = event {
-                    match process_key_event(&mut escape, key) {
-                        KeyAction::SendAndPredict(bytes) => {
-                            // Check if this key starts a new escape
-                            // sequence (Enter → AfterEnter).
-                            if matches!(escape, EscapeState::AfterEnter) {
-                                // The Enter was sent AND started an
-                                // escape — defer it.
-                                pending_keys.append(&mut deferred);
+                    let prev_escape = escape;
+                    let action = process_key_event(&mut escape, key);
+
+                    match action {
+                        KeyAction::Consumed => {
+                            // Tilde consumed while entering AfterTilde.
+                            // Defer it so it's not lost on timeout.
+                            let bytes = super::input::key_event_to_bytes(key);
+                            if !bytes.is_empty() {
                                 deferred.push(bytes);
-                            } else {
-                                // Normal key or escape-abandoned key.
-                                pending_keys.append(&mut deferred);
-                                pending_keys.push(bytes);
                             }
                         }
-                        KeyAction::Consumed => {
-                            // Tilde consumed by escape FSM. Do NOT
-                            // defer it — SendMultipleAndPredict already
-                            // includes the tilde in its payload when
-                            // the escape is abandoned. For completed
-                            // escapes (Disconnect/Detach/ShowHelp) the
-                            // tilde is intentionally discarded.
-                        }
                         KeyAction::Disconnect => {
-                            // Discard deferred keys — they were part
-                            // of the escape sequence.
+                            // Complete escape — discard all deferred.
                             return true;
                         }
                         KeyAction::Detach => {
-                            // During backoff we treat detach the same
-                            // as disconnect.
+                            // During backoff treat detach = disconnect.
                             return true;
                         }
-                        KeyAction::SendMultipleAndPredict(byte_seqs) => {
-                            // Escape abandoned — flush deferred + all
-                            // the byte sequences.
+                        KeyAction::ShowHelp => {
+                            // Complete escape — Enter is real input,
+                            // tilde is part of the escape. Pop the
+                            // tilde (last deferred) and flush the rest.
+                            deferred.pop();
                             pending_keys.append(&mut deferred);
-                            for bytes in byte_seqs {
+                        }
+                        KeyAction::SendAndPredict(bytes) => {
+                            if matches!(prev_escape, EscapeState::AfterTilde) {
+                                // Was in AfterTilde → completed ~~ escape.
+                                // The deferred tilde is consumed by the
+                                // escape; only the literal tilde (bytes)
+                                // should be sent. Pop the deferred tilde
+                                // and flush remaining deferred + bytes.
+                                deferred.pop();
+                                pending_keys.append(&mut deferred);
+                                pending_keys.push(bytes);
+                            } else if matches!(escape, EscapeState::AfterEnter) {
+                                // Enter that starts a new escape — flush
+                                // any prior deferred keys and defer this.
+                                pending_keys.append(&mut deferred);
+                                deferred.push(bytes);
+                            } else {
+                                // Normal key — flush deferred + this key.
+                                pending_keys.append(&mut deferred);
                                 pending_keys.push(bytes);
                             }
                         }
-                        KeyAction::ShowHelp => {
-                            // Help is a complete escape — flush
-                            // deferred Enter (real input) but the
-                            // tilde was already excluded from
-                            // deferred by the Consumed handler.
+                        KeyAction::SendMultipleAndPredict(byte_seqs) => {
+                            // Escape abandoned from AfterTilde. The
+                            // tilde in deferred is real input and is
+                            // also in byte_seqs[0]. Flush deferred
+                            // (which has it) and skip the duplicate
+                            // from byte_seqs.
                             pending_keys.append(&mut deferred);
+                            for bytes in byte_seqs.into_iter().skip(1) {
+                                pending_keys.push(bytes);
+                            }
                         }
                     }
                 }
