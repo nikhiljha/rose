@@ -136,15 +136,17 @@ fn format_line_cells(line: &wezterm_term::Line) -> String {
         runs.push((cell_attrs, cell.str().to_string()));
     }
 
-    // Trim trailing spaces from the last default-attr run
-    if let Some(last) = runs.last_mut()
-        && last.0 == default_attrs
-    {
+    // Trim trailing whitespace from the end of the line, regardless of
+    // cell attributes.  Previously this only trimmed the last run when it
+    // had default attributes, which left "ghost spaces" visible when a
+    // colored prompt didn't reset SGR before the user's input area.
+    while let Some(last) = runs.last_mut() {
         let trimmed = last.1.trim_end().to_string();
         if trimmed.is_empty() {
-            runs.pop();
+            runs.pop(); // entire run was whitespace — drop it
         } else {
             last.1 = trimmed;
+            break; // found non-whitespace content — stop
         }
     }
 
@@ -1148,5 +1150,58 @@ mod tests {
         // Row 100 doesn't exist — should return empty string
         let ansi = term.line_ansi(100);
         assert!(ansi.is_empty());
+    }
+
+    // -- Regression tests: trailing-space trimming in format_line_cells ------
+
+    /// Regression: `format_line_cells` must trim trailing whitespace
+    /// regardless of cell attributes. When a colored prompt doesn't reset
+    /// attributes, backspace-echo spaces inherit the prompt's color.
+    /// Previously only default-attributed trailing spaces were trimmed,
+    /// leaving colored spaces visible as ghost characters.
+    #[test]
+    fn colored_trailing_spaces_are_trimmed() {
+        let mut term = RoseTerminal::new(24, 80);
+        // Green text followed by green trailing spaces
+        term.advance(b"\x1b[32mhi   \x1b[0m");
+        let snap = term.snapshot();
+        // Should be "\x1b[32mhi\x1b[0m" — NOT "\x1b[32mhi   \x1b[0m"
+        assert_eq!(
+            snap.rows[0], "\x1b[32mhi\x1b[0m",
+            "trailing spaces with non-default attrs must be trimmed"
+        );
+    }
+
+    /// Regression: backspace at a colored prompt must not leave ghost spaces.
+    ///
+    /// Simulates: colored prompt "$ " (green, no reset) → user types "ls" →
+    /// two BS echoes (\x08 \x08 each). After both backspaces the snapshot
+    /// should show only the prompt prefix, not "$ l " or "$   ".
+    #[test]
+    fn colored_prompt_backspace_no_ghost_spaces() {
+        let mut term = RoseTerminal::new(24, 80);
+
+        // Colored prompt without SGR reset
+        term.advance(b"\x1b[32m$ ");
+        // User types "ls" (inherits green)
+        term.advance(b"ls");
+        let before = term.snapshot();
+        assert_eq!(before.rows[0], "\x1b[32m$ ls\x1b[0m");
+
+        // First backspace echo (erase 's')
+        term.advance(b"\x08 \x08");
+        let after1 = term.snapshot();
+        assert_eq!(
+            after1.rows[0], "\x1b[32m$ l\x1b[0m",
+            "first backspace should leave '$ l', not '$ l '"
+        );
+
+        // Second backspace echo (erase 'l')
+        term.advance(b"\x08 \x08");
+        let after2 = term.snapshot();
+        assert_eq!(
+            after2.rows[0], "\x1b[32m$\x1b[0m",
+            "second backspace should leave '$', not '$   '"
+        );
     }
 }
