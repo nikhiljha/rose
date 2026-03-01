@@ -2,7 +2,7 @@
 //!
 //! Both the client and server embed a wezterm terminal emulator. The server
 //! interprets PTY output into screen state and computes diffs. The client
-//! maintains a local copy for display and keystroke prediction.
+//! maintains a local copy for display.
 
 use std::sync::Arc;
 
