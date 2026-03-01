@@ -33,7 +33,8 @@ pub(super) struct StunReconnectContext {
 /// Collects environment variables to forward from client to server.
 ///
 /// Includes `TERM`, `COLORTERM`, `LANG`, and all `LC_*` locale variables.
-/// Defaults `TERM` to `xterm-256color` if unset (matches wezterm-term capabilities).
+/// TERM is always set to `xterm-256color` because the server-side terminal
+/// emulator (wezterm-term) is xterm-256color compatible.
 ///
 /// COVERAGE: Only called from `client_session_loop` which is excluded from
 /// instrumented coverage (tested via e2e tests).
@@ -41,8 +42,7 @@ pub(super) struct StunReconnectContext {
 fn collect_env_vars() -> Vec<(String, String)> {
     let mut vars = Vec::new();
 
-    let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
-    vars.push(("TERM".to_string(), term));
+    vars.push(("TERM".to_string(), "xterm-256color".to_string()));
 
     for key in ["COLORTERM", "LANG"] {
         if let Ok(val) = std::env::var(key) {

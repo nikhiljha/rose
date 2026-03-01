@@ -639,3 +639,206 @@ async fn ssp_oversized_frame_via_stream() {
 
     server_task.abort();
 }
+
+// ---------------------------------------------------------------------------
+// Diagnostic: trace full pipeline matching REAL client code pattern
+// The real client uses ScreenState tracking (not a client terminal).
+// render_diff_ansi(&previous_ssp_state, &new_ssp_state) → ANSI to stdout.
+// We feed that ANSI into a client RoseTerminal to see what the user sees.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn backspace_real_client_flow() {
+    use rose::ssp::{ScreenState, SspReceiver, SspSender, render_diff_ansi};
+    use rose::terminal::RoseTerminal;
+
+    let rows: u16 = 24;
+    let cols: u16 = 80;
+
+    // Server side
+    let mut server_term = RoseTerminal::new(rows, cols);
+    let mut sender = SspSender::new();
+
+    // Client side: matches process_ssp_frame exactly
+    let mut receiver = SspReceiver::new(rows);
+    let mut client_screen = ScreenState::empty(rows);
+    // Real terminal to see what the user's terminal would show
+    let mut client_term = RoseTerminal::new(rows, cols);
+    client_term.advance(b"\x1b[2J\x1b[H");
+
+    // One SSP cycle matching the REAL client code
+    let ssp_cycle = |server_term: &mut RoseTerminal,
+                     sender: &mut SspSender,
+                     receiver: &mut SspReceiver,
+                     client_screen: &mut ScreenState,
+                     client_term: &mut RoseTerminal| {
+        let snap = server_term.snapshot();
+        sender.push_state(snap);
+        let frame = sender.generate_frame().expect("should have a frame");
+        receiver.process_frame(&frame).expect("frame should apply");
+        let new_state = receiver.state().clone();
+        // EXACTLY what the real client does:
+        let ansi = render_diff_ansi(client_screen, &new_state);
+        client_term.advance(&ansi);
+        *client_screen = new_state;
+        sender.process_ack(receiver.ack_num());
+    };
+
+    // PTY echoes "l"
+    server_term.advance(b"l");
+    ssp_cycle(
+        &mut server_term,
+        &mut sender,
+        &mut receiver,
+        &mut client_screen,
+        &mut client_term,
+    );
+
+    // PTY echoes "s"
+    server_term.advance(b"s");
+    ssp_cycle(
+        &mut server_term,
+        &mut sender,
+        &mut receiver,
+        &mut client_screen,
+        &mut client_term,
+    );
+
+    let server_snap = server_term.snapshot();
+    let client_text = client_term.line_text(0);
+    eprintln!(
+        "After 'ls': server={:?}, ssp={:?}, term={:?}",
+        server_snap.rows[0],
+        client_screen.rows[0],
+        client_text.trim_end()
+    );
+
+    // First backspace echo
+    server_term.advance(b"\x08 \x08");
+    ssp_cycle(
+        &mut server_term,
+        &mut sender,
+        &mut receiver,
+        &mut client_screen,
+        &mut client_term,
+    );
+
+    let server_snap = server_term.snapshot();
+    let client_text = client_term.line_text(0);
+    eprintln!(
+        "After 1st BS: server={:?}, ssp={:?}, term={:?}",
+        server_snap.rows[0],
+        client_screen.rows[0],
+        client_text.trim_end()
+    );
+
+    // Second backspace echo
+    server_term.advance(b"\x08 \x08");
+    ssp_cycle(
+        &mut server_term,
+        &mut sender,
+        &mut receiver,
+        &mut client_screen,
+        &mut client_term,
+    );
+
+    let server_snap = server_term.snapshot();
+    let client_text = client_term.line_text(0);
+    eprintln!(
+        "After 2nd BS: server={:?}, ssp={:?}, term={:?}",
+        server_snap.rows[0],
+        client_screen.rows[0],
+        client_text.trim_end()
+    );
+
+    // KEY ASSERTIONS
+    assert_eq!(server_snap.rows[0], "", "server should show empty row");
+    assert_eq!(
+        client_screen.rows[0], "",
+        "client SSP state should be empty"
+    );
+    assert_eq!(
+        client_text.trim_end(),
+        "",
+        "client terminal should show empty row (what user sees)"
+    );
+}
+
+#[test]
+fn left_arrow_insert_real_client_flow() {
+    use rose::ssp::{ScreenState, SspReceiver, SspSender, render_diff_ansi};
+    use rose::terminal::RoseTerminal;
+
+    let rows: u16 = 24;
+    let cols: u16 = 80;
+
+    let mut server_term = RoseTerminal::new(rows, cols);
+    let mut sender = SspSender::new();
+    let mut receiver = SspReceiver::new(rows);
+    let mut client_screen = ScreenState::empty(rows);
+    let mut client_term = RoseTerminal::new(rows, cols);
+    client_term.advance(b"\x1b[2J\x1b[H");
+
+    let ssp_cycle = |server_term: &mut RoseTerminal,
+                     sender: &mut SspSender,
+                     receiver: &mut SspReceiver,
+                     client_screen: &mut ScreenState,
+                     client_term: &mut RoseTerminal| {
+        let snap = server_term.snapshot();
+        sender.push_state(snap);
+        let frame = sender.generate_frame().expect("should have a frame");
+        receiver.process_frame(&frame).expect("frame should apply");
+        let new_state = receiver.state().clone();
+        let ansi = render_diff_ansi(client_screen, &new_state);
+        client_term.advance(&ansi);
+        *client_screen = new_state;
+        sender.process_ack(receiver.ack_num());
+    };
+
+    // PTY echoes "s"
+    server_term.advance(b"s");
+    ssp_cycle(
+        &mut server_term,
+        &mut sender,
+        &mut receiver,
+        &mut client_screen,
+        &mut client_term,
+    );
+
+    // Left arrow
+    server_term.advance(b"\x1b[D");
+    ssp_cycle(
+        &mut server_term,
+        &mut sender,
+        &mut receiver,
+        &mut client_screen,
+        &mut client_term,
+    );
+
+    // Shell inserts 'l' - redraws "ls" then moves cursor back
+    server_term.advance(b"ls\x08");
+    ssp_cycle(
+        &mut server_term,
+        &mut sender,
+        &mut receiver,
+        &mut client_screen,
+        &mut client_term,
+    );
+
+    let server_snap = server_term.snapshot();
+    let client_text = client_term.line_text(0);
+    eprintln!(
+        "After insert: server={:?}, ssp={:?}, term={:?}",
+        server_snap.rows[0],
+        client_screen.rows[0],
+        client_text.trim_end()
+    );
+
+    assert_eq!(server_snap.rows[0], "ls");
+    assert_eq!(client_screen.rows[0], "ls");
+    assert_eq!(
+        client_text.trim_end(),
+        "ls",
+        "client terminal should show 'ls', not 'sls'"
+    );
+}
