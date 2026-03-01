@@ -2,7 +2,7 @@
 title = "RoSE - Remote Shell Environment"
 +++
 
-[Mosh](https://mosh.org/) showed us that mobile-friendly remote terminals are possible, but its architecture limits what it can do. RoSE takes the same core ideas — local keystroke prediction, UDP-like unreliable transport, roaming support — and rebuilds them on modern foundations:
+[Mosh](https://mosh.org/) showed us that mobile-friendly remote terminals are possible, but its architecture limits what it can do. RoSE takes the same core ideas — UDP-like unreliable transport, roaming support — and rebuilds them on modern foundations:
 
 - **QUIC (RFC 9000) + Datagrams (RFC 9221):** Instead of a custom encrypted UDP protocol, RoSE uses QUIC. This gives us TLS 1.3 encryption for free, multiplexed reliable streams alongside unreliable datagrams, and standard X.509 certificate-based authentication. It also means RoSE servers can sit behind ordinary reverse proxies with SNI routing.
 - **wezterm terminal emulator:** Instead of a custom terminal emulator, RoSE embeds [wezterm](https://github.com/wez/wezterm)'s terminal emulation. This gives us full support for modern terminal features (true color, sixel, kitty graphics, etc.) without reinventing the wheel.

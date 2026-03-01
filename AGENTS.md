@@ -1,7 +1,3 @@
-# Version Control
-
-This project uses [Jujutsu (jj)](https://github.com/jj-vcs/jj) instead of raw git. Use `jj` commands for all version control operations (e.g., `jj describe`, `jj new`, `jj log`, `jj diff`). Do NOT use `git commit`, `git add`, etc.
-
 # Project Commands
 
 ## Building
