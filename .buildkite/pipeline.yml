@@ -47,6 +47,16 @@ steps:
           mount-checkout: true
           environment:
             - CODECOV_TOKEN
+            - BUILDKITE
+            - BUILDKITE_BRANCH
+            - BUILDKITE_BUILD_NUMBER
+            - BUILDKITE_BUILD_URL
+            - BUILDKITE_COMMIT
+            - BUILDKITE_JOB_ID
+            - BUILDKITE_ORGANIZATION_SLUG
+            - BUILDKITE_PIPELINE_SLUG
+            - BUILDKITE_PULL_REQUEST
+            - BUILDKITE_REPO
 
   - label: ":shield: Security"
     command: cargo deny check
