@@ -32,13 +32,14 @@ cargo --version
 # ---------------------------------------------------------------------------
 echo "--- :hammer: Building ${CRATE_NAME} for ${TARGET}"
 
-cargo build --release -p "$CRATE_NAME"
+rustup target add "$TARGET"
+cargo build --release --target "$TARGET" -p "$CRATE_NAME"
 
 mkdir -p dist
 
 ARCHIVE_DIR="${CRATE_NAME}-${TARGET}-${TAG}"
 mkdir -p "$ARCHIVE_DIR"
-cp "target/release/${BINARY_NAME}" "$ARCHIVE_DIR/"
+cp "target/${TARGET}/release/${BINARY_NAME}" "$ARCHIVE_DIR/"
 
 ARCHIVE_NAME="${ARCHIVE_DIR}.tar.gz"
 tar czf "dist/${ARCHIVE_NAME}" "$ARCHIVE_DIR"
