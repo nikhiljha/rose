@@ -4,6 +4,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 ///
 /// Detects `Enter ~ .` to disconnect, `Enter ~ ~` to send literal `~`,
 /// and `Enter ~ ?` for help.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum EscapeState {
     /// No escape sequence in progress.
     Normal,
@@ -11,6 +12,78 @@ pub(super) enum EscapeState {
     AfterEnter,
     /// Enter + `~` were pressed — waiting for `.`, `~`, or `?`.
     AfterTilde,
+}
+
+/// Action determined by the escape state machine for a single key event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum KeyAction {
+    /// Send the byte sequence to the server and feed it to the predictor.
+    SendAndPredict(Vec<u8>),
+    /// Send multiple byte sequences (e.g., deferred `~` plus the current key).
+    SendMultipleAndPredict(Vec<Vec<u8>>),
+    /// User requested disconnect (`Enter ~ .`).
+    Disconnect,
+    /// User requested detach (`Enter ~ d`).
+    Detach,
+    /// User requested escape help (`Enter ~ ?`).
+    ShowHelp,
+    /// Key was consumed by the escape state machine (no action needed).
+    Consumed,
+}
+
+/// Processes a key event through the escape state machine.
+///
+/// Returns the action to take. The caller is responsible for sending bytes,
+/// predicting, disconnecting, etc. based on the returned action.
+///
+/// The escape detection uses the actual bytes produced by [`key_event_to_bytes`]
+/// rather than raw key codes, so it works correctly regardless of whether the
+/// kitty keyboard protocol is active.
+pub(super) fn process_key_event(
+    escape: &mut EscapeState,
+    key: &crossterm::event::KeyEvent,
+) -> KeyAction {
+    let key_bytes = key_event_to_bytes(key);
+    if key_bytes.is_empty() {
+        return KeyAction::Consumed;
+    }
+
+    match *escape {
+        EscapeState::Normal => {
+            if key_bytes == [b'\r'] {
+                *escape = EscapeState::AfterEnter;
+            }
+            KeyAction::SendAndPredict(key_bytes)
+        }
+        EscapeState::AfterEnter => {
+            if key_bytes == [b'~'] {
+                *escape = EscapeState::AfterTilde;
+                KeyAction::Consumed
+            } else if key_bytes == [b'\r'] {
+                // Another Enter — stay in AfterEnter, send this one.
+                KeyAction::SendAndPredict(key_bytes)
+            } else {
+                *escape = EscapeState::Normal;
+                KeyAction::SendAndPredict(key_bytes)
+            }
+        }
+        EscapeState::AfterTilde => {
+            *escape = EscapeState::Normal;
+            if key_bytes == [b'.'] {
+                KeyAction::Disconnect
+            } else if key_bytes == [b'd'] {
+                KeyAction::Detach
+            } else if key_bytes == [b'~'] {
+                // `~~` sends a literal tilde.
+                KeyAction::SendAndPredict(b"~".to_vec())
+            } else if key_bytes == [b'?'] {
+                KeyAction::ShowHelp
+            } else {
+                // Escape abandoned — flush the deferred `~` and the current key.
+                KeyAction::SendMultipleAndPredict(vec![b"~".to_vec(), key_bytes])
+            }
+        }
+    }
 }
 
 /// Computes the xterm-style modifier parameter from crossterm key modifiers.
@@ -98,8 +171,20 @@ pub(super) fn key_event_to_bytes(key: &crossterm::event::KeyEvent) -> Vec<u8> {
 
     match key.code {
         KeyCode::Char(c) => {
+            // With the kitty keyboard protocol, Shift+<key> may be reported as
+            // the base (unshifted) character with SHIFT modifier, instead of the
+            // actual produced character.  Resolve the shifted character before
+            // encoding so both the server and the escape state machine see the
+            // correct bytes.
+            let resolved = if key.modifiers.contains(KeyModifiers::SHIFT)
+                && !key.modifiers.contains(KeyModifiers::CONTROL)
+            {
+                resolve_shifted_char(c)
+            } else {
+                c
+            };
             let mut buf = [0u8; 4];
-            let s = c.encode_utf8(&mut buf);
+            let s = resolved.encode_utf8(&mut buf);
             let char_bytes = s.as_bytes();
             // Alt+char: prefix ESC before the character bytes.
             // With kitty keyboard protocol, Alt+char arrives as a structured
@@ -129,6 +214,44 @@ pub(super) fn key_event_to_bytes(key: &crossterm::event::KeyEvent) -> Vec<u8> {
         KeyCode::Insert => csi_tilde("2", key.modifiers),
         KeyCode::F(n) => f_key_escape(n, key.modifiers),
         _ => vec![],
+    }
+}
+
+/// Resolves the shifted character for a base key on a US keyboard layout.
+///
+/// With the kitty keyboard protocol, Shift+key may be reported as the
+/// unshifted base character plus a SHIFT modifier. This function maps
+/// those base characters to their shifted counterparts so that byte
+/// encoding and escape-sequence detection work correctly.
+const fn resolve_shifted_char(base: char) -> char {
+    match base {
+        // Letters: lowercase -> uppercase
+        c if c.is_ascii_lowercase() => c.to_ascii_uppercase(),
+        // Number row
+        '`' => '~',
+        '1' => '!',
+        '2' => '@',
+        '3' => '#',
+        '4' => '$',
+        '5' => '%',
+        '6' => '^',
+        '7' => '&',
+        '8' => '*',
+        '9' => '(',
+        '0' => ')',
+        '-' => '_',
+        '=' => '+',
+        // Brackets and punctuation
+        '[' => '{',
+        ']' => '}',
+        '\\' => '|',
+        ';' => ':',
+        '\'' => '"',
+        ',' => '<',
+        '.' => '>',
+        '/' => '?',
+        // Already the shifted variant, or not a standard US key
+        other => other,
     }
 }
 
@@ -498,5 +621,256 @@ mod tests {
             KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL,
         );
         assert_eq!(key_event_to_bytes(&key), b"\x1b[1;8A");
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_shifted_char / kitty keyboard protocol SHIFT handling
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn shift_backtick_produces_tilde() {
+        // Kitty protocol: Shift+` reported as Char('`') + SHIFT → should produce ~
+        let key = crossterm::event::KeyEvent::new(KeyCode::Char('`'), KeyModifiers::SHIFT);
+        assert_eq!(key_event_to_bytes(&key), b"~");
+    }
+
+    #[test]
+    fn shift_letter_produces_uppercase() {
+        // Kitty protocol: Shift+a reported as Char('a') + SHIFT → should produce A
+        let key = crossterm::event::KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SHIFT);
+        assert_eq!(key_event_to_bytes(&key), b"A");
+    }
+
+    #[test]
+    fn shift_number_row_produces_symbols() {
+        let cases = [
+            ('1', b"!" as &[u8]),
+            ('2', b"@"),
+            ('3', b"#"),
+            ('4', b"$"),
+            ('5', b"%"),
+            ('6', b"^"),
+            ('7', b"&"),
+            ('8', b"*"),
+            ('9', b"("),
+            ('0', b")"),
+            ('-', b"_"),
+            ('=', b"+"),
+        ];
+        for (base, expected) in cases {
+            let key = crossterm::event::KeyEvent::new(KeyCode::Char(base), KeyModifiers::SHIFT);
+            assert_eq!(
+                key_event_to_bytes(&key),
+                expected,
+                "Shift+{base} should produce {:?}",
+                std::str::from_utf8(expected).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn shift_punctuation_produces_shifted() {
+        let cases = [
+            ('[', b"{" as &[u8]),
+            (']', b"}"),
+            ('\\', b"|"),
+            (';', b":"),
+            ('\'', b"\""),
+            (',', b"<"),
+            ('.', b">"),
+            ('/', b"?"),
+        ];
+        for (base, expected) in cases {
+            let key = crossterm::event::KeyEvent::new(KeyCode::Char(base), KeyModifiers::SHIFT);
+            assert_eq!(
+                key_event_to_bytes(&key),
+                expected,
+                "Shift+{base} should produce {:?}",
+                std::str::from_utf8(expected).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn already_shifted_char_passes_through() {
+        // If crossterm reports the shifted char directly (no SHIFT), pass through.
+        let key = crossterm::event::KeyEvent::new(KeyCode::Char('~'), KeyModifiers::NONE);
+        assert_eq!(key_event_to_bytes(&key), b"~");
+    }
+
+    #[test]
+    fn shift_does_not_apply_when_ctrl_is_held() {
+        // Ctrl+Shift+a should still produce Ctrl+A (0x01), not uppercase 'A'.
+        // The Ctrl path takes precedence over shift resolution.
+        let key = crossterm::event::KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::SHIFT | KeyModifiers::CONTROL,
+        );
+        assert_eq!(key_event_to_bytes(&key), vec![1]); // Ctrl+A
+    }
+
+    // -----------------------------------------------------------------------
+    // process_key_event: escape state machine
+    // -----------------------------------------------------------------------
+
+    /// Helper to create a key event with no modifiers.
+    fn char_key(c: char) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    /// Helper to create a key event with SHIFT modifier (kitty protocol style).
+    fn shift_char_key(c: char) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT)
+    }
+
+    fn enter_key() -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn process_normal_char_sends_and_predicts() {
+        let mut escape = EscapeState::Normal;
+        let action = process_key_event(&mut escape, &char_key('a'));
+        assert_eq!(action, KeyAction::SendAndPredict(b"a".to_vec()));
+        assert!(matches!(escape, EscapeState::Normal));
+    }
+
+    #[test]
+    fn process_enter_transitions_to_after_enter() {
+        let mut escape = EscapeState::Normal;
+        let action = process_key_event(&mut escape, &enter_key());
+        assert_eq!(action, KeyAction::SendAndPredict(b"\r".to_vec()));
+        assert!(matches!(escape, EscapeState::AfterEnter));
+    }
+
+    #[test]
+    fn process_enter_tilde_period_disconnects() {
+        let mut escape = EscapeState::Normal;
+        // Enter
+        let _ = process_key_event(&mut escape, &enter_key());
+        assert!(matches!(escape, EscapeState::AfterEnter));
+        // ~
+        let action = process_key_event(&mut escape, &char_key('~'));
+        assert_eq!(action, KeyAction::Consumed);
+        assert!(matches!(escape, EscapeState::AfterTilde));
+        // .
+        let action = process_key_event(&mut escape, &char_key('.'));
+        assert_eq!(action, KeyAction::Disconnect);
+    }
+
+    #[test]
+    fn process_enter_tilde_d_detaches() {
+        let mut escape = EscapeState::Normal;
+        let _ = process_key_event(&mut escape, &enter_key());
+        let _ = process_key_event(&mut escape, &char_key('~'));
+        let action = process_key_event(&mut escape, &char_key('d'));
+        assert_eq!(action, KeyAction::Detach);
+    }
+
+    #[test]
+    fn process_enter_tilde_tilde_sends_literal_tilde() {
+        let mut escape = EscapeState::Normal;
+        let _ = process_key_event(&mut escape, &enter_key());
+        let _ = process_key_event(&mut escape, &char_key('~'));
+        let action = process_key_event(&mut escape, &char_key('~'));
+        assert_eq!(action, KeyAction::SendAndPredict(b"~".to_vec()));
+        assert!(matches!(escape, EscapeState::Normal));
+    }
+
+    #[test]
+    fn process_enter_tilde_question_shows_help() {
+        let mut escape = EscapeState::Normal;
+        let _ = process_key_event(&mut escape, &enter_key());
+        let _ = process_key_event(&mut escape, &char_key('~'));
+        let action = process_key_event(&mut escape, &char_key('?'));
+        assert_eq!(action, KeyAction::ShowHelp);
+        assert!(matches!(escape, EscapeState::Normal));
+    }
+
+    #[test]
+    fn process_enter_tilde_other_flushes_deferred() {
+        let mut escape = EscapeState::Normal;
+        let _ = process_key_event(&mut escape, &enter_key());
+        let _ = process_key_event(&mut escape, &char_key('~'));
+        let action = process_key_event(&mut escape, &char_key('x'));
+        assert_eq!(
+            action,
+            KeyAction::SendMultipleAndPredict(vec![b"~".to_vec(), b"x".to_vec()])
+        );
+        assert!(matches!(escape, EscapeState::Normal));
+    }
+
+    #[test]
+    fn process_enter_enter_stays_in_after_enter() {
+        let mut escape = EscapeState::Normal;
+        let _ = process_key_event(&mut escape, &enter_key());
+        let action = process_key_event(&mut escape, &enter_key());
+        // Second Enter is sent and we stay in AfterEnter.
+        assert_eq!(action, KeyAction::SendAndPredict(b"\r".to_vec()));
+        assert!(matches!(escape, EscapeState::AfterEnter));
+    }
+
+    #[test]
+    fn process_after_enter_normal_key_resets() {
+        let mut escape = EscapeState::Normal;
+        let _ = process_key_event(&mut escape, &enter_key());
+        let action = process_key_event(&mut escape, &char_key('x'));
+        assert_eq!(action, KeyAction::SendAndPredict(b"x".to_vec()));
+        assert!(matches!(escape, EscapeState::Normal));
+    }
+
+    #[test]
+    fn process_unknown_key_consumed() {
+        let mut escape = EscapeState::Normal;
+        let key = crossterm::event::KeyEvent::new(KeyCode::Null, KeyModifiers::NONE);
+        let action = process_key_event(&mut escape, &key);
+        assert_eq!(action, KeyAction::Consumed);
+    }
+
+    // -----------------------------------------------------------------------
+    // Kitty protocol: escape sequence with SHIFT+base key
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn kitty_escape_shift_backtick_is_tilde() {
+        // With kitty protocol, ~ may arrive as Char('`') + SHIFT.
+        // The escape FSM should still recognize it as tilde.
+        let mut escape = EscapeState::Normal;
+        let _ = process_key_event(&mut escape, &enter_key());
+        assert!(matches!(escape, EscapeState::AfterEnter));
+
+        // Shift+backtick (kitty protocol for ~)
+        let action = process_key_event(&mut escape, &shift_char_key('`'));
+        assert_eq!(action, KeyAction::Consumed);
+        assert!(matches!(escape, EscapeState::AfterTilde));
+
+        // . to disconnect
+        let action = process_key_event(&mut escape, &char_key('.'));
+        assert_eq!(action, KeyAction::Disconnect);
+    }
+
+    #[test]
+    fn kitty_escape_shift_backtick_shift_backtick_sends_tilde() {
+        // Enter, ~(shift+`), ~(shift+`) → literal tilde
+        let mut escape = EscapeState::Normal;
+        let _ = process_key_event(&mut escape, &enter_key());
+        let _ = process_key_event(&mut escape, &shift_char_key('`'));
+        let action = process_key_event(&mut escape, &shift_char_key('`'));
+        assert_eq!(action, KeyAction::SendAndPredict(b"~".to_vec()));
+    }
+
+    #[test]
+    fn kitty_shift_period_produces_greater_than() {
+        // Shift+. → > (not a disconnect trigger)
+        let mut escape = EscapeState::Normal;
+        let _ = process_key_event(&mut escape, &enter_key());
+        let _ = process_key_event(&mut escape, &char_key('~'));
+        // Shift+. produces '>' which is NOT '.'
+        let action = process_key_event(&mut escape, &shift_char_key('.'));
+        // '>' is not a recognized escape character, so it flushes ~ and >
+        assert_eq!(
+            action,
+            KeyAction::SendMultipleAndPredict(vec![b"~".to_vec(), b">".to_vec()])
+        );
     }
 }

@@ -675,10 +675,25 @@ impl Predictor {
         }
     }
 
+    /// Sets the confirmed (baseline) state used for prediction.
+    ///
+    /// Call this on reconnect so that predictions start from the last
+    /// known screen content instead of an empty screen.
+    pub fn set_confirmed_state(&mut self, state: &ScreenState) {
+        self.confirmed_state = state.clone();
+    }
+
     /// Feeds a keystroke into the local terminal for prediction.
     ///
     /// Returns the predicted screen state after this keystroke.
+    /// On the first keystroke of a new prediction sequence, syncs the
+    /// local terminal to the last confirmed server state so the
+    /// prediction starts from the correct baseline.
     pub fn predict_keystroke(&mut self, data: &[u8]) -> ScreenState {
+        if !self.active {
+            let state = self.confirmed_state.clone();
+            self.sync_terminal(&state);
+        }
         self.terminal.advance(data);
         self.active = true;
         self.last_keystroke = std::time::Instant::now();
