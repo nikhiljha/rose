@@ -5,10 +5,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use crossterm::event::{Event, KeyCode};
+use crossterm::event::Event;
 use crossterm::terminal;
 
-use super::input::{EscapeState, key_event_to_bytes};
+use super::input::{EscapeState, KeyAction, key_event_to_bytes, process_key_event};
 use super::util::{RawModeGuard, extract_peer_cert, load_or_generate_client_cert};
 use crate::config::{self, CertKeyPair, RosePaths};
 use crate::protocol::{ClientSession, ControlMessage};
@@ -640,86 +640,57 @@ async fn client_session_loop_inner(
                 *screen = predicted;
             }
 
+            /// Sends bytes to the server and feeds them to the predictor.
+            /// Returns `false` if the connection is lost.
+            fn send_and_predict(
+                conn: &quinn::Connection,
+                bytes: &[u8],
+                predictor: &Mutex<Predictor>,
+                client_screen: &Mutex<ScreenState>,
+            ) -> bool {
+                if !send_keys(conn, bytes) {
+                    return false;
+                }
+                predict_and_render(bytes, predictor, client_screen);
+                true
+            }
+
             loop {
                 let event = input_key_rx.lock().await.recv().await;
                 match event {
-                    Some(Event::Key(key)) => {
-                        let key_bytes = key_event_to_bytes(&key);
-                        if key_bytes.is_empty() {
-                            continue;
+                    Some(Event::Key(key)) => match process_key_event(&mut escape, &key) {
+                        KeyAction::SendAndPredict(bytes) => {
+                            if !send_and_predict(&input_conn, &bytes, &pred_input, &client_input) {
+                                break;
+                            }
                         }
-
-                        match escape {
-                            EscapeState::Normal => {
-                                if key.code == crossterm::event::KeyCode::Enter {
-                                    escape = EscapeState::AfterEnter;
-                                    if !send_keys(&input_conn, &key_bytes) {
-                                        break;
-                                    }
-                                    predict_and_render(&key_bytes, &pred_input, &client_input);
-                                } else {
-                                    if !send_keys(&input_conn, &key_bytes) {
-                                        break;
-                                    }
-                                    predict_and_render(&key_bytes, &pred_input, &client_input);
+                        KeyAction::SendMultipleAndPredict(byte_seqs) => {
+                            for bytes in &byte_seqs {
+                                if !send_and_predict(&input_conn, bytes, &pred_input, &client_input)
+                                {
+                                    break;
                                 }
                             }
-                            EscapeState::AfterEnter => {
-                                if key.code == crossterm::event::KeyCode::Char('~') {
-                                    escape = EscapeState::AfterTilde;
-                                } else if key.code == crossterm::event::KeyCode::Enter {
-                                    if !send_keys(&input_conn, &key_bytes) {
-                                        break;
-                                    }
-                                    predict_and_render(&key_bytes, &pred_input, &client_input);
-                                } else {
-                                    escape = EscapeState::Normal;
-                                    if !send_keys(&input_conn, &key_bytes) {
-                                        break;
-                                    }
-                                    predict_and_render(&key_bytes, &pred_input, &client_input);
-                                }
-                            }
-                            EscapeState::AfterTilde => match key.code {
-                                crossterm::event::KeyCode::Char('.') => {
-                                    return InputResult::Disconnect;
-                                }
-                                crossterm::event::KeyCode::Char('d') => {
-                                    return InputResult::Detach;
-                                }
-                                crossterm::event::KeyCode::Char('~') => {
-                                    escape = EscapeState::Normal;
-                                    if !send_keys(&input_conn, b"~") {
-                                        break;
-                                    }
-                                    predict_and_render(b"~", &pred_input, &client_input);
-                                }
-                                crossterm::event::KeyCode::Char('?') => {
-                                    let mut stdout = std::io::stdout();
-                                    let _ = stdout.write_all(
-                                        b"\r\nSupported escape sequences:\r\n\
-                                              \x20 ~.  - disconnect\r\n\
-                                              \x20 ~d  - detach (session stays alive)\r\n\
-                                              \x20 ~~  - send literal ~\r\n\
-                                              \x20 ~?  - this help\r\n",
-                                    );
-                                    let _ = stdout.flush();
-                                    escape = EscapeState::Normal;
-                                }
-                                _ => {
-                                    escape = EscapeState::Normal;
-                                    if !send_keys(&input_conn, b"~") {
-                                        break;
-                                    }
-                                    if !send_keys(&input_conn, &key_bytes) {
-                                        break;
-                                    }
-                                    predict_and_render(b"~", &pred_input, &client_input);
-                                    predict_and_render(&key_bytes, &pred_input, &client_input);
-                                }
-                            },
                         }
-                    }
+                        KeyAction::Disconnect => {
+                            return InputResult::Disconnect;
+                        }
+                        KeyAction::Detach => {
+                            return InputResult::Detach;
+                        }
+                        KeyAction::ShowHelp => {
+                            let mut stdout = std::io::stdout();
+                            let _ = stdout.write_all(
+                                b"\r\nSupported escape sequences:\r\n\
+                                          \x20 ~.  - disconnect\r\n\
+                                          \x20 ~d  - detach (session stays alive)\r\n\
+                                          \x20 ~~  - send literal ~\r\n\
+                                          \x20 ~?  - this help\r\n",
+                            );
+                            let _ = stdout.flush();
+                        }
+                        KeyAction::Consumed => {}
+                    },
                     Some(Event::Resize(_, _)) => {}
                     None => break,
                     _ => {}
@@ -896,63 +867,50 @@ async fn wait_or_disconnect(
         tokio::select! {
             event = async { key_rx.lock().await.recv().await } => {
                 if let Some(Event::Key(ref key)) = event {
-                    let bytes = key_event_to_bytes(key);
-                    match escape {
-                        EscapeState::Normal => {
-                            if key.code == KeyCode::Enter {
-                                escape = EscapeState::AfterEnter;
-                                // Defer the Enter — it might be the start
-                                // of an escape sequence.
-                                if !bytes.is_empty() {
-                                    deferred.push(bytes);
-                                }
+                    match process_key_event(&mut escape, key) {
+                        KeyAction::SendAndPredict(bytes) => {
+                            // Check if this key starts a new escape
+                            // sequence (Enter → AfterEnter).
+                            if matches!(escape, EscapeState::AfterEnter) {
+                                // The Enter was sent AND started an
+                                // escape — defer it.
+                                pending_keys.append(&mut deferred);
+                                deferred.push(bytes);
                             } else {
-                                // Normal key, buffer immediately.
-                                if !bytes.is_empty() {
-                                    pending_keys.push(bytes);
-                                }
-                            }
-                        }
-                        EscapeState::AfterEnter => match key.code {
-                            KeyCode::Char('~') => {
-                                escape = EscapeState::AfterTilde;
-                                // Defer the ~ — it might be an escape prefix.
-                                if !bytes.is_empty() {
-                                    deferred.push(bytes);
-                                }
-                            }
-                            KeyCode::Enter => {
-                                // Another Enter — flush previous deferred
-                                // keys (they were real input) and defer
-                                // this new Enter.
+                                // Normal key or escape-abandoned key.
                                 pending_keys.append(&mut deferred);
-                                if !bytes.is_empty() {
-                                    deferred.push(bytes);
-                                }
-                            }
-                            _ => {
-                                escape = EscapeState::Normal;
-                                // Escape abandoned — flush deferred keys
-                                // and buffer this key.
-                                pending_keys.append(&mut deferred);
-                                if !bytes.is_empty() {
-                                    pending_keys.push(bytes);
-                                }
-                            }
-                        },
-                        EscapeState::AfterTilde => {
-                            if key.code == KeyCode::Char('.') {
-                                // Disconnect — discard deferred keys
-                                // (they were part of the escape sequence).
-                                return true;
-                            }
-                            // Escape abandoned — flush deferred keys
-                            // and buffer this key.
-                            escape = EscapeState::Normal;
-                            pending_keys.append(&mut deferred);
-                            if !bytes.is_empty() {
                                 pending_keys.push(bytes);
                             }
+                        }
+                        KeyAction::Consumed => {
+                            // Tilde consumed by escape FSM — defer it
+                            // in case the escape is abandoned.
+                            let bytes = key_event_to_bytes(key);
+                            if !bytes.is_empty() {
+                                deferred.push(bytes);
+                            }
+                        }
+                        KeyAction::Disconnect => {
+                            // Discard deferred keys — they were part
+                            // of the escape sequence.
+                            return true;
+                        }
+                        KeyAction::Detach => {
+                            // During backoff we treat detach the same
+                            // as disconnect.
+                            return true;
+                        }
+                        KeyAction::SendMultipleAndPredict(byte_seqs) => {
+                            // Escape abandoned — flush deferred + all
+                            // the byte sequences.
+                            pending_keys.append(&mut deferred);
+                            for bytes in byte_seqs {
+                                pending_keys.push(bytes);
+                            }
+                        }
+                        KeyAction::ShowHelp => {
+                            // Flush deferred keys (escape abandoned).
+                            pending_keys.append(&mut deferred);
                         }
                     }
                 }
