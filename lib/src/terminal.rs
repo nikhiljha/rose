@@ -115,8 +115,8 @@ fn push_color_sgr(color: ColorAttribute, is_fg: bool, codes: &mut Vec<String>) {
 }
 
 /// Formats a terminal [`Line`](wezterm_term::Line) with ANSI SGR escape
-/// sequences, preserving colors and text attributes. Trailing
-/// default-attributed whitespace is trimmed.
+/// sequences, preserving colors and text attributes. Trailing whitespace
+/// is trimmed regardless of cell attributes.
 ///
 /// Shared by [`RoseTerminal::line_ansi`] (visible rows) and
 /// [`RoseTerminal::scrollback_lines`] (scrollback history).
@@ -305,9 +305,9 @@ impl RoseTerminal {
     }
 
     /// Returns a single visible row with ANSI SGR escape sequences preserving
-    /// colors and text attributes. Trailing default-attributed whitespace is
-    /// trimmed. A final `\x1b[0m` reset is appended when attributes are active
-    /// at end-of-line.
+    /// colors and text attributes. Trailing whitespace is trimmed regardless
+    /// of cell attributes. A final `\x1b[0m` reset is appended when attributes
+    /// are active at end-of-line.
     #[must_use]
     pub fn line_ansi(&self, row: usize) -> String {
         let screen = self.inner.screen();
