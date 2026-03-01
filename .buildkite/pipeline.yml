@@ -53,9 +53,34 @@ steps:
           image: "ghcr.io/nikhiljha/rose-ci:latest"
           mount-checkout: true
 
-  - label: ":rocket: Release"
+  - label: ":linux: Build Linux Releases"
+    key: "build-linux"
     if: build.tag != null
-    command: bash .buildkite/release.sh
+    command: bash .buildkite/release-build-linux.sh
+    artifact_paths:
+      - "dist/*.tar.gz"
+    plugins:
+      - docker#v5.11.0:
+          image: "ghcr.io/nikhiljha/rose-ci:latest"
+          mount-checkout: true
+          environment:
+            - BUILDKITE_TAG
+
+  - label: ":apple: Build macOS Release"
+    key: "build-macos"
+    if: build.tag != null
+    command: bash .buildkite/release-build-macos.sh
+    artifact_paths:
+      - "dist/*.tar.gz"
+    agents:
+      queue: "macos"
+
+  - label: ":rocket: Publish GitHub Release"
+    if: build.tag != null
+    depends_on:
+      - "build-linux"
+      - "build-macos"
+    command: bash .buildkite/release-publish.sh
     secrets:
       - GITHUB_TOKEN
     plugins:
