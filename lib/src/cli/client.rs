@@ -8,7 +8,7 @@ use bytes::Bytes;
 use crossterm::event::Event;
 use crossterm::terminal;
 
-use super::input::{EscapeState, KeyAction, key_event_to_bytes, process_key_event};
+use super::input::{EscapeState, KeyAction, process_key_event};
 use super::util::{RawModeGuard, extract_peer_cert, load_or_generate_client_cert};
 use crate::config::{self, CertKeyPair, RosePaths};
 use crate::protocol::{ClientSession, ControlMessage};
@@ -665,11 +665,16 @@ async fn client_session_loop_inner(
                             }
                         }
                         KeyAction::SendMultipleAndPredict(byte_seqs) => {
+                            let mut lost = false;
                             for bytes in &byte_seqs {
                                 if !send_and_predict(&input_conn, bytes, &pred_input, &client_input)
                                 {
+                                    lost = true;
                                     break;
                                 }
+                            }
+                            if lost {
+                                break;
                             }
                         }
                         KeyAction::Disconnect => {
@@ -883,12 +888,12 @@ async fn wait_or_disconnect(
                             }
                         }
                         KeyAction::Consumed => {
-                            // Tilde consumed by escape FSM — defer it
-                            // in case the escape is abandoned.
-                            let bytes = key_event_to_bytes(key);
-                            if !bytes.is_empty() {
-                                deferred.push(bytes);
-                            }
+                            // Tilde consumed by escape FSM. Do NOT
+                            // defer it — SendMultipleAndPredict already
+                            // includes the tilde in its payload when
+                            // the escape is abandoned. For completed
+                            // escapes (Disconnect/Detach/ShowHelp) the
+                            // tilde is intentionally discarded.
                         }
                         KeyAction::Disconnect => {
                             // Discard deferred keys — they were part
@@ -909,7 +914,10 @@ async fn wait_or_disconnect(
                             }
                         }
                         KeyAction::ShowHelp => {
-                            // Flush deferred keys (escape abandoned).
+                            // Help is a complete escape — flush
+                            // deferred Enter (real input) but the
+                            // tilde was already excluded from
+                            // deferred by the Consumed handler.
                             pending_keys.append(&mut deferred);
                         }
                     }
