@@ -33,12 +33,19 @@ fn is_allowed_env_var(name: &str) -> bool {
 }
 
 /// Filters environment variables from the client, keeping only safe entries.
+///
+/// TERM is always forced to `xterm-256color` because the server-side terminal
+/// emulator (wezterm-term) is xterm-256color compatible.  Forwarding the
+/// client's real TERM (e.g. `xterm-ghostty`) would make the shell emit escape
+/// sequences that the emulator doesn't understand, causing rendering bugs.
 fn filter_env_vars(env_vars: &[(String, String)]) -> Vec<(String, String)> {
-    env_vars
+    let mut out: Vec<(String, String)> = env_vars
         .iter()
-        .filter(|(k, _)| is_allowed_env_var(k))
+        .filter(|(k, _)| is_allowed_env_var(k) && k != "TERM")
         .cloned()
-        .collect()
+        .collect();
+    out.push(("TERM".to_string(), "xterm-256color".to_string()));
+    out
 }
 
 /// COVERAGE: CLI server loop is tested via integration/e2e tests.
@@ -640,5 +647,39 @@ mod tests {
         let filtered = filter_env_vars(&input);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].0, "TERM");
+    }
+
+    #[test]
+    fn filter_env_vars_overrides_term_to_xterm_256color() {
+        // The server-side wezterm-term emulator is xterm-256color compatible.
+        // If the client forwards a different TERM (e.g. xterm-ghostty),
+        // the shell may emit escape sequences that wezterm-term doesn't
+        // understand, causing rendering bugs.
+        let input = vec![
+            ("TERM".into(), "xterm-ghostty".into()),
+            ("COLORTERM".into(), "truecolor".into()),
+        ];
+        let filtered = filter_env_vars(&input);
+        let term = filtered
+            .iter()
+            .find(|(k, _)| k == "TERM")
+            .expect("TERM must be present");
+        assert_eq!(
+            term.1, "xterm-256color",
+            "TERM must always be xterm-256color to match the server-side wezterm-term emulator"
+        );
+    }
+
+    #[test]
+    fn filter_env_vars_adds_term_when_missing() {
+        // Even if the client doesn't send TERM at all, the server should
+        // ensure it's set to xterm-256color for the PTY.
+        let input = vec![("LANG".into(), "en_US.UTF-8".into())];
+        let filtered = filter_env_vars(&input);
+        let term = filtered
+            .iter()
+            .find(|(k, _)| k == "TERM")
+            .expect("TERM must be present");
+        assert_eq!(term.1, "xterm-256color");
     }
 }

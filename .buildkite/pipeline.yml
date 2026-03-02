@@ -34,7 +34,7 @@ steps:
       - cargo +nightly llvm-cov-easy nextest --workspace --branch
       - cargo test --workspace --doc
       - cargo +nightly llvm-cov report --codecov --output-path codecov.json
-      - codecov upload-process --fail-on-error -t "$CODECOV_TOKEN" -f codecov.json
+      - codecov upload-process --fail-on-error -f codecov.json
     if_changed:
       - "**.rs"
       - Cargo.toml
