@@ -109,6 +109,16 @@ Heavily inspired by Mosh's State Synchronization Protocol (SSP), but not wire-co
 - Both sides track sequence numbers to know what state the other side has acknowledged.
 - Diffs are computed from the last acknowledged state, so lost datagrams are automatically superseded.
 
+### Viewport Identity
+
+Screen diffs may append a nine-byte viewport extension after the changed rows:
+`[alternate_screen: u8][first_row: u64 big-endian]`. The stable first-row index
+distinguishes actual scrolling from a redraw that happens to reuse row text.
+Clients only synthesize native scrolling when both snapshots identify movement
+within the primary screen and the overlapping rows match. Without this metadata,
+history arrives through the reliable scrollback stream. Older decoders ignore
+the extension; newer decoders accept frames without it.
+
 ### Session Persistence
 
 Sessions survive network changes (WiFi to cellular, IP address changes, NAT rebinding). The client automatically reconnects with exponential backoff (100ms to 5s) when the connection is lost. On reconnect:
@@ -117,6 +127,11 @@ Sessions survive network changes (WiFi to cellular, IP address changes, NAT rebi
 - The server resumes the detached session (PTY, terminal state, SSP sender are all preserved).
 - The server resets its `SspSender` so the client gets a full init diff.
 - The client starts fresh SSP state each connection.
+
+After an explicit detach, `rose connect <host> --port <port> --session <id>`
+sends `Reconnect` on the first connection. The printed reattach command includes
+the session ID and any explicit certificate paths. The server checks the
+connecting client's certificate against the session owner.
 
 Sessions persist indefinitely until the server-side shell process exits. There is no idle timeout.
 

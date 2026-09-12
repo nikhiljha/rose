@@ -6,6 +6,15 @@
 //!
 //! Each test is annotated with the mosh test it was ported from.
 
+use std::io::Write;
+use std::process::Stdio;
+
+use bytes::Bytes;
+use portable_pty::CommandBuilder;
+use rose::protocol::{ControlMessage, PROTOCOL_VERSION, ServerSession};
+use rose::ssp::{DATAGRAM_KEYSTROKE, SspSender};
+use tokio::io::{AsyncBufReadExt, BufReader};
+
 mod common;
 use common::MtlsFixture;
 
@@ -1208,6 +1217,226 @@ async fn ssh_bootstrap_mode() {
         !captured.contains("connection error") && !captured.contains("connection failed"),
         "QUIC connection failed. output:\n{captured}"
     );
+}
+
+#[tokio::test]
+async fn native_reconnect_preserves_first_keystroke() {
+    let fixture = MtlsFixture::new();
+    let home = ssh_bootstrap_helpers::isolated_home_dir();
+    let config_dir = home.join(".config/rose");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("client.crt.der"),
+        fixture.client_cert.cert_der.as_ref(),
+    )
+    .unwrap();
+    std::fs::write(
+        config_dir.join("client.key.der"),
+        &fixture.client_cert.key_der,
+    )
+    .unwrap();
+    let server_cert = config_dir.join("server.crt");
+    std::fs::write(&server_cert, fixture.server.server_cert_der().as_ref()).unwrap();
+
+    let rose_bin = ssh_bootstrap_helpers::build_rose_binary();
+    let mut cmd = CommandBuilder::new(&rose_bin);
+    cmd.env("HOME", &home);
+    cmd.args([
+        "connect",
+        "127.0.0.1",
+        "--port",
+        &fixture.addr().port().to_string(),
+        "--cert",
+    ]);
+    cmd.arg(&server_cert);
+    let mut pty = ssh_bootstrap_helpers::spawn_in_pty(cmd);
+    let session_id = [0x12; 16];
+
+    for attempt in 0..2 {
+        let conn =
+            tokio::time::timeout(std::time::Duration::from_secs(30), fixture.server.accept())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        let (mut session, hello) = ServerSession::accept_any(conn.clone()).await.unwrap();
+        if attempt == 0 {
+            assert!(matches!(hello, ControlMessage::Hello { .. }));
+        } else {
+            assert!(
+                matches!(hello, ControlMessage::Reconnect { session_id: id, .. } if id == session_id)
+            );
+        }
+        session
+            .send_control(&ControlMessage::SessionInfo {
+                version: PROTOCOL_VERSION,
+                session_id,
+            })
+            .await
+            .unwrap();
+
+        let ready = format!("CONNECTION_READY_{attempt}");
+        let mut terminal = rose::terminal::RoseTerminal::new(24, 80);
+        terminal.advance(ready.as_bytes());
+        let mut sender = SspSender::new();
+        sender.push_state(terminal.snapshot());
+        conn.send_datagram(Bytes::from(sender.generate_frame().unwrap().encode()))
+            .unwrap();
+        assert!(
+            ssh_bootstrap_helpers::wait_for_output_contains(&pty, &ready, 30).await,
+            "client did not render connection {attempt}: {}",
+            pty.captured_output()
+        );
+        let writer = pty.writer.as_mut().unwrap();
+        writer.write_all(b"ab").unwrap();
+        writer.flush().unwrap();
+        for expected in b"ab" {
+            let data = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let data = conn.read_datagram().await.unwrap();
+                    if data.first() == Some(&DATAGRAM_KEYSTROKE) {
+                        break data;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                &data[1..],
+                &[*expected],
+                "connection {attempt} lost a keystroke"
+            );
+        }
+        conn.close(
+            u32::from(attempt == 0).into(),
+            b"test reconnect",
+        );
+    }
+    let status = ssh_bootstrap_helpers::wait_for_exit(&mut pty.child, 15)
+        .await
+        .unwrap();
+    assert_eq!(status.exit_code(), 0);
+    pty.finish();
+}
+
+#[tokio::test]
+async fn native_detach_command_restores_shell_state() {
+    let home = ssh_bootstrap_helpers::isolated_home_dir().join("native session 'home'");
+    let paths = rose::config::RosePaths::with_base(home.join(".config/rose"));
+    std::fs::create_dir_all(&paths.authorized_certs_dir).unwrap();
+    std::fs::create_dir_all(&paths.known_hosts_dir).unwrap();
+    let cert = rose::config::generate_self_signed_cert(&["127.0.0.1".into()]).unwrap();
+    for name in [
+        "server.crt",
+        "client.crt.der",
+        "known_hosts/127.0.0.1.crt",
+        "authorized_certs/client.crt",
+    ] {
+        std::fs::write(paths.config_dir.join(name), cert.cert_der.as_ref()).unwrap();
+    }
+    for name in ["server.key", "client.key.der"] {
+        std::fs::write(paths.config_dir.join(name), &cert.key_der).unwrap();
+    }
+
+    let rose_bin = ssh_bootstrap_helpers::build_rose_binary();
+    let mut server = tokio::process::Command::new(&rose_bin)
+        .env("HOME", &home)
+        .args(["server", "--listen", "127.0.0.1:0"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut lines = BufReader::new(server.stderr.take().unwrap()).lines();
+    let addr: std::net::SocketAddr =
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let mut startup = String::new();
+            while let Some(line) = lines.next_line().await.unwrap() {
+                if let Some(addr) = line.strip_prefix("RoSE server listening on ") {
+                    return addr.parse().unwrap();
+                }
+                startup.push_str(&line);
+                startup.push('\n');
+            }
+            panic!("native server exited before listening: {startup}");
+        })
+        .await
+        .unwrap();
+
+    let mut cmd = CommandBuilder::new(&rose_bin);
+    cmd.env("HOME", &home);
+    cmd.args([
+        "connect",
+        "127.0.0.1",
+        "--port",
+        &addr.port().to_string(),
+        "--cert",
+    ]);
+    cmd.arg(paths.config_dir.join("server.crt"));
+    let mut pty = ssh_bootstrap_helpers::spawn_in_pty(cmd);
+    let writer = pty.writer.as_mut().unwrap();
+    writer
+        .write_all(b"ROSE_MARK=native-reattach; printf 'READY:%s\\n' \"$ROSE_MARK\"\r")
+        .unwrap();
+    writer.flush().unwrap();
+    assert!(
+        ssh_bootstrap_helpers::wait_for_output_contains(&pty, "READY:native-reattach", 30).await,
+        "initial shell did not respond: {}",
+        pty.captured_output()
+    );
+    let writer = pty.writer.as_mut().unwrap();
+    writer.write_all(b"\r~d").unwrap();
+    writer.flush().unwrap();
+    let status = ssh_bootstrap_helpers::wait_for_exit(&mut pty.child, 15)
+        .await
+        .unwrap();
+    assert_eq!(status.exit_code(), 0);
+    let captured = pty.finish();
+    let command = captured
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("[RoSE: to reattach, run: ")?
+                .strip_suffix(']')
+        })
+        .unwrap_or_else(|| panic!("detach must display a reattach command: {captured:?}"));
+
+    let mut cmd = CommandBuilder::new("/bin/sh");
+    cmd.env("HOME", &home);
+    let binary_dir = std::path::Path::new(&rose_bin).parent().unwrap();
+    cmd.env(
+        "PATH",
+        format!(
+            "{}:{}",
+            binary_dir.display(),
+            std::env::var("PATH").unwrap()
+        ),
+    );
+    cmd.args(["-c", &format!("exec {command}")]);
+    let mut reattached = ssh_bootstrap_helpers::spawn_in_pty(cmd);
+    let writer = reattached.writer.as_mut().unwrap();
+    writer
+        .write_all(b"printf 'RESTORED%s:%s\\n' '' \"$ROSE_MARK\"\r")
+        .unwrap();
+    writer.flush().unwrap();
+    assert!(
+        ssh_bootstrap_helpers::wait_for_output_contains(&reattached, "RESTORED:", 30).await,
+        "reattached shell did not respond: {}",
+        reattached.captured_output()
+    );
+    let writer = reattached.writer.as_mut().unwrap();
+    writer.write_all(b"exit\r").unwrap();
+    writer.flush().unwrap();
+    let status = ssh_bootstrap_helpers::wait_for_exit(&mut reattached.child, 30)
+        .await
+        .unwrap();
+    assert_eq!(status.exit_code(), 0);
+    let captured = reattached.finish();
+    assert!(
+        captured.contains("RESTORED:native-reattach"),
+        "detached shell state was lost: {captured}"
+    );
+    server.kill().await.unwrap();
 }
 
 #[tokio::test]

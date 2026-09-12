@@ -9,7 +9,9 @@ use crossterm::event::{Event, KeyCode};
 use crossterm::terminal;
 
 use super::input::{EscapeState, key_event_to_bytes};
-use super::util::{RawModeGuard, extract_peer_cert, load_or_generate_client_cert};
+use super::util::{
+    RawModeGuard, connect_command, extract_peer_cert, hex_encode, load_or_generate_client_cert,
+};
 use crate::config::{self, CertKeyPair, RosePaths};
 use crate::protocol::{ClientSession, ControlMessage};
 use crate::scrollback::{self, ScrollbackLine, ScrollbackReceiver};
@@ -66,7 +68,14 @@ pub(super) async fn run_client(
     port: u16,
     cert_path: Option<PathBuf>,
     client_cert_path: Option<PathBuf>,
+    session_id: Option<[u8; 16]>,
 ) -> anyhow::Result<()> {
+    let reattach_command = connect_command(
+        host,
+        port,
+        cert_path.as_deref(),
+        client_cert_path.as_deref(),
+    );
     let paths = RosePaths::resolve();
     let cfg = config::RoseConfig::load(&paths.config_dir)?;
 
@@ -119,7 +128,7 @@ pub(super) async fn run_client(
 
     let _raw_guard = RawModeGuard::enable()?;
 
-    client_session_loop(addr, host, client_config).await
+    client_session_loop(addr, host, client_config, session_id, reattach_command).await
 }
 
 /// Performs a TOFU (Trust On First Use) first connection: connects to the
@@ -165,16 +174,25 @@ async fn tofu_first_connect(
 
 /// Reconnection loop: connects/reconnects to the server with exponential backoff.
 ///
-/// When `client_cert` is `Some`, mutual TLS is used (for SSH bootstrap mode).
-///
 /// COVERAGE: CLI client session loop is tested via integration/e2e tests.
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub(super) async fn client_session_loop(
     addr: SocketAddr,
     server_name: &str,
     client_config: quinn::ClientConfig,
+    session_id: Option<[u8; 16]>,
+    reattach_command: String,
 ) -> anyhow::Result<()> {
-    client_session_loop_inner(addr, server_name, client_config, None, None).await
+    client_session_loop_inner(
+        addr,
+        server_name,
+        client_config,
+        None,
+        None,
+        session_id,
+        reattach_command,
+    )
+    .await
 }
 
 /// Like [`client_session_loop`] but uses a pre-established connection for the
@@ -188,7 +206,17 @@ pub(super) async fn client_session_loop_with_conn(
     server_name: &str,
     client_config: quinn::ClientConfig,
 ) -> anyhow::Result<()> {
-    client_session_loop_inner(addr, server_name, client_config, Some(first_conn), None).await
+    let reattach_command = connect_command(server_name, addr.port(), None, None);
+    client_session_loop_inner(
+        addr,
+        server_name,
+        client_config,
+        Some(first_conn),
+        None,
+        None,
+        reattach_command,
+    )
+    .await
 }
 
 /// Like [`client_session_loop`] but uses a pre-created [`QuicClient`] for the
@@ -206,7 +234,17 @@ pub(super) async fn client_session_loop_with_client(
     let conn = first_client
         .connect_with_config(client_config.clone(), addr, server_name)
         .await?;
-    client_session_loop_inner(addr, server_name, client_config, Some(conn), Some(stun_ctx)).await
+    let reattach_command = connect_command(server_name, addr.port(), None, None);
+    client_session_loop_inner(
+        addr,
+        server_name,
+        client_config,
+        Some(conn),
+        Some(stun_ctx),
+        None,
+        reattach_command,
+    )
+    .await
 }
 
 /// Performs STUN discovery for reconnection, returning a [`QuicClient`]
@@ -243,8 +281,9 @@ async fn client_session_loop_inner(
     client_config: quinn::ClientConfig,
     first_conn: Option<quinn::Connection>,
     stun_ctx: Option<StunReconnectContext>,
+    mut session_id: Option<[u8; 16]>,
+    reattach_command: String,
 ) -> anyhow::Result<()> {
-    let mut session_id: Option<[u8; 16]> = None;
     let mut backoff = Duration::from_millis(100);
     let mut initial_conn = first_conn;
     const MAX_INITIAL_RETRIES: u32 = 10;
@@ -711,17 +750,21 @@ async fn client_session_loop_inner(
             ConnectionLost,
         }
 
+        let mut output_task = output_task;
+        let mut stream_task = stream_task;
+        let mut input_task = input_task;
+        let mut control_task = control_task;
         let exit = tokio::select! {
-            _ = output_task => SessionExit::ConnectionLost,
-            _ = stream_task => SessionExit::ConnectionLost,
-            result = input_task => {
+            _ = &mut output_task => SessionExit::ConnectionLost,
+            _ = &mut stream_task => SessionExit::ConnectionLost,
+            result = &mut input_task => {
                 match result.ok().unwrap_or(InputResult::ConnectionLost) {
                     InputResult::Disconnect => SessionExit::UserDisconnect,
                     InputResult::Detach => SessionExit::UserDetach,
                     InputResult::ConnectionLost => SessionExit::ConnectionLost,
                 }
             },
-            result = control_task => {
+            result = &mut control_task => {
                 if result.unwrap_or(false) {
                     SessionExit::UserDisconnect
                 } else {
@@ -729,6 +772,11 @@ async fn client_session_loop_inner(
                 }
             },
         };
+
+        output_task.abort();
+        stream_task.abort();
+        input_task.abort();
+        control_task.abort();
 
         let exit = match exit {
             SessionExit::ConnectionLost => {
@@ -782,9 +830,8 @@ async fn client_session_loop_inner(
                 let _ = stdout.write_all(
                     format!(
                         "\r\n[RoSE: detached]\r\n\
-                         [RoSE: to reattach, run: rose connect {} --port {}]\r\n",
-                        addr.ip(),
-                        addr.port()
+                         [RoSE: to reattach, run: {reattach_command} --session {}]\r\n",
+                        hex_encode(&session_id.expect("session ID received during handshake"))
                     )
                     .as_bytes(),
                 );

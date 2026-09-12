@@ -14,7 +14,7 @@ use wezterm_term::{
 /// Monotonically increasing sequence number used by wezterm for dirty tracking.
 type SequenceNo = usize;
 
-use crate::ssp::ScreenState;
+use crate::ssp::{ScreenState, Viewport};
 
 /// Configuration for the wezterm terminal emulator.
 #[derive(Debug)]
@@ -178,9 +178,9 @@ fn format_line_cells(line: &wezterm_term::Line) -> String {
 /// Wraps a wezterm [`Terminal`] for use in `RoSE`'s state synchronization.
 ///
 /// Maintains an internal cache of ANSI-rendered rows so that [`snapshot`](RoseTerminal::snapshot)
-/// only re-renders rows that wezterm marks as changed (via [`SequenceNo`] dirty
-/// tracking). This avoids the cost of calling [`format_line_cells`] for every
-/// visible row on every frame.
+/// re-renders rows that wezterm marks as changed (via [`SequenceNo`] dirty
+/// tracking) or when switching screen buffers. This avoids calling
+/// [`format_line_cells`] for every visible row on every frame.
 pub struct RoseTerminal {
     inner: Terminal,
     /// Cached ANSI strings for each visible row, indexed by visible row number.
@@ -192,6 +192,8 @@ pub struct RoseTerminal {
     /// snapshot.  When the viewport scrolls, `phys_row(0)` increases and
     /// we shift the cached rows to match before checking dirty flags.
     last_phys_offset: usize,
+    /// Whether the cached rows belong to the alternate screen.
+    last_alternate_screen: bool,
 }
 
 impl RoseTerminal {
@@ -214,6 +216,7 @@ impl RoseTerminal {
             cached_rows: vec![String::new(); rows as usize],
             last_seqno: 0,
             last_phys_offset: 0,
+            last_alternate_screen: false,
         }
     }
 
@@ -323,15 +326,19 @@ impl RoseTerminal {
     ///
     /// Uses wezterm's [`SequenceNo`]-based dirty tracking to avoid
     /// re-rendering rows that have not changed since the last snapshot.
-    /// Only rows where `Line::changed_since(last_seqno)` returns `true` are
-    /// passed through [`format_line_cells`]; all other rows reuse the cached
-    /// ANSI string from the previous call.
+    /// Changed rows are passed through [`format_line_cells`]; unchanged rows
+    /// reuse the cached ANSI string. Switching screen buffers refreshes all rows.
     #[must_use]
     #[tracing::instrument(level = "trace", skip_all)]
     pub fn snapshot(&mut self) -> ScreenState {
         let size = self.inner.get_size();
         let screen = self.inner.screen();
+        let viewport = Viewport {
+            first_row: screen.phys_to_stable_row_index(screen.phys_row(0)) as u64,
+            alternate_screen: self.inner.is_alt_screen_active(),
+        };
         let seqno = self.last_seqno;
+        let screen_changed = viewport.alternate_screen != self.last_alternate_screen;
 
         // Compute the physical row offset for visible row 0.
         let first_phys = screen.phys_row(0);
@@ -362,15 +369,12 @@ impl RoseTerminal {
             self.cached_rows.resize(size.rows, String::new());
         }
 
-        // Re-render only rows whose underlying Line has been modified since
-        // the last snapshot. We iterate visible rows individually via
-        // `lines_in_phys_range(row..row+1)`, which safely handles scrollback
-        // pruning (unlike `with_phys_lines` over the full range).
+        // Read visible rows individually to handle scrollback pruning.
         for row in 0..size.rows {
             let phys = screen.phys_row(row as i64);
             let phys_lines = screen.lines_in_phys_range(phys..phys + 1);
             if let Some(line) = phys_lines.first()
-                && line.changed_since(seqno)
+                && (screen_changed || line.changed_since(seqno))
             {
                 self.cached_rows[row] = format_line_cells(line);
             }
@@ -378,12 +382,14 @@ impl RoseTerminal {
 
         self.last_seqno = self.inner.current_seqno();
         self.last_phys_offset = first_phys;
+        self.last_alternate_screen = viewport.alternate_screen;
 
         let (cx, cy) = self.cursor_pos();
         ScreenState {
             rows: self.cached_rows.clone(),
             cursor_x: cx as u16,
             cursor_y: cy as u16,
+            viewport: Some(viewport),
         }
     }
 }
@@ -1037,6 +1043,22 @@ mod tests {
         let term = RoseTerminal::new(24, 80);
         let ansi = term.line_ansi(5);
         assert_eq!(ansi, "", "empty line should produce empty string");
+    }
+
+    #[test]
+    fn snapshot_restores_primary_rows_after_alternate_scroll() {
+        let mut term = RoseTerminal::new(5, 20);
+        term.advance(b"history1\r\nhistory2\r\nhistory3\r\na\r\nb\r\nc\r\nd\r\ne");
+        let primary = term.snapshot();
+        assert_eq!(primary.rows, ["a", "b", "c", "d", "e"]);
+
+        term.advance(b"\x1b[?1049h\x1b[2J\x1b[H1\r\n2\r\n3\r\n4\r\n5");
+        let _ = term.snapshot();
+        term.advance(b"\r\n6\r\n7\r\n8");
+        let _ = term.snapshot();
+        term.advance(b"\x1b[?1049l");
+
+        assert_eq!(term.snapshot(), primary);
     }
 
     #[test]

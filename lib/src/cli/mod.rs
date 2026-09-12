@@ -40,6 +40,10 @@ enum Commands {
         #[arg(long)]
         cert: Option<PathBuf>,
 
+        /// Reattach to a detached session using its 32-digit hexadecimal ID.
+        #[arg(long, value_parser = parse_session_id, conflicts_with = "ssh")]
+        session: Option<[u8; 16]>,
+
         /// Use SSH bootstrap mode instead of native mode.
         #[arg(long)]
         ssh: bool,
@@ -61,7 +65,7 @@ enum Commands {
         #[arg(long)]
         ssh_option: Vec<String>,
 
-        /// Path to a client certificate for mutual TLS (PEM format).
+        /// Path to a client certificate for mutual TLS (DER format).
         /// Used for reattaching to a bootstrapped session after detach.
         #[arg(long)]
         client_cert: Option<PathBuf>,
@@ -85,6 +89,16 @@ enum Commands {
     },
     /// Generate X.509 client certificates for authentication.
     Keygen,
+}
+
+fn parse_session_id(value: &str) -> Result<[u8; 16], String> {
+    if value.len() != 32 || !value.is_ascii() {
+        return Err("session ID must contain 32 hexadecimal digits".into());
+    }
+    util::hex_decode(value)
+        .map_err(|error| error.to_string())?
+        .try_into()
+        .map_err(|_| "session ID must contain 32 hexadecimal digits".into())
 }
 
 /// Parses CLI arguments and runs the appropriate subcommand.
@@ -113,6 +127,7 @@ pub async fn run() -> anyhow::Result<()> {
             host,
             port,
             cert,
+            session,
             ssh,
             server_binary,
             force_stun,
@@ -130,7 +145,7 @@ pub async fn run() -> anyhow::Result<()> {
                 )
                 .await
             } else {
-                client::run_client(&host, port, cert, client_cert).await
+                client::run_client(&host, port, cert, client_cert, session).await
             }
         }
         Commands::Server {
@@ -139,5 +154,57 @@ pub async fn run() -> anyhow::Result<()> {
             hostname,
         } => server::run_server(listen, bootstrap, hostname).await,
         Commands::Keygen => keygen::run_keygen(),
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_native_session() {
+        let cli = Cli::try_parse_from([
+            "rose",
+            "connect",
+            "host",
+            "--session",
+            "00112233445566778899aAbBcCdDeEfF",
+        ])
+        .unwrap();
+        let Commands::Connect { session, .. } = cli.command else {
+            panic!("expected connect");
+        };
+        assert_eq!(
+            session,
+            Some([
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                0xee, 0xff,
+            ])
+        );
+    }
+
+    #[test]
+    fn reject_invalid_session_arguments() {
+        for invalid in [
+            "short",
+            "gg112233445566778899aabbccddeeff",
+            "éééééééééééééééé",
+        ] {
+            assert!(
+                Cli::try_parse_from(["rose", "connect", "host", "--session", invalid]).is_err()
+            );
+        }
+        assert!(
+            Cli::try_parse_from([
+                "rose",
+                "connect",
+                "host",
+                "--ssh",
+                "--session",
+                "00112233445566778899aabbccddeeff",
+            ])
+            .is_err()
+        );
     }
 }

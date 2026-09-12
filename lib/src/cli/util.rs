@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::path::Path;
 
 use bytes::Bytes;
 use crossterm::terminal;
@@ -107,6 +108,23 @@ pub(super) fn rand_u16() -> u16 {
 /// Hex-encodes a byte slice.
 pub(super) fn hex_encode(data: &[u8]) -> String {
     data.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Builds a shell command that preserves connection and certificate options.
+pub(super) fn connect_command(
+    host: &str,
+    port: u16,
+    cert_path: Option<&Path>,
+    client_cert_path: Option<&Path>,
+) -> String {
+    let quote = |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
+    let mut command = format!("rose connect {} --port {port}", quote(host));
+    for (flag, path) in [("cert", cert_path), ("client-cert", client_cert_path)] {
+        if let Some(path) = path {
+            command.push_str(&format!(" --{flag} {}", quote(&path.to_string_lossy())));
+        }
+    }
+    command
 }
 
 /// Extracts the peer's DER-encoded TLS certificate from a QUIC connection.
@@ -250,6 +268,23 @@ fn enable_kitty_keyboard() -> bool {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connect_command_preserves_quoted_certificate_paths() {
+        assert_eq!(
+            connect_command(
+                "server.example",
+                4433,
+                Some(Path::new("server's cert.der")),
+                Some(Path::new("client cert.der")),
+            ),
+            "rose connect 'server.example' --port 4433 --cert 'server'\\''s cert.der' --client-cert 'client cert.der'"
+        );
+        assert_eq!(
+            connect_command("server.example", 4433, None, None),
+            "rose connect 'server.example' --port 4433"
+        );
+    }
 
     #[test]
     fn hex_encode_roundtrip() {

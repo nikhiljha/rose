@@ -27,6 +27,10 @@ enum Commands {
         #[arg(long)]
         cert: Option<PathBuf>,
 
+        /// Reattach to a detached session using its 32-digit hexadecimal ID.
+        #[arg(long, conflicts_with = "ssh")]
+        session: Option<String>,
+
         /// Use SSH bootstrap mode instead of native mode.
         #[arg(long)]
         ssh: bool,
