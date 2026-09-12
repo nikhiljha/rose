@@ -47,12 +47,10 @@ impl ScreenState {
     #[tracing::instrument(level = "trace", skip_all)]
     pub fn diff_from(&self, old: &Self) -> ScreenDiff {
         let mut changed_rows = Vec::new();
-        let max_rows = self.rows.len().max(old.rows.len());
-        for i in 0..max_rows {
+        for (i, new_row) in self.rows.iter().enumerate() {
             let old_row = old.rows.get(i).map_or("", String::as_str);
-            let new_row = self.rows.get(i).map_or("", String::as_str);
             if old_row != new_row {
-                changed_rows.push((i as u16, new_row.to_string()));
+                changed_rows.push((i as u16, new_row.clone()));
             }
         }
         ScreenDiff {
@@ -529,22 +527,10 @@ impl SspReceiver {
 /// Returns `Some(k)` if `old[k..] == new[..n-k]` for some `k >= 1`.
 fn detect_scroll_up(old: &ScreenState, new: &ScreenState) -> Option<usize> {
     let n = old.rows.len();
-    if n == 0 || n != new.rows.len() {
+    if n == 0 || n != new.rows.len() || old.rows == new.rows {
         return None;
     }
-    // Check shift amounts 1..n (stop early once rows diverge)
-    for k in 1..n {
-        if old.rows[k..] == new.rows[..n - k] {
-            return Some(k);
-        }
-        // Optimisation: if old[k] != new[0] there's no point checking larger k
-        // values (they'd require old[k+1..] == new[..n-k-1] which can't hold
-        // when old[k] already didn't match new[0]).
-        if old.rows[k] != new.rows[0] {
-            break;
-        }
-    }
-    None
+    (1..n).find(|&k| old.rows[k..] == new.rows[..n - k])
 }
 
 /// Generates minimal ANSI escape sequences to update the real terminal

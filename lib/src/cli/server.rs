@@ -380,6 +380,8 @@ async fn handle_server_session(
     let session_conn = session.connection().clone();
     let terminal_out = Arc::clone(&terminal);
     let sender_out = Arc::clone(&ssp_sender);
+    let resize_notify = Arc::new(tokio::sync::Notify::new());
+    let resize_out = Arc::clone(&resize_notify);
     let output_task = tokio::spawn(async move {
         let mut dirty = false;
         let mut last_send = tokio::time::Instant::now();
@@ -402,6 +404,7 @@ async fn handle_server_session(
                         }
                     }
                 }
+                () = resize_out.notified() => dirty = true,
                 _ = retransmit.tick() => {}
                 () = &mut pty_closed_notified => return true,
             }
@@ -522,6 +525,7 @@ async fn handle_server_session(
                                 .lock()
                                 .expect("terminal lock poisoned")
                                 .resize(rows, cols);
+                            resize_notify.notify_one();
                         }
                         Ok(Some(ControlMessage::Goodbye) | None) => break,
                         Ok(Some(msg)) => {
@@ -622,6 +626,90 @@ async fn handle_server_session(
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+    use crate::protocol::ClientSession;
+    use crate::ssp::SspReceiver;
+    use crate::testutil::MtlsFixture;
+    use crate::transport::QuicClient;
+
+    #[tokio::test]
+    async fn idle_session_resize_sends_updated_screen() {
+        let fixture = MtlsFixture::new();
+        let store = SessionStore::new();
+        let session_id = [1; 16];
+        let pty = PtySession::open_command(5, 20, "cat", &[]).unwrap();
+        let terminal = Arc::new(Mutex::new(RoseTerminal::new(5, 20)));
+        terminal.lock().unwrap().advance(b"idle");
+        let _ = store.insert(
+            session_id,
+            DetachedSession {
+                pty,
+                terminal,
+                ssp_sender: Arc::new(Mutex::new(SspSender::new())),
+                rows: 5,
+                cols: 20,
+                owner_cert_der: Some(fixture.client_cert.cert_der.to_vec()),
+                detached_at: std::time::Instant::now(),
+            },
+        );
+
+        let client = QuicClient::new().unwrap();
+        let (server_conn, client_conn) =
+            tokio::join!(fixture.server.accept(), fixture.connect(&client));
+        let server_task = tokio::spawn(handle_server_session(
+            server_conn.unwrap().unwrap(),
+            store,
+            false,
+        ));
+        let mut session = ClientSession::reconnect(client_conn, 5, 20, session_id, vec![])
+            .await
+            .unwrap();
+        let info = tokio::time::timeout(Duration::from_secs(5), session.recv_control())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(info, Some(ControlMessage::SessionInfo { .. })));
+
+        let mut receiver = SspReceiver::new(5);
+        let output = tokio::time::timeout(Duration::from_secs(5), session.recv_output())
+            .await
+            .unwrap()
+            .unwrap();
+        receiver
+            .process_frame(&SspFrame::decode(&output).unwrap())
+            .unwrap();
+        assert!(receiver.state().rows[0].contains("idle"));
+        let mut ack = vec![DATAGRAM_SSP_ACK];
+        ack.extend_from_slice(&SspFrame::ack_only(receiver.ack_num()).encode());
+        session.send_input(ack.into()).unwrap();
+        session
+            .send_control(&ControlMessage::Resize { rows: 8, cols: 20 })
+            .await
+            .unwrap();
+
+        let resized = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let output = session.recv_output().await.unwrap();
+                receiver
+                    .process_frame(&SspFrame::decode(&output).unwrap())
+                    .unwrap();
+                if receiver.state().rows.len() == 8 {
+                    break;
+                }
+            }
+        })
+        .await;
+        session
+            .send_control(&ControlMessage::Goodbye)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(resized.is_ok(), "resize was not sent without PTY output");
+        assert!(receiver.state().rows[0].contains("idle"));
+    }
 
     #[test]
     fn filter_env_vars_allows_safe_vars() {

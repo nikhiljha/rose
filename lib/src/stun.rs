@@ -148,7 +148,7 @@ fn parse_xor_mapped_address(value: &[u8]) -> Option<SocketAddrV4> {
 }
 
 /// Parses a `MAPPED-ADDRESS` attribute value (IPv4 only, legacy fallback).
-fn parse_mapped_address(value: &[u8]) -> Option<SocketAddrV4> {
+const fn parse_mapped_address(value: &[u8]) -> Option<SocketAddrV4> {
     if value[1] != FAMILY_IPV4 || value.len() < 8 {
         return None;
     }

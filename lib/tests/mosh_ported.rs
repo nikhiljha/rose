@@ -778,7 +778,7 @@ async fn scrollback_sync_over_reliable_stream() {
 mod ssh_bootstrap_helpers {
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
     use russh::ChannelId;
-    use russh::server::{Auth, Config, Handler, Msg, Session};
+    use russh::server::{Auth, ChannelOpenHandle, Config, Handler, Msg, Session};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
@@ -807,9 +807,11 @@ mod ssh_bootstrap_helpers {
         async fn channel_open_session(
             &mut self,
             _channel: russh::Channel<Msg>,
+            reply: ChannelOpenHandle,
             _session: &mut Session,
-        ) -> Result<bool, Self::Error> {
-            Ok(true)
+        ) -> Result<(), Self::Error> {
+            reply.accept().await;
+            Ok(())
         }
 
         async fn exec_request(
@@ -842,7 +844,9 @@ mod ssh_bootstrap_helpers {
                 let mut reader = tokio::io::BufReader::new(child_stdout);
                 let mut line = String::new();
                 while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
-                    let _ = handle.data(channel, line.as_bytes().into()).await;
+                    let _ = handle
+                        .data(channel, bytes::Bytes::copy_from_slice(line.as_bytes()))
+                        .await;
                     line.clear();
                 }
                 let _ = handle.eof(channel).await;

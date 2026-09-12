@@ -2,8 +2,62 @@
 
 use std::time::Duration;
 
+use rose::ssp::{ScreenState, SspReceiver, SspSender, render_diff_ansi};
+use rose::terminal::RoseTerminal;
+
 mod common;
 use common::MtlsFixture;
+
+#[test]
+fn ssp_shrink_preserves_remaining_rows() {
+    let mut sender = SspSender::new();
+    let mut receiver = SspReceiver::new(8);
+    let mut state = ScreenState {
+        rows: (0..8).map(|i| format!("line {i}")).collect(),
+        cursor_x: 0,
+        cursor_y: 0,
+    };
+    sender.push_state(state.clone());
+    receiver
+        .process_frame(&sender.generate_frame().unwrap())
+        .unwrap();
+    sender.process_ack(receiver.ack_num());
+
+    state.rows.truncate(7);
+    sender.push_state(state.clone());
+    let frame = sender.generate_frame().unwrap();
+    receiver.process_frame(&frame).unwrap();
+    assert_eq!(receiver.state(), &state);
+}
+
+#[test]
+fn ssp_render_batched_scroll_preserves_history() {
+    let mut server = RoseTerminal::new(5, 20);
+    let mut client = RoseTerminal::new(5, 20);
+    server.advance(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+    let old = server.snapshot();
+    client.advance(&render_diff_ansi(&ScreenState::empty(5), &old));
+
+    server.advance(b"\r\nsix\r\nseven");
+    let new = server.snapshot();
+    client.advance(&render_diff_ansi(&old, &new));
+
+    assert_eq!(client.snapshot(), new);
+    assert_eq!(client.scrollback_lines(), server.scrollback_lines());
+}
+
+#[test]
+fn ssp_render_cursor_only_does_not_scroll_blank_rows() {
+    let mut server = RoseTerminal::new(5, 20);
+    let mut client = RoseTerminal::new(5, 20);
+    let old = server.snapshot();
+    server.advance(b"\x1b[3;4H");
+    let new = server.snapshot();
+    client.advance(&render_diff_ansi(&old, &new));
+
+    assert_eq!(client.snapshot(), new);
+    assert!(client.scrollback_lines().is_empty());
+}
 
 // ---------------------------------------------------------------------------
 // PTY + Terminal: spawn a command in a PTY and feed output to RoseTerminal
