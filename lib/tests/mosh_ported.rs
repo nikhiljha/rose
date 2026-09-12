@@ -1307,10 +1307,7 @@ async fn native_reconnect_preserves_first_keystroke() {
                 "connection {attempt} lost a keystroke"
             );
         }
-        conn.close(
-            u32::from(attempt == 0).into(),
-            b"test reconnect",
-        );
+        conn.close(u32::from(attempt == 0).into(), b"test reconnect");
     }
     let status = ssh_bootstrap_helpers::wait_for_exit(&mut pty.child, 15)
         .await
