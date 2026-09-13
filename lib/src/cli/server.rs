@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -347,7 +348,7 @@ async fn handle_server_session(
     let peer_cert = extract_peer_cert(&conn);
     let (mut session, handshake) = ServerSession::accept_any(conn).await?;
 
-    let (session_id, pty, terminal, ssp_sender, rows, cols) = match handshake {
+    let (session_id, mut pty, terminal, ssp_sender, rows, cols) = match handshake {
         ControlMessage::Hello {
             version: _,
             rows,
@@ -396,6 +397,7 @@ async fn handle_server_session(
 
     let pty_output = pty.subscribe_output();
     let pty_closed = pty.closed();
+    let child_exited = Arc::new(tokio::sync::Notify::new());
     let pty_writer = pty.clone_writer();
 
     let session_conn = session.connection().clone();
@@ -405,7 +407,7 @@ async fn handle_server_session(
     let resize_out = Arc::clone(&resize_notify);
     let output_task = tokio::spawn(forward_pty_output(
         pty_output,
-        pty_closed,
+        wait_for_output_end(pty_closed, Arc::clone(&child_exited)),
         terminal_out,
         sender_out,
         session_conn,
@@ -485,28 +487,39 @@ async fn handle_server_session(
     let (control_shutdown_tx, mut control_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let terminal_ctrl = Arc::clone(&terminal);
     let control_task = tokio::spawn(async move {
+        let mut child_poll = tokio::time::interval(Duration::from_millis(100));
+        let mut child_reaped = false;
         loop {
-            tokio::select! {
-                _ = &mut control_shutdown_rx => break,
-                msg = session.recv_control() => {
-                    match msg {
-                        Ok(Some(ControlMessage::Resize { rows, cols })) => {
-                            tracing::info!(rows, cols, "resize");
-                            let mut terminal = terminal_ctrl.lock().expect("terminal lock poisoned");
-                            if pty.resize(rows, cols).is_ok() {
-                                terminal.resize(rows, cols);
-                            }
-                            resize_notify.notify_one();
-                        }
-                        Ok(Some(ControlMessage::Goodbye) | None) => break,
-                        Ok(Some(msg)) => {
-                            tracing::warn!(?msg, "unexpected control message");
-                        }
-                        Err(e) => {
-                            tracing::debug!("control stream ended: {e}");
-                            break;
+            let message = session.recv_control();
+            tokio::pin!(message);
+            let result = loop {
+                tokio::select! {
+                    _ = &mut control_shutdown_rx => return pty,
+                    msg = &mut message => break msg,
+                    _ = child_poll.tick(), if !child_reaped => {
+                        if pty.try_wait().ok().flatten().is_some() {
+                            child_reaped = true;
+                            child_exited.notify_one();
                         }
                     }
+                }
+            };
+            match result {
+                Ok(Some(ControlMessage::Resize { rows, cols })) => {
+                    tracing::info!(rows, cols, "resize");
+                    let mut terminal = terminal_ctrl.lock().expect("terminal lock poisoned");
+                    if pty.resize(rows, cols).is_ok() {
+                        terminal.resize(rows, cols);
+                    }
+                    resize_notify.notify_one();
+                }
+                Ok(Some(ControlMessage::Goodbye) | None) => break,
+                Ok(Some(msg)) => {
+                    tracing::warn!(?msg, "unexpected control message");
+                }
+                Err(e) => {
+                    tracing::debug!("control stream ended: {e}");
+                    break;
                 }
             }
         }
@@ -594,9 +607,22 @@ async fn handle_server_session(
     Ok(())
 }
 
+async fn wait_for_output_end(
+    pty_closed: Arc<tokio::sync::Notify>,
+    child_exited: Arc<tokio::sync::Notify>,
+) {
+    let eof = pty_closed.notified();
+    tokio::pin!(eof);
+    tokio::select! {
+        () = &mut eof => return,
+        () = child_exited.notified() => {}
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(1), eof).await;
+}
+
 async fn forward_pty_output(
     mut pty_output: tokio::sync::broadcast::Receiver<bytes::Bytes>,
-    pty_closed: Arc<tokio::sync::Notify>,
+    output_end: impl Future<Output = ()>,
     terminal_out: Arc<Mutex<RoseTerminal>>,
     sender_out: Arc<Mutex<SspSender>>,
     session_conn: quinn::Connection,
@@ -606,8 +632,7 @@ async fn forward_pty_output(
     let mut last_send = tokio::time::Instant::now();
     let min_frame_interval = Duration::from_millis(5);
     let mut retransmit = tokio::time::interval(Duration::from_millis(20));
-    let pty_closed_notified = pty_closed.notified();
-    tokio::pin!(pty_closed_notified);
+    tokio::pin!(output_end);
     loop {
         let retransmit_due = tokio::select! {
             result = pty_output.recv() => {
@@ -626,7 +651,7 @@ async fn forward_pty_output(
             () = resize_out.notified() => { dirty = true; false },
             () = tokio::time::sleep_until(last_send + min_frame_interval), if dirty => false,
             _ = retransmit.tick() => true,
-            () = &mut pty_closed_notified => break,
+            () = &mut output_end => break,
         };
 
         if dirty && last_send.elapsed() >= min_frame_interval {
@@ -894,7 +919,7 @@ mod tests {
         let closed = Arc::new(tokio::sync::Notify::new());
         let output = forward_pty_output(
             rx,
-            Arc::clone(&closed),
+            closed.notified(),
             Arc::clone(&terminal),
             Arc::clone(&sender),
             server_conn.clone(),
@@ -949,6 +974,116 @@ mod tests {
         receiver.process_frame(&frame).unwrap();
         assert_eq!(receiver.state().rows[0], "FINAL_OUTPUT");
         assert!(!native.task.is_finished());
+        let mut ack = vec![DATAGRAM_SSP_ACK];
+        ack.extend_from_slice(&SspFrame::ack_only(receiver.ack_num()).encode());
+        native.session.send_input(ack.into()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), native.task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(native.store.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejected_final_stream_ends_delivery() {
+        let (client_conn, server_conn, _fixture, _client) = crate::testutil::connected_pair().await;
+        let (_tx, rx) = tokio::sync::broadcast::channel(16);
+        let terminal = Arc::new(Mutex::new(RoseTerminal::new(512, 256)));
+        terminal
+            .lock()
+            .unwrap()
+            .advance("x".repeat(128 * 1024).as_bytes());
+        let output = forward_pty_output(
+            rx,
+            std::future::ready(()),
+            terminal,
+            Arc::new(Mutex::new(SspSender::new())),
+            server_conn,
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        let reject = async {
+            let mut stream = client_conn.accept_uni().await.unwrap();
+            let mut kind = [0];
+            stream.read_exact(&mut kind).await.unwrap();
+            assert_eq!(kind[0], scrollback::stream_type::SSP_FRAME);
+            stream.stop(42u32.into()).unwrap();
+        };
+        let (exited, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(output, reject)
+        })
+        .await
+        .expect("rejected final stream kept retrying");
+        assert!(exited);
+    }
+
+    #[tokio::test]
+    async fn child_polling_preserves_fragmented_control_messages() {
+        let (client_conn, server_conn, _fixture, _client) = crate::testutil::connected_pair().await;
+        let task = tokio::spawn(handle_server_session(
+            server_conn,
+            SessionStore::new(),
+            false,
+        ));
+        let (mut send, mut recv) = client_conn.open_bi().await.unwrap();
+        protocol::write_control(
+            &mut send,
+            &ControlMessage::Hello {
+                version: protocol::PROTOCOL_VERSION,
+                rows: 5,
+                cols: 20,
+                env_vars: vec![],
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            protocol::read_control(&mut recv).await.unwrap(),
+            Some(ControlMessage::SessionInfo { .. })
+        ));
+        let resize = ControlMessage::Resize { rows: 8, cols: 20 }.encode();
+        let length = u32::try_from(resize.len()).unwrap().to_be_bytes();
+        send.write_all(&length[..2]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        send.write_all(&length[2..]).await.unwrap();
+        send.write_all(&resize[..2]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        send.write_all(&resize[2..]).await.unwrap();
+        let mut receiver = SspReceiver::new(5);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let data = client_conn.read_datagram().await.unwrap();
+                receiver
+                    .process_frame(&SspFrame::decode(&data).unwrap())
+                    .unwrap();
+                if receiver.state().rows.len() == 8 {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("child polling interrupted a partial resize message");
+        client_conn.close(0u32.into(), b"done");
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn exiting_shell_is_not_held_open_by_a_descendant() {
+        let native = NativeSession::new().await;
+        native.send_command(
+            "sh -c 'trap \"\" HUP; printf \"\\033[2J\\033[HHOLDER_READY\\n\"; sleep 8' &",
+        );
+        native.wait_for_marker("HOLDER_READY").await;
+        native.send_command("printf '\\033[2J\\033[HCHILD_FINAL\\n'; exit");
+        let frame = tokio::time::timeout(
+            Duration::from_secs(3),
+            receive_stream_frame(native.session.connection()),
+        )
+        .await
+        .expect("descendant held the exited shell open");
+        let mut receiver = SspReceiver::new(5);
+        receiver.process_frame(&frame).unwrap();
+        assert_eq!(receiver.state().rows[0], "CHILD_FINAL");
         let mut ack = vec![DATAGRAM_SSP_ACK];
         ack.extend_from_slice(&SspFrame::ack_only(receiver.ack_num()).encode());
         native.session.send_input(ack.into()).unwrap();
@@ -1046,7 +1181,7 @@ mod tests {
         let closed = Arc::new(tokio::sync::Notify::new());
         let output = forward_pty_output(
             rx,
-            Arc::clone(&closed),
+            closed.notified(),
             Arc::clone(&terminal),
             Arc::clone(&sender),
             server_conn,

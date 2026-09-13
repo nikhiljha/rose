@@ -49,8 +49,13 @@ Resize operations hold the same terminal lock while resizing the PTY and emulato
 The low-level `PtySession` constructors without an attached terminal expose a
 lossy broadcast stream for callers that need raw output.
 
-At PTY EOF, the server snapshots the final authoritative state regardless of
-pending output notifications or frame throttling. It sends a full SSP frame on a
+The server monitors both the direct child and PTY EOF. If the child exits while
+a descendant retains the slave PTY, output continues draining until EOF or for
+one additional second, whichever comes first. Child polling does not cancel
+partially received control messages.
+
+At PTY EOF or the drain deadline, the server snapshots the final authoritative
+state regardless of pending output notifications or frame throttling. It sends a full SSP frame on a
 reliable stream and waits for the client's SSP acknowledgment before closing the
 connection. Missing application acknowledgments trigger another reliable copy.
 Final delivery is bounded to two seconds; connection failure or timeout can
