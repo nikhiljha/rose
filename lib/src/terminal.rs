@@ -198,6 +198,12 @@ impl RoseTerminal {
     /// Creates a new terminal emulator with the given dimensions.
     #[must_use]
     pub fn new(rows: u16, cols: u16) -> Self {
+        Self::with_writer(rows, cols, Box::new(DummyWriter))
+    }
+
+    /// Creates a terminal whose query responses are sent to the given writer.
+    #[must_use]
+    pub fn with_writer(rows: u16, cols: u16, writer: Box<dyn std::io::Write + Send>) -> Self {
         let config: Arc<dyn TerminalConfiguration + Send + Sync> = Arc::new(RoseTerminalConfig);
         let size = TerminalSize {
             rows: rows as usize,
@@ -207,7 +213,7 @@ impl RoseTerminal {
             dpi: 0,
         };
 
-        let terminal = Terminal::new(size, config, "RoSE", "0.1.0", Box::new(DummyWriter));
+        let terminal = Terminal::new(size, config, "RoSE", "0.1.0", writer);
 
         Self {
             inner: terminal,

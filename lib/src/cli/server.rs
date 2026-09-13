@@ -2,6 +2,8 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use portable_pty::CommandBuilder;
+
 use super::util::{
     extract_peer_cert, hex_decode, hex_encode, parse_stun_line, rand_session_id, rand_u16,
     send_ssp_frame, write_private_key,
@@ -250,12 +252,9 @@ async fn reattach_session(
     tracing::info!(rows, cols, "reattaching session");
 
     if detached.rows != rows || detached.cols != cols {
-        let _ = detached.pty.resize(rows, cols);
-        detached
-            .terminal
-            .lock()
-            .expect("terminal lock poisoned")
-            .resize(rows, cols);
+        let mut terminal = detached.terminal.lock().expect("terminal lock poisoned");
+        detached.pty.resize(rows, cols)?;
+        terminal.resize(rows, cols);
     }
 
     session
@@ -302,8 +301,12 @@ async fn new_session(
     tracing::info!(rows, cols, "new session");
 
     let filtered = filter_env_vars(env_vars);
-    let pty = PtySession::open_with_env(rows, cols, &filtered)?;
-    let terminal = Arc::new(Mutex::new(RoseTerminal::new(rows, cols)));
+    let mut command = CommandBuilder::new_default_prog();
+    for (key, value) in filtered {
+        command.env(key, value);
+    }
+    let pty = PtySession::open_terminal(rows, cols, command)?;
+    let terminal = Arc::clone(pty.terminal().expect("terminal enabled"));
     let ssp_sender = Arc::new(Mutex::new(SspSender::new()));
 
     session
@@ -472,11 +475,10 @@ async fn handle_server_session(
                     match msg {
                         Ok(Some(ControlMessage::Resize { rows, cols })) => {
                             tracing::info!(rows, cols, "resize");
-                            let _ = pty.resize(rows, cols);
-                            terminal_ctrl
-                                .lock()
-                                .expect("terminal lock poisoned")
-                                .resize(rows, cols);
+                            let mut terminal = terminal_ctrl.lock().expect("terminal lock poisoned");
+                            if pty.resize(rows, cols).is_ok() {
+                                terminal.resize(rows, cols);
+                            }
                             resize_notify.notify_one();
                         }
                         Ok(Some(ControlMessage::Goodbye) | None) => break,
@@ -592,8 +594,7 @@ async fn forward_pty_output(
         let retransmit_due = tokio::select! {
             result = pty_output.recv() => {
                 match result {
-                    Ok(data) => {
-                        terminal_out.lock().expect("terminal lock poisoned").advance(&data);
+                Ok(_) => {
                         dirty = true;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return true,
@@ -649,6 +650,154 @@ mod tests {
     use crate::testutil::MtlsFixture;
     use crate::transport::QuicClient;
 
+    struct NativeSession {
+        session: ClientSession,
+        task: tokio::task::JoinHandle<anyhow::Result<()>>,
+        store: SessionStore,
+        session_id: [u8; 16],
+        _fixture: MtlsFixture,
+        _client: QuicClient,
+    }
+
+    impl NativeSession {
+        async fn new() -> Self {
+            let fixture = MtlsFixture::new();
+            let store = SessionStore::new();
+            let client = QuicClient::new().unwrap();
+            let (server_conn, client_conn) =
+                tokio::join!(fixture.server.accept(), fixture.connect(&client));
+            let task = tokio::spawn(handle_server_session(
+                server_conn.unwrap().unwrap(),
+                store.clone(),
+                false,
+            ));
+            let mut session = ClientSession::connect(client_conn, 5, 80, vec![])
+                .await
+                .unwrap();
+            let Some(ControlMessage::SessionInfo { session_id, .. }) =
+                session.recv_control().await.unwrap()
+            else {
+                panic!("missing session metadata");
+            };
+            Self {
+                session,
+                task,
+                store,
+                session_id,
+                _fixture: fixture,
+                _client: client,
+            }
+        }
+
+        fn send_command(&self, command: &str) {
+            let mut data = vec![DATAGRAM_KEYSTROKE];
+            data.extend_from_slice(command.as_bytes());
+            data.push(b'\r');
+            self.session.send_input(data.into()).unwrap();
+        }
+
+        async fn wait_for_marker(&self, marker: &str) {
+            let mut receiver = SspReceiver::new(5);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let data = self.session.recv_output().await.unwrap();
+                    receiver
+                        .process_frame(&SspFrame::decode(&data).unwrap())
+                        .unwrap();
+                    if receiver.state().rows.iter().any(|row| row == marker) {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("remote program did not produce its marker");
+        }
+    }
+
+    #[tokio::test]
+    async fn detached_output_reaches_the_authoritative_terminal() {
+        let native = NativeSession::new().await;
+        let gate_dir = tempfile::tempdir().unwrap();
+        let gate = gate_dir.path().join("continue");
+        native.send_command(&format!(
+            "printf '\\033[0m\\033[2J\\033[HREADY'; \
+             while [ ! -e '{}' ]; do sleep 0.01; done; \
+             printf '\\033[0m\\033[2J\\033[HAFTER_DETACH\\n'",
+            gate.display()
+        ));
+        native.wait_for_marker("READY").await;
+        native.session.connection().close(0u32.into(), b"detach");
+        tokio::time::timeout(Duration::from_secs(5), native.task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let detached = native.store.remove(&native.session_id).unwrap();
+        std::fs::write(gate, b"continue").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if detached
+                    .terminal
+                    .lock()
+                    .unwrap()
+                    .snapshot()
+                    .rows
+                    .iter()
+                    .any(|row| row == "AFTER_DETACH")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("detached PTY output was not interpreted");
+
+        let _ = native.store.insert(native.session_id, detached);
+        let (server_conn, client_conn) = tokio::join!(
+            native._fixture.server.accept(),
+            native._fixture.connect(&native._client)
+        );
+        let task = tokio::spawn(handle_server_session(
+            server_conn.unwrap().unwrap(),
+            native.store.clone(),
+            false,
+        ));
+        let mut session = ClientSession::reconnect(client_conn, 5, 80, native.session_id, vec![])
+            .await
+            .unwrap();
+        assert!(matches!(
+            session.recv_control().await.unwrap(),
+            Some(ControlMessage::SessionInfo { .. })
+        ));
+        let data = tokio::time::timeout(Duration::from_secs(5), session.recv_output())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut receiver = SspReceiver::new(5);
+        receiver
+            .process_frame(&SspFrame::decode(&data).unwrap())
+            .unwrap();
+        assert_eq!(receiver.state().rows[0], "AFTER_DETACH");
+        session.connection().close(0u32.into(), b"done");
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn terminal_queries_receive_a_response_from_the_authority() {
+        let native = NativeSession::new().await;
+        native.send_command(
+            "stty -echo -icanon min 1 time 0; \
+             printf '\\033[0m\\033[2J\\033[H\\033[6n'; \
+             reply=$(dd bs=1 count=6 2>/dev/null); stty sane; \
+             if [ \"$reply\" = \"$(printf '\\033[1;1R')\" ]; \
+             then printf 'QUERY_OK\\n'; fi",
+        );
+        native.wait_for_marker("QUERY_OK").await;
+        native.session.connection().close(0u32.into(), b"done");
+        native.task.await.unwrap().unwrap();
+    }
+
     #[tokio::test]
     async fn pending_output_obeys_frame_deadline() {
         let (client_conn, server_conn, _fixture, _client) = crate::testutil::connected_pair().await;
@@ -667,6 +816,7 @@ mod tests {
             Arc::clone(&resized),
         );
         tokio::pin!(output);
+        terminal.lock().unwrap().advance(b"first");
         tx.send(bytes::Bytes::from_static(b"first")).unwrap();
         assert!(
             poll_fn(|cx| Poll::Ready(output.as_mut().poll(cx)))

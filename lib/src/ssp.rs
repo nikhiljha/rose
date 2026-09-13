@@ -524,7 +524,9 @@ impl SspReceiver {
     /// Processes an incoming SSP frame.
     ///
     /// Returns `Some(new_num)` when the state was updated (caller should render).
-    /// Returns `Ok(None)` for ack-only frames, stale frames, or wrong-base frames.
+    /// Returns `Ok(None)` for ack-only frames, stale frames, or unavailable bases.
+    /// Callers should acknowledge all valid screen frames with [`Self::ack_num`],
+    /// including ignored duplicates and frames whose base has been evicted.
     ///
     /// # Errors
     ///
@@ -1028,6 +1030,52 @@ mod tests {
     }
 
     // -- SspReceiver ----------------------------------------------------------
+
+    #[test]
+    fn receiver_recovers_after_its_old_base_is_evicted() {
+        let mut receiver = SspReceiver::new(24);
+        for num in 1..=(MAX_QUEUE_SIZE as u64 + 2) {
+            receiver
+                .process_frame(&make_frame(num - 1, num, 0, &[(0, "current")], 0, 0))
+                .unwrap();
+        }
+        let current = receiver.ack_num();
+        assert_eq!(
+            receiver
+                .process_frame(&make_frame(
+                    1,
+                    current + 1,
+                    0,
+                    &[(0, "obsolete base")],
+                    0,
+                    0
+                ))
+                .unwrap(),
+            None
+        );
+        assert_eq!(receiver.ack_num(), current);
+        assert_eq!(receiver.state().rows[0], "current");
+        assert_eq!(
+            receiver
+                .process_frame(&make_frame(0, current + 2, 0, &[(0, "recovered")], 0, 0))
+                .unwrap(),
+            Some(current + 2)
+        );
+        assert_eq!(receiver.state().rows[0], "recovered");
+    }
+
+    #[test]
+    fn invalid_init_frame_preserves_the_acknowledged_screen() {
+        let mut receiver = SspReceiver::new(24);
+        receiver
+            .process_frame(&make_frame(0, 1, 0, &[(0, "valid")], 3, 2))
+            .unwrap();
+        let previous = receiver.state().clone();
+        let invalid = make_frame(0, 2, 0, &[(0, "partial"), (24, "invalid")], 0, 0);
+        assert!(receiver.process_frame(&invalid).is_err());
+        assert_eq!(receiver.ack_num(), 1);
+        assert_eq!(receiver.state(), &previous);
+    }
 
     #[test]
     fn receiver_applies_updates_from_a_retained_base_without_ack_roundtrips() {
