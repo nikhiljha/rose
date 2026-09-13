@@ -373,7 +373,7 @@ async fn handle_server_session(
         _ => anyhow::bail!("unexpected handshake message"),
     };
 
-    let mut pty_output = pty.subscribe_output();
+    let pty_output = pty.subscribe_output();
     let pty_closed = pty.closed();
     let pty_writer = pty.clone_writer();
 
@@ -382,62 +382,14 @@ async fn handle_server_session(
     let sender_out = Arc::clone(&ssp_sender);
     let resize_notify = Arc::new(tokio::sync::Notify::new());
     let resize_out = Arc::clone(&resize_notify);
-    let output_task = tokio::spawn(async move {
-        let mut dirty = false;
-        let mut last_send = tokio::time::Instant::now();
-        let min_frame_interval = Duration::from_millis(5);
-        let mut retransmit = tokio::time::interval(Duration::from_millis(20));
-        let pty_closed_notified = pty_closed.notified();
-        tokio::pin!(pty_closed_notified);
-        loop {
-            tokio::select! {
-                result = pty_output.recv() => {
-                    match result {
-                        Ok(data) => {
-                            terminal_out.lock().expect("terminal lock poisoned").advance(&data);
-                            dirty = true;
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return true,
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            tracing::warn!(n, "output subscriber lagged");
-                            dirty = true;
-                        }
-                    }
-                }
-                () = resize_out.notified() => dirty = true,
-                _ = retransmit.tick() => {}
-                () = &mut pty_closed_notified => return true,
-            }
-
-            if dirty && last_send.elapsed() >= min_frame_interval {
-                dirty = false;
-                let state = terminal_out
-                    .lock()
-                    .expect("terminal lock poisoned")
-                    .snapshot();
-                last_send = tokio::time::Instant::now();
-
-                let mut sender = sender_out.lock().expect("sender lock poisoned");
-                sender.push_state(state);
-                let frame = sender.generate_frame();
-                drop(sender);
-                if let Some(ref f) = frame
-                    && !send_ssp_frame(f, &session_conn)
-                {
-                    return false;
-                }
-            } else {
-                let sender = sender_out.lock().expect("sender lock poisoned");
-                let frame = sender.generate_frame();
-                drop(sender);
-                if let Some(ref f) = frame
-                    && !send_ssp_frame(f, &session_conn)
-                {
-                    return false;
-                }
-            }
-        }
-    });
+    let output_task = tokio::spawn(forward_pty_output(
+        pty_output,
+        pty_closed,
+        terminal_out,
+        sender_out,
+        session_conn,
+        resize_out,
+    ));
 
     let input_conn = session.connection().clone();
     let sender_input = Arc::clone(&ssp_sender);
@@ -622,14 +574,159 @@ async fn handle_server_session(
     Ok(())
 }
 
+async fn forward_pty_output(
+    mut pty_output: tokio::sync::broadcast::Receiver<bytes::Bytes>,
+    pty_closed: Arc<tokio::sync::Notify>,
+    terminal_out: Arc<Mutex<RoseTerminal>>,
+    sender_out: Arc<Mutex<SspSender>>,
+    session_conn: quinn::Connection,
+    resize_out: Arc<tokio::sync::Notify>,
+) -> bool {
+    let mut dirty = false;
+    let mut last_send = tokio::time::Instant::now();
+    let min_frame_interval = Duration::from_millis(5);
+    let mut retransmit = tokio::time::interval(Duration::from_millis(20));
+    let pty_closed_notified = pty_closed.notified();
+    tokio::pin!(pty_closed_notified);
+    loop {
+        let retransmit_due = tokio::select! {
+            result = pty_output.recv() => {
+                match result {
+                    Ok(data) => {
+                        terminal_out.lock().expect("terminal lock poisoned").advance(&data);
+                        dirty = true;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return true,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(n, "output subscriber lagged");
+                        dirty = true;
+                    }
+                }
+                false
+            }
+            () = resize_out.notified() => { dirty = true; false },
+            () = tokio::time::sleep_until(last_send + min_frame_interval), if dirty => false,
+            _ = retransmit.tick() => true,
+            () = &mut pty_closed_notified => return true,
+        };
+
+        if dirty && last_send.elapsed() >= min_frame_interval {
+            dirty = false;
+            let state = terminal_out
+                .lock()
+                .expect("terminal lock poisoned")
+                .snapshot();
+            last_send = tokio::time::Instant::now();
+
+            sender_out
+                .lock()
+                .expect("sender lock poisoned")
+                .push_state(state);
+        } else if !retransmit_due {
+            continue;
+        }
+        let frame = sender_out
+            .lock()
+            .expect("sender lock poisoned")
+            .generate_frame();
+        if let Some(ref f) = frame
+            && !send_ssp_frame(f, &session_conn)
+        {
+            return false;
+        }
+    }
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
+    use std::future::{Future, poll_fn};
+    use std::task::Poll;
+
     use super::*;
     use crate::protocol::ClientSession;
     use crate::ssp::SspReceiver;
     use crate::testutil::MtlsFixture;
     use crate::transport::QuicClient;
+
+    #[tokio::test]
+    async fn pending_output_obeys_frame_deadline() {
+        let (client_conn, server_conn, _fixture, _client) = crate::testutil::connected_pair().await;
+        tokio::time::pause();
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let terminal = Arc::new(Mutex::new(RoseTerminal::new(5, 20)));
+        let sender = Arc::new(Mutex::new(SspSender::new()));
+        let resized = Arc::new(tokio::sync::Notify::new());
+        let closed = Arc::new(tokio::sync::Notify::new());
+        let output = forward_pty_output(
+            rx,
+            Arc::clone(&closed),
+            Arc::clone(&terminal),
+            Arc::clone(&sender),
+            server_conn,
+            Arc::clone(&resized),
+        );
+        tokio::pin!(output);
+        tx.send(bytes::Bytes::from_static(b"first")).unwrap();
+        assert!(
+            poll_fn(|cx| Poll::Ready(output.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        // Tokio's timer wheel rounds deadlines up to the next millisecond.
+        for (advance_ms, expected_num) in [(4, 0), (2, 1)] {
+            tokio::time::advance(Duration::from_millis(advance_ms)).await;
+            assert!(
+                poll_fn(|cx| Poll::Ready(output.as_mut().poll(cx)))
+                    .await
+                    .is_pending()
+            );
+            assert_eq!(sender.lock().unwrap().current_num(), expected_num);
+        }
+        terminal.lock().unwrap().resize(8, 20);
+        resized.notify_one();
+        assert!(
+            poll_fn(|cx| Poll::Ready(output.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        assert_eq!(sender.lock().unwrap().current_num(), 1);
+        tokio::time::advance(Duration::from_millis(6)).await;
+        assert!(
+            poll_fn(|cx| Poll::Ready(output.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        assert_eq!(sender.lock().unwrap().current_num(), 2);
+        assert_eq!(
+            sender
+                .lock()
+                .unwrap()
+                .generate_frame()
+                .unwrap()
+                .diff
+                .unwrap()
+                .total_rows,
+            8
+        );
+        tokio::time::advance(Duration::from_millis(9)).await;
+        assert!(
+            poll_fn(|cx| Poll::Ready(output.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        assert_eq!(sender.lock().unwrap().current_num(), 2);
+        tokio::time::resume();
+        for expected in [1, 2, 2] {
+            let data = tokio::time::timeout(Duration::from_secs(5), client_conn.read_datagram())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(SspFrame::decode(&data).unwrap().new_num, expected);
+        }
+        closed.notify_one();
+        assert!(output.await);
+    }
 
     #[tokio::test]
     async fn idle_session_resize_sends_updated_screen() {

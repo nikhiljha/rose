@@ -188,10 +188,8 @@ pub struct RoseTerminal {
     /// The wezterm [`SequenceNo`] at the time of the last snapshot.
     /// Rows with a seqno newer than this value are dirty and need re-rendering.
     last_seqno: SequenceNo,
-    /// The physical row index of visible row 0 at the time of the last
-    /// snapshot.  When the viewport scrolls, `phys_row(0)` increases and
-    /// we shift the cached rows to match before checking dirty flags.
-    last_phys_offset: usize,
+    /// The stable index of the first cached visible row.
+    last_first_row: u64,
     /// Whether the cached rows belong to the alternate screen.
     last_alternate_screen: bool,
 }
@@ -215,7 +213,7 @@ impl RoseTerminal {
             inner: terminal,
             cached_rows: vec![String::new(); rows as usize],
             last_seqno: 0,
-            last_phys_offset: 0,
+            last_first_row: 0,
             last_alternate_screen: false,
         }
     }
@@ -240,7 +238,7 @@ impl RoseTerminal {
         // Invalidate cache: reset seqno so all rows are considered dirty,
         // and resize the cache vector to match the new row count.
         self.last_seqno = 0;
-        self.last_phys_offset = 0;
+        self.last_first_row = 0;
         self.cached_rows = vec![String::new(); rows as usize];
     }
 
@@ -287,19 +285,31 @@ impl RoseTerminal {
     /// the format used by [`line_ansi`] for visible rows.
     #[must_use]
     pub fn scrollback_lines(&self) -> Vec<(isize, String)> {
+        self.scrollback_lines_since(-1)
+    }
+
+    /// Returns retained scrollback rows whose stable index is greater than
+    /// `last_stable_row`, with ANSI colors and attributes preserved.
+    #[must_use]
+    pub fn scrollback_lines_since(&self, last_stable_row: isize) -> Vec<(isize, String)> {
         let screen = self.inner.screen();
         let total = screen.scrollback_rows();
         let visible = self.inner.get_size().rows;
         let scrollback_count = total.saturating_sub(visible);
-        if scrollback_count == 0 {
+        let first_stable = screen.phys_to_stable_row_index(0);
+        let start = last_stable_row
+            .saturating_add(1)
+            .saturating_sub(first_stable)
+            .max(0) as usize;
+        if start >= scrollback_count {
             return vec![];
         }
-        let lines = screen.lines_in_phys_range(0..scrollback_count);
+        let lines = screen.lines_in_phys_range(start..scrollback_count);
         lines
             .iter()
             .enumerate()
             .map(|(i, line)| {
-                let stable = screen.phys_to_stable_row_index(i);
+                let stable = screen.phys_to_stable_row_index(start + i);
                 (stable, format_line_cells(line))
             })
             .collect()
@@ -338,15 +348,13 @@ impl RoseTerminal {
             alternate_screen: self.inner.is_alt_screen_active(),
         };
         let seqno = self.last_seqno;
-        let screen_changed = viewport.alternate_screen != self.last_alternate_screen;
+        let screen_changed = viewport.alternate_screen != self.last_alternate_screen
+            || viewport.first_row < self.last_first_row;
 
-        // Compute the physical row offset for visible row 0.
-        let first_phys = screen.phys_row(0);
-
-        // Detect viewport scroll: if the physical offset of visible row 0
-        // has increased, the terminal has scrolled up. Shift the cache so
-        // that entries still correspond to the correct physical lines.
-        let scroll = first_phys.saturating_sub(self.last_phys_offset);
+        let scroll = viewport
+            .first_row
+            .saturating_sub(self.last_first_row)
+            .min(size.rows as u64) as usize;
         if scroll > 0 {
             if scroll >= size.rows {
                 // Scrolled by more than a full screen — invalidate everything.
@@ -369,19 +377,17 @@ impl RoseTerminal {
             self.cached_rows.resize(size.rows, String::new());
         }
 
-        // Read visible rows individually to handle scrollback pruning.
+        let screen = self.inner.screen_mut();
         for row in 0..size.rows {
             let phys = screen.phys_row(row as i64);
-            let phys_lines = screen.lines_in_phys_range(phys..phys + 1);
-            if let Some(line) = phys_lines.first()
-                && (screen_changed || line.changed_since(seqno))
-            {
+            let line = screen.line_mut(phys);
+            if screen_changed || line.changed_since(seqno) {
                 self.cached_rows[row] = format_line_cells(line);
             }
         }
 
         self.last_seqno = self.inner.current_seqno();
-        self.last_phys_offset = first_phys;
+        self.last_first_row = viewport.first_row;
         self.last_alternate_screen = viewport.alternate_screen;
 
         let (cx, cy) = self.cursor_pos();
@@ -1043,6 +1049,17 @@ mod tests {
         let term = RoseTerminal::new(24, 80);
         let ansi = term.line_ansi(5);
         assert_eq!(ansi, "", "empty line should produce empty string");
+    }
+
+    #[test]
+    fn snapshot_tracks_rows_through_scrollback_pruning() {
+        let mut term = RoseTerminal::new(5, 40);
+        for i in 0..7100 {
+            term.advance(format!("\x1b[32mline {i}\x1b[0m\r\n").as_bytes());
+            let snapshot = term.snapshot();
+            let expected: Vec<_> = (0..5).map(|row| term.line_ansi(row)).collect();
+            assert_eq!(snapshot.rows, expected, "after line {i}");
+        }
     }
 
     #[test]

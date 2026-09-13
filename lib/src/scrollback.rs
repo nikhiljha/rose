@@ -87,10 +87,9 @@ impl ScrollbackSender {
         &mut self,
         terminal: &crate::terminal::RoseTerminal,
     ) -> Vec<ScrollbackLine> {
-        let lines = terminal.scrollback_lines();
+        let lines = terminal.scrollback_lines_since(self.last_sent_stable_row);
         let new_lines: Vec<ScrollbackLine> = lines
             .into_iter()
-            .filter(|(stable, _)| *stable > self.last_sent_stable_row)
             .map(|(stable, text)| ScrollbackLine {
                 stable_row: stable,
                 text,
@@ -275,6 +274,54 @@ mod tests {
             second.len() < first_count + 5,
             "should only collect new lines, not all lines"
         );
+    }
+
+    #[test]
+    fn sender_handles_pruning_clear_resize_and_alternate_screen() {
+        let mut term = crate::terminal::RoseTerminal::new(5, 40);
+        let mut sender = ScrollbackSender::new();
+        let mut last = -1;
+        for phase in 0..4 {
+            for i in 0..3800 {
+                term.advance(format!("\x1b[31m{phase}:{i}\x1b[0m\r\n").as_bytes());
+            }
+            let all = term.scrollback_lines();
+            let expected: Vec<_> = all.into_iter().filter(|(row, _)| *row > last).collect();
+            let collected = sender.collect_new_lines(&term);
+            assert!(!collected.is_empty());
+            assert_eq!(
+                collected
+                    .iter()
+                    .map(|line| (line.stable_row, line.text.clone()))
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            last = collected.last().unwrap().stable_row;
+            assert!(sender.collect_new_lines(&term).is_empty());
+            assert!(term.scrollback_lines_since(isize::MAX).is_empty());
+            assert_eq!(
+                term.scrollback_lines_since(isize::MIN),
+                term.scrollback_lines()
+            );
+
+            let mut reattached = ScrollbackSender::new();
+            assert_eq!(
+                reattached.collect_new_lines(&term).len(),
+                term.scrollback_lines().len()
+            );
+            match phase {
+                0 => term.advance(b"\x1b[3J"),
+                1 => term.resize(10, 80),
+                2 => {
+                    term.advance(
+                        b"\x1b[?1049h1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7\r\n8\r\n9\r\n10\r\n11",
+                    );
+                    assert!(sender.collect_new_lines(&term).is_empty());
+                    term.advance(b"\x1b[?1049l");
+                }
+                _ => {}
+            }
+        }
     }
 
     #[test]

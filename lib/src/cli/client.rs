@@ -1,7 +1,9 @@
+use std::future::{Future, poll_fn};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -20,6 +22,27 @@ use crate::ssp::{
     render_full_redraw,
 };
 use crate::transport::QuicClient;
+
+async fn drain_ssp_frames(conn: &quinn::Connection, data: &[u8]) -> Option<SspFrame> {
+    poll_fn(|cx| {
+        let mut best = SspFrame::decode(data).ok();
+        for _ in 0..64 {
+            let read = conn.read_datagram();
+            tokio::pin!(read);
+            let Poll::Ready(Ok(more)) = read.poll(cx) else {
+                break;
+            };
+            if let Ok(frame) = SspFrame::decode(&more) {
+                match &best {
+                    Some(b) if frame.new_num <= b.new_num => {}
+                    _ => best = Some(frame),
+                }
+            }
+        }
+        Poll::Ready(best)
+    })
+    .await
+}
 
 /// Marker that STUN was used for the initial connection.
 ///
@@ -507,18 +530,7 @@ async fn client_session_loop_inner(
                     result = output_conn.read_datagram() => {
                         match result {
                             Ok(data) => {
-                                let mut best = SspFrame::decode(&data).ok();
-                                while let Ok(Ok(more)) = tokio::time::timeout(
-                                    Duration::ZERO,
-                                    output_conn.read_datagram(),
-                                ).await {
-                                    if let Ok(frame) = SspFrame::decode(&more) {
-                                        match &best {
-                                            Some(b) if frame.new_num <= b.new_num => {}
-                                            _ => best = Some(frame),
-                                        }
-                                    }
-                                }
+                                let best = drain_ssp_frames(&output_conn, &data).await;
                                 if let Some(ref frame) = best {
                                     process_ssp_frame(
                                         frame,
@@ -1013,5 +1025,59 @@ fn process_ssp_frame(
         Err(e) => {
             tracing::warn!("SSP frame error: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn empty_datagram_drain_is_immediately_ready() {
+        let (client, _server, _fixture, _endpoint) = crate::testutil::connected_pair().await;
+        let data = SspFrame::ack_only(1).encode();
+        let drain = drain_ssp_frames(&client, &data);
+        tokio::pin!(drain);
+        assert!(matches!(
+            poll_fn(|cx| Poll::Ready(drain.as_mut().poll(cx))).await,
+            Poll::Ready(Some(_))
+        ));
+        client.close(0u32.into(), b"done");
+        assert!(drain_ssp_frames(&client, b"invalid").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn datagram_drain_selects_newest_valid_frame_and_bounds_work() {
+        let (client, server, _fixture, _endpoint) = crate::testutil::connected_pair().await;
+        for new_num in 1..=66 {
+            let data = if new_num == 10 {
+                b"invalid".to_vec()
+            } else {
+                SspFrame {
+                    new_num: if new_num == 20 { 1 } else { new_num },
+                    ..SspFrame::ack_only(0)
+                }
+                .encode()
+            };
+            server.send_datagram(data.into()).unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while client.stats().frame_rx.datagram < 66 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            drain_ssp_frames(&client, b"invalid").await.unwrap().new_num,
+            64
+        );
+        let remaining = client.read_datagram().await.unwrap();
+        assert_eq!(SspFrame::decode(&remaining).unwrap().new_num, 65);
+        assert_eq!(
+            drain_ssp_frames(&client, &remaining).await.unwrap().new_num,
+            66
+        );
     }
 }

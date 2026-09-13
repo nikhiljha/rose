@@ -17,6 +17,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use rose::config::generate_self_signed_cert;
 use rose::protocol::{ClientSession, ServerSession};
 use rose::pty::PtySession;
+use rose::scrollback::ScrollbackSender;
 use rose::ssp::{
     DATAGRAM_KEYSTROKE, DATAGRAM_SSP_ACK, ScreenState, SspFrame, SspReceiver, SspSender,
     render_diff_ansi,
@@ -269,10 +270,65 @@ fn ssp_pipeline(c: &mut Criterion) {
     group.finish();
 }
 
+fn cached_snapshots(c: &mut Criterion) {
+    let mut group = c.benchmark_group("cached_snapshot");
+    for (rows, cols) in [(24, 80), (200, 200)] {
+        for history in [0, 5000] {
+            let mut term = RoseTerminal::new(rows, cols);
+            for _ in 0..history {
+                term.advance(b"\x1b[32mcompiler output\x1b[0m\r\n");
+            }
+            fill_with_ansi(&mut term, rows, cols);
+            let _ = term.snapshot();
+            let label = format!("{rows}x{cols}/history_{history}");
+            group.bench_function(format!("{label}/idle"), |b| b.iter(|| term.snapshot()));
+            let mut alternate = false;
+            group.bench_function(format!("{label}/styled_row"), |b| {
+                b.iter(|| {
+                    alternate = !alternate;
+                    term.advance(if alternate {
+                        b"\x1b[H\x1b[31mchanged\x1b[0m"
+                    } else {
+                        b"\x1b[H\x1b[32mupdated\x1b[0m"
+                    });
+                    term.snapshot()
+                });
+            });
+        }
+    }
+    group.finish();
+}
+
+fn scrollback_collection(c: &mut Criterion) {
+    let mut group = c.benchmark_group("scrollback_collection");
+    for history in [0, 1000, 5000] {
+        let mut term = RoseTerminal::new(24, 80);
+        for _ in 0..history {
+            term.advance(b"\x1b[32mcompiler output\x1b[0m\r\n");
+        }
+        let mut sender = ScrollbackSender::new();
+        let _ = sender.collect_new_lines(&term);
+        group.bench_function(format!("idle/history_{history}"), |b| {
+            b.iter(|| sender.collect_new_lines(&term));
+        });
+        if history == 5000 {
+            group.bench_function("one_new_line/full_history", |b| {
+                b.iter(|| {
+                    term.advance(b"\x1b[32mcompiler output\x1b[0m\r\n");
+                    sender.collect_new_lines(&term)
+                });
+            });
+        }
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     keystroke_roundtrip,
     terminal_pipeline,
-    ssp_pipeline
+    ssp_pipeline,
+    cached_snapshots,
+    scrollback_collection
 );
 criterion_main!(benches);
