@@ -1016,16 +1016,18 @@ fn process_ssp_frame(
                 let _ = out.flush();
                 *screen = new_state;
             }
-
-            let ack = SspFrame::ack_only(recv.ack_num());
-            let mut ack_data = vec![DATAGRAM_SSP_ACK];
-            ack_data.extend_from_slice(&ack.encode());
-            let _ = conn.send_datagram(Bytes::from(ack_data));
         }
         Ok(None) => {}
         Err(e) => {
             tracing::warn!("SSP frame error: {e}");
+            return;
         }
+    }
+    if frame.diff.is_some() {
+        let ack = SspFrame::ack_only(recv.ack_num());
+        let mut ack_data = vec![DATAGRAM_SSP_ACK];
+        ack_data.extend_from_slice(&ack.encode());
+        let _ = conn.send_datagram(Bytes::from(ack_data));
     }
 }
 
@@ -1033,6 +1035,35 @@ fn process_ssp_frame(
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn duplicate_and_unknown_base_frames_acknowledge_current_state() {
+        let (client, server, _fixture, _endpoint) = crate::testutil::connected_pair().await;
+        let receiver = Arc::new(Mutex::new(SspReceiver::new(4)));
+        let screen = Arc::new(Mutex::new(ScreenState::empty(4)));
+        let history = Arc::new(Mutex::new(ScrollbackReceiver::new()));
+        let rendered = Arc::new(Mutex::new(0));
+        let initial = SspFrame {
+            old_num: 0,
+            new_num: 2,
+            ack_num: 0,
+            diff: Some(ScreenState::empty(4).diff_from_empty()),
+        };
+        let unknown_base = SspFrame {
+            old_num: 1,
+            new_num: 3,
+            ..initial.clone()
+        };
+        for frame in [&initial, &initial, &unknown_base] {
+            process_ssp_frame(frame, &receiver, &screen, &client, &history, &rendered);
+            let data = tokio::time::timeout(Duration::from_secs(1), server.read_datagram())
+                .await
+                .expect("every valid screen frame must elicit an ACK")
+                .unwrap();
+            assert_eq!(data[0], DATAGRAM_SSP_ACK);
+            assert_eq!(SspFrame::decode(&data[1..]).unwrap().ack_num, 2);
+        }
+    }
 
     #[tokio::test]
     async fn empty_datagram_drain_is_immediately_ready() {
