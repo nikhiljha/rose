@@ -19,7 +19,7 @@ use crate::protocol::{ClientSession, ControlMessage};
 use crate::scrollback::{self, ScrollbackLine, ScrollbackReceiver};
 use crate::ssp::{
     DATAGRAM_KEYSTROKE, DATAGRAM_SSP_ACK, ScreenState, SspFrame, SspReceiver, render_diff_ansi,
-    render_full_redraw,
+    render_full_redraw, scrollback_before_viewport,
 };
 use crate::transport::QuicClient;
 
@@ -930,7 +930,7 @@ fn do_full_redraw(
         .expect("rendered count lock poisoned");
 
     let ansi = render_full_redraw(sb.lines(), new_state);
-    *count = sb.len();
+    *count = scrollback_before_viewport(sb.lines(), new_state.viewport).len();
     drop(sb);
     drop(count);
 
@@ -955,18 +955,18 @@ fn maybe_render_scrollback(
     scrollback_rx: &Arc<Mutex<ScrollbackReceiver>>,
     rendered_sb_count: &Arc<Mutex<usize>>,
 ) {
+    let recv = receiver.lock().expect("receiver lock poisoned");
     let needs_redraw = {
         let sb = scrollback_rx.lock().expect("scrollback lock poisoned");
         let count = rendered_sb_count
             .lock()
             .expect("rendered count lock poisoned");
-        sb.len() != *count
+        scrollback_before_viewport(sb.lines(), recv.state().viewport).len() != *count
     };
     if !needs_redraw {
         return;
     }
 
-    let recv = receiver.lock().expect("receiver lock poisoned");
     let state = recv.state().clone();
     drop(recv);
 
@@ -1003,7 +1003,8 @@ fn process_ssp_frame(
                 let count = rendered_sb_count
                     .lock()
                     .expect("rendered count lock poisoned");
-                sb.len() != *count || new_state.rows.len() != screen.rows.len()
+                scrollback_before_viewport(sb.lines(), new_state.viewport).len() != *count
+                    || new_state.rows.len() != screen.rows.len()
             };
 
             if needs_full_redraw {

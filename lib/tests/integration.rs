@@ -2,11 +2,71 @@
 
 use std::time::Duration;
 
-use rose::ssp::{ScreenDiff, ScreenState, SspReceiver, SspSender, render_diff_ansi};
+use rose::scrollback::ScrollbackSender;
+use rose::ssp::{
+    ScreenDiff, ScreenState, SspReceiver, SspSender, render_diff_ansi, render_full_redraw,
+};
 use rose::terminal::RoseTerminal;
 
 mod common;
 use common::MtlsFixture;
+
+#[test]
+fn full_redraw_excludes_history_pulled_back_into_a_growing_viewport() {
+    let mut server = RoseTerminal::new(7, 40);
+    let mut sender = ScrollbackSender::new();
+    for line in 1..=25 {
+        server.advance(format!("line {line}\r\n").as_bytes());
+    }
+    let mut history = sender.collect_new_lines(&server);
+    server.resize(5, 40);
+    history.extend(sender.collect_new_lines(&server));
+    server.resize(7, 40);
+    let visible = server.snapshot();
+    let mut client = RoseTerminal::new(7, 40);
+    client.advance(&render_full_redraw(&history, &visible));
+    assert_eq!(client.snapshot().rows, visible.rows);
+    assert_eq!(
+        client
+            .scrollback_lines()
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect::<Vec<_>>(),
+        server
+            .scrollback_lines()
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn full_redraw_defers_history_received_ahead_of_the_screen() {
+    let mut server = RoseTerminal::new(5, 40);
+    server.advance(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+    let visible = server.snapshot();
+    server.advance(b"\r\nsix\r\nseven\r\neight");
+    let history = ScrollbackSender::new().collect_new_lines(&server);
+    let mut client = RoseTerminal::new(5, 40);
+    client.advance(&render_full_redraw(&history, &visible));
+    assert_eq!(client.snapshot().rows, visible.rows);
+    assert!(client.scrollback_lines().is_empty());
+    let latest = server.snapshot();
+    client.advance(&render_full_redraw(&history, &latest));
+    assert_eq!(client.snapshot().rows, latest.rows);
+    assert_eq!(
+        client
+            .scrollback_lines()
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect::<Vec<_>>(),
+        server
+            .scrollback_lines()
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect::<Vec<_>>()
+    );
+}
 
 #[test]
 fn ssp_shrink_preserves_remaining_rows() {
