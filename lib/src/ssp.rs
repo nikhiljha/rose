@@ -20,6 +20,15 @@ pub enum SspError {
     InvalidDiff(String),
 }
 
+/// Identity of the terminal viewport within its screen buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Viewport {
+    /// Stable index of the first visible row.
+    pub first_row: u64,
+    /// Whether the alternate screen buffer is active.
+    pub alternate_screen: bool,
+}
+
 /// Snapshot of visible terminal screen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScreenState {
@@ -29,6 +38,8 @@ pub struct ScreenState {
     pub cursor_x: u16,
     /// Cursor row.
     pub cursor_y: u16,
+    /// Viewport identity, absent in frames from older peers.
+    pub viewport: Option<Viewport>,
 }
 
 impl ScreenState {
@@ -39,6 +50,7 @@ impl ScreenState {
             rows: vec![String::new(); rows as usize],
             cursor_x: 0,
             cursor_y: 0,
+            viewport: None,
         }
     }
 
@@ -47,15 +59,14 @@ impl ScreenState {
     #[tracing::instrument(level = "trace", skip_all)]
     pub fn diff_from(&self, old: &Self) -> ScreenDiff {
         let mut changed_rows = Vec::new();
-        let max_rows = self.rows.len().max(old.rows.len());
-        for i in 0..max_rows {
+        for (i, new_row) in self.rows.iter().enumerate() {
             let old_row = old.rows.get(i).map_or("", String::as_str);
-            let new_row = self.rows.get(i).map_or("", String::as_str);
             if old_row != new_row {
-                changed_rows.push((i as u16, new_row.to_string()));
+                changed_rows.push((i as u16, new_row.clone()));
             }
         }
         ScreenDiff {
+            viewport: self.viewport,
             changed_rows,
             cursor_x: self.cursor_x,
             cursor_y: self.cursor_y,
@@ -74,6 +85,7 @@ impl ScreenState {
             .map(|(i, row)| (i as u16, row.clone()))
             .collect();
         ScreenDiff {
+            viewport: self.viewport,
             changed_rows,
             cursor_x: self.cursor_x,
             cursor_y: self.cursor_y,
@@ -101,6 +113,7 @@ impl ScreenState {
         }
         self.cursor_x = diff.cursor_x;
         self.cursor_y = diff.cursor_y;
+        self.viewport = diff.viewport;
         Ok(())
     }
 }
@@ -116,6 +129,8 @@ pub struct ScreenDiff {
     pub cursor_y: u16,
     /// Total row count (handles resize).
     pub total_rows: u16,
+    /// Viewport identity, absent in frames from older peers.
+    pub viewport: Option<Viewport>,
 }
 
 impl ScreenDiff {
@@ -123,6 +138,7 @@ impl ScreenDiff {
     ///
     /// Format: `[cursor_x: u16][cursor_y: u16][total_rows: u16][num_changed: u16]`
     /// followed by each changed row: `[row_index: u16][text_len: u16][text bytes]`
+    /// and optionally `[alternate_screen: u8][first_row: u64]`.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::new();
@@ -134,6 +150,10 @@ impl ScreenDiff {
             buf.extend_from_slice(&idx.to_be_bytes());
             buf.extend_from_slice(&(text.len() as u16).to_be_bytes());
             buf.extend_from_slice(text.as_bytes());
+        }
+        if let Some(viewport) = self.viewport {
+            buf.push(u8::from(viewport.alternate_screen));
+            buf.extend_from_slice(&viewport.first_row.to_be_bytes());
         }
         buf
     }
@@ -172,11 +192,34 @@ impl ScreenDiff {
             offset += text_len;
             changed_rows.push((idx, text));
         }
+        let viewport = if data.len() == offset {
+            None
+        } else {
+            let bytes = data
+                .get(offset..offset + 9)
+                .ok_or_else(|| SspError::MalformedFrame("truncated viewport".to_string()))?;
+            let alternate_screen = match bytes[0] {
+                0 => false,
+                1 => true,
+                _ => {
+                    return Err(SspError::MalformedFrame(
+                        "invalid screen buffer".to_string(),
+                    ));
+                }
+            };
+            Some(Viewport {
+                first_row: u64::from_be_bytes([
+                    bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], bytes[8],
+                ]),
+                alternate_screen,
+            })
+        };
         Ok(Self {
             changed_rows,
             cursor_x,
             cursor_y,
             total_rows,
+            viewport,
         })
     }
 }
@@ -523,28 +566,19 @@ impl SspReceiver {
     }
 }
 
-/// Detects whether `new` is `old` scrolled up by `k` lines, i.e. the top `k`
-/// lines were pushed off and `k` new lines appeared at the bottom.
-///
-/// Returns `Some(k)` if `old[k..] == new[..n-k]` for some `k >= 1`.
+/// Detects upward viewport movement with unchanged overlapping rows.
 fn detect_scroll_up(old: &ScreenState, new: &ScreenState) -> Option<usize> {
     let n = old.rows.len();
     if n == 0 || n != new.rows.len() {
         return None;
     }
-    // Check shift amounts 1..n (stop early once rows diverge)
-    for k in 1..n {
-        if old.rows[k..] == new.rows[..n - k] {
-            return Some(k);
-        }
-        // Optimisation: if old[k] != new[0] there's no point checking larger k
-        // values (they'd require old[k+1..] == new[..n-k-1] which can't hold
-        // when old[k] already didn't match new[0]).
-        if old.rows[k] != new.rows[0] {
-            break;
-        }
+    let from = old.viewport?;
+    let to = new.viewport?;
+    if from.alternate_screen || to.alternate_screen {
+        return None;
     }
-    None
+    let k = usize::try_from(to.first_row.checked_sub(from.first_row)?).ok()?;
+    ((1..n).contains(&k) && old.rows[k..] == new.rows[..n - k]).then_some(k)
 }
 
 /// Generates minimal ANSI escape sequences to update the real terminal
@@ -554,6 +588,7 @@ fn detect_scroll_up(old: &ScreenState, new: &ScreenState) -> Option<usize> {
 /// at the bottom of the screen so the user's terminal scrolls and builds
 /// up a scrollback buffer. Non-scroll changes use absolute cursor
 /// positioning to update individual rows in place.
+/// Without viewport metadata, history is supplied by the scrollback stream.
 #[must_use]
 #[tracing::instrument(level = "trace", skip_all)]
 pub fn render_diff_ansi(old: &ScreenState, new: &ScreenState) -> Vec<u8> {
@@ -665,6 +700,7 @@ mod tests {
             new_num: new,
             ack_num: ack,
             diff: Some(ScreenDiff {
+                viewport: None,
                 changed_rows: rows.iter().map(|(i, s)| (*i, (*s).into())).collect(),
                 cursor_x: cx,
                 cursor_y: cy,
@@ -678,6 +714,7 @@ mod tests {
     #[test]
     fn diff_identical_states() {
         let state = ScreenState {
+            viewport: None,
             rows: vec!["hello".into(), "world".into()],
             cursor_x: 3,
             cursor_y: 1,
@@ -692,11 +729,13 @@ mod tests {
     #[test]
     fn diff_one_row_changed() {
         let old = ScreenState {
+            viewport: None,
             rows: vec!["hello".into(), "world".into()],
             cursor_x: 0,
             cursor_y: 0,
         };
         let new = ScreenState {
+            viewport: None,
             rows: vec!["hello".into(), "earth".into()],
             cursor_x: 0,
             cursor_y: 0,
@@ -708,11 +747,13 @@ mod tests {
     #[test]
     fn diff_cursor_only() {
         let old = ScreenState {
+            viewport: None,
             rows: vec!["abc".into()],
             cursor_x: 0,
             cursor_y: 0,
         };
         let new = ScreenState {
+            viewport: None,
             rows: vec!["abc".into()],
             cursor_x: 3,
             cursor_y: 0,
@@ -725,6 +766,7 @@ mod tests {
     #[test]
     fn diff_from_none_includes_all_nonempty() {
         let state = ScreenState {
+            viewport: None,
             rows: vec!["hello".into(), String::new(), "world".into()],
             cursor_x: 5,
             cursor_y: 2,
@@ -740,11 +782,13 @@ mod tests {
     #[test]
     fn apply_diff_roundtrip() {
         let old = ScreenState {
+            viewport: None,
             rows: vec!["aaa".into(), "bbb".into(), "ccc".into()],
             cursor_x: 0,
             cursor_y: 0,
         };
         let new = ScreenState {
+            viewport: None,
             rows: vec!["aaa".into(), "XXX".into(), "ccc".into()],
             cursor_x: 2,
             cursor_y: 1,
@@ -758,11 +802,13 @@ mod tests {
     #[test]
     fn apply_diff_resize() {
         let mut state = ScreenState {
+            viewport: None,
             rows: vec!["a".into(), "b".into()],
             cursor_x: 0,
             cursor_y: 0,
         };
         let diff = ScreenDiff {
+            viewport: None,
             changed_rows: vec![(2, "c".into())],
             cursor_x: 0,
             cursor_y: 2,
@@ -779,6 +825,7 @@ mod tests {
     #[test]
     fn screen_diff_encode_decode() {
         let diff = ScreenDiff {
+            viewport: None,
             changed_rows: vec![(0, "hello".into()), (3, "world".into())],
             cursor_x: 5,
             cursor_y: 0,
@@ -787,6 +834,40 @@ mod tests {
         let encoded = diff.encode();
         let decoded = ScreenDiff::decode(&encoded).unwrap();
         assert_eq!(diff, decoded);
+    }
+
+    #[test]
+    fn viewport_extension_roundtrip_and_legacy_decode() {
+        let mut state = ScreenState::empty(3);
+        state.rows[0] = "hello".into();
+        let legacy = state.diff_from_empty().encode();
+        assert_eq!(ScreenDiff::decode(&legacy).unwrap().viewport, None);
+
+        for alternate_screen in [false, true] {
+            state.viewport = Some(Viewport {
+                first_row: u64::MAX,
+                alternate_screen,
+            });
+            let diff = state.diff_from_empty();
+            let encoded = diff.encode();
+            assert_eq!(&encoded[..legacy.len()], legacy);
+            let decoded = ScreenDiff::decode(&encoded).unwrap();
+            let mut received = ScreenState::empty(3);
+            received.apply_diff(&decoded).unwrap();
+            assert_eq!(received, state);
+        }
+    }
+
+    #[test]
+    fn viewport_extension_rejects_malformed_data() {
+        let legacy = ScreenState::empty(3).diff_from_empty().encode();
+        let mut truncated = legacy.clone();
+        truncated.push(0);
+        assert!(ScreenDiff::decode(&truncated).is_err());
+
+        let mut invalid = legacy;
+        invalid.extend_from_slice(&[2; 9]);
+        assert!(ScreenDiff::decode(&invalid).is_err());
     }
 
     // -- SspFrame encode/decode -----------------------------------------------
@@ -819,6 +900,7 @@ mod tests {
             rows,
             cursor_x: 5,
             cursor_y: 0,
+            viewport: None,
         });
 
         let frame = sender.generate_frame().unwrap();
@@ -838,6 +920,7 @@ mod tests {
         rows1[1] = "line two".into();
         rows1[2] = "line three".into();
         sender.push_state(ScreenState {
+            viewport: None,
             rows: rows1,
             cursor_x: 0,
             cursor_y: 0,
@@ -850,6 +933,7 @@ mod tests {
         rows2[1] = "line two MODIFIED".into();
         rows2[2] = "line three".into();
         sender.push_state(ScreenState {
+            viewport: None,
             rows: rows2,
             cursor_x: 0,
             cursor_y: 0,
@@ -880,6 +964,7 @@ mod tests {
         let mut rows = vec![String::new(); 24];
         rows[0] = "hello".into();
         sender.push_state(ScreenState {
+            viewport: None,
             rows: rows.clone(),
             cursor_x: 0,
             cursor_y: 0,
@@ -889,6 +974,7 @@ mod tests {
         // Push 32 more identical states (nums 2..=33), triggering pruning
         for _ in 0..32 {
             sender.push_state(ScreenState {
+                viewport: None,
                 rows: rows.clone(),
                 cursor_x: 0,
                 cursor_y: 0,
@@ -899,6 +985,7 @@ mod tests {
         let mut rows2 = vec![String::new(); 24];
         rows2[0] = "hello world".into();
         sender.push_state(ScreenState {
+            viewport: None,
             rows: rows2,
             cursor_x: 0,
             cursor_y: 0,
@@ -974,11 +1061,13 @@ mod tests {
     #[test]
     fn render_diff_changed_row() {
         let old = ScreenState {
+            viewport: None,
             rows: vec!["abc".into(), "def".into()],
             cursor_x: 0,
             cursor_y: 0,
         };
         let new = ScreenState {
+            viewport: None,
             rows: vec!["abc".into(), "xyz".into()],
             cursor_x: 0,
             cursor_y: 0,
@@ -996,11 +1085,13 @@ mod tests {
     #[test]
     fn render_diff_cursor_position() {
         let old = ScreenState {
+            viewport: None,
             rows: vec!["same".into()],
             cursor_x: 0,
             cursor_y: 0,
         };
         let new = ScreenState {
+            viewport: None,
             rows: vec!["same".into()],
             cursor_x: 4,
             cursor_y: 0,
@@ -1016,6 +1107,7 @@ mod tests {
     #[test]
     fn render_full_redraw_no_scrollback() {
         let state = ScreenState {
+            viewport: None,
             rows: vec!["hello".into(), "world".into()],
             cursor_x: 5,
             cursor_y: 0,
@@ -1066,6 +1158,7 @@ mod tests {
             },
         ];
         let state = ScreenState {
+            viewport: None,
             rows: vec!["visible A".into(), "visible B".into()],
             cursor_x: 3,
             cursor_y: 1,
@@ -1127,6 +1220,7 @@ mod tests {
     fn apply_diff_out_of_bounds_is_error() {
         let mut state = ScreenState::empty(2);
         let diff = ScreenDiff {
+            viewport: None,
             changed_rows: vec![(5, "oob".into())],
             cursor_x: 0,
             cursor_y: 0,
@@ -1209,6 +1303,7 @@ mod tests {
             .map(|i| format!("row {i} with lots of text padding here"))
             .collect();
         sender.push_state(ScreenState {
+            viewport: None,
             rows: rows1,
             cursor_x: 0,
             cursor_y: 0,
@@ -1221,6 +1316,7 @@ mod tests {
         let mut rows2 = vec![String::new(); 24];
         rows2[0] = "only this row".into();
         sender.push_state(ScreenState {
+            viewport: None,
             rows: rows2,
             cursor_x: 0,
             cursor_y: 0,
@@ -1296,6 +1392,7 @@ mod tests {
             new_num: 1,
             ack_num: 0,
             diff: Some(ScreenDiff {
+                viewport: None,
                 changed_rows: vec![(5, "oob".into())],
                 cursor_x: 0,
                 cursor_y: 0,
@@ -1322,6 +1419,10 @@ mod tests {
     #[test]
     fn detect_scroll_up_no_scroll() {
         let state = ScreenState {
+            viewport: Some(Viewport {
+                first_row: 0,
+                alternate_screen: false,
+            }),
             rows: vec!["a".into(), "b".into(), "c".into()],
             cursor_x: 0,
             cursor_y: 0,
@@ -1332,11 +1433,19 @@ mod tests {
     #[test]
     fn detect_scroll_up_one_line() {
         let old = ScreenState {
+            viewport: Some(Viewport {
+                first_row: 0,
+                alternate_screen: false,
+            }),
             rows: vec!["a".into(), "b".into(), "c".into()],
             cursor_x: 0,
             cursor_y: 0,
         };
         let new = ScreenState {
+            viewport: Some(Viewport {
+                first_row: 1,
+                alternate_screen: false,
+            }),
             rows: vec!["b".into(), "c".into(), "d".into()],
             cursor_x: 0,
             cursor_y: 0,
@@ -1345,14 +1454,21 @@ mod tests {
     }
 
     #[test]
-    fn detect_scroll_up_early_exit() {
-        // old[1] != new[0], so k>1 can't work
+    fn detect_scroll_up_mismatched_content() {
         let old = ScreenState {
+            viewport: Some(Viewport {
+                first_row: 0,
+                alternate_screen: false,
+            }),
             rows: vec!["a".into(), "x".into(), "c".into()],
             cursor_x: 0,
             cursor_y: 0,
         };
         let new = ScreenState {
+            viewport: Some(Viewport {
+                first_row: 1,
+                alternate_screen: false,
+            }),
             rows: vec!["y".into(), "z".into(), "w".into()],
             cursor_x: 0,
             cursor_y: 0,
@@ -1366,6 +1482,7 @@ mod tests {
         // Push many states to exceed MAX_QUEUE_SIZE
         for i in 0..35 {
             let state = ScreenState {
+                viewport: None,
                 rows: vec![format!("line {i}")],
                 cursor_x: 0,
                 cursor_y: 0,

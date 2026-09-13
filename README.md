@@ -44,8 +44,12 @@ rose connect --ssh user@myserver.example.com
 While connected, press `Enter` then `~` to access escape commands:
 
 - `~.` — disconnect
+- `~d` — detach and print a command to reattach to the same session
 - `~~` — send a literal `~`
 - `~?` — show help
+
+The reattach command includes `--session <id>` and preserves the host, port,
+and any explicit certificate paths. Run that command to resume the saved shell.
 
 ## Building
 

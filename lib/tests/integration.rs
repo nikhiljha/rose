@@ -2,8 +2,104 @@
 
 use std::time::Duration;
 
+use rose::ssp::{ScreenDiff, ScreenState, SspReceiver, SspSender, render_diff_ansi};
+use rose::terminal::RoseTerminal;
+
 mod common;
 use common::MtlsFixture;
+
+#[test]
+fn ssp_shrink_preserves_remaining_rows() {
+    let mut sender = SspSender::new();
+    let mut receiver = SspReceiver::new(8);
+    let mut state = ScreenState {
+        viewport: None,
+        rows: (0..8).map(|i| format!("line {i}")).collect(),
+        cursor_x: 0,
+        cursor_y: 0,
+    };
+    sender.push_state(state.clone());
+    receiver
+        .process_frame(&sender.generate_frame().unwrap())
+        .unwrap();
+    sender.process_ack(receiver.ack_num());
+
+    state.rows.truncate(7);
+    sender.push_state(state.clone());
+    let frame = sender.generate_frame().unwrap();
+    receiver.process_frame(&frame).unwrap();
+    assert_eq!(receiver.state(), &state);
+}
+
+#[test]
+fn ssp_render_batched_scroll_preserves_history() {
+    let mut server = RoseTerminal::new(5, 20);
+    let mut client = RoseTerminal::new(5, 20);
+    server.advance(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+    let old = server.snapshot();
+    client.advance(&render_diff_ansi(&ScreenState::empty(5), &old));
+
+    server.advance(b"\r\nsix\r\nseven");
+    let new = server.snapshot();
+    client.advance(&render_diff_ansi(&old, &new));
+
+    assert_eq!(client.snapshot(), new);
+    assert_eq!(client.scrollback_lines(), server.scrollback_lines());
+}
+
+#[test]
+fn ssp_render_cursor_only_does_not_scroll_blank_rows() {
+    let mut server = RoseTerminal::new(5, 20);
+    let mut client = RoseTerminal::new(5, 20);
+    let old = server.snapshot();
+    server.advance(b"\x1b[3;4H");
+    let new = server.snapshot();
+    client.advance(&render_diff_ansi(&old, &new));
+
+    assert_eq!(client.snapshot(), new);
+    assert!(client.scrollback_lines().is_empty());
+}
+
+#[test]
+fn ssp_render_coincidental_overlap_does_not_create_history() {
+    let mut server = RoseTerminal::new(5, 20);
+    let mut client = RoseTerminal::new(5, 20);
+    server.advance(b"a\r\nb\r\nc\r\nd\r\ne");
+    let old = server.snapshot();
+    client.advance(&render_diff_ansi(&ScreenState::empty(5), &old));
+
+    server.advance(b"\x1b[He\r\nx\r\ny\r\nz\r\nw");
+    let state = server.snapshot();
+    let diff = ScreenDiff::decode(&state.diff_from(&old).encode()).unwrap();
+    let mut received = old.clone();
+    received.apply_diff(&diff).unwrap();
+    client.advance(&render_diff_ansi(&old, &received));
+
+    assert_eq!(client.snapshot(), state);
+    assert_eq!(client.scrollback_lines(), server.scrollback_lines());
+}
+
+#[test]
+fn ssp_render_alternate_screen_does_not_create_history() {
+    let mut server = RoseTerminal::new(5, 20);
+    let mut client = RoseTerminal::new(5, 20);
+    server.advance(b"a\r\nb\r\nc\r\nd\r\ne");
+    let mut old = server.snapshot();
+    client.advance(&render_diff_ansi(&ScreenState::empty(5), &old));
+
+    let updates: &[&[u8]] = &[b"\x1b[?1049hb\r\nc\r\nd\r\ne\r\nf", b"\x1b[?1049l"];
+    for output in updates {
+        server.advance(output);
+        let new = server.snapshot();
+        client.advance(&render_diff_ansi(&old, &new));
+        let rendered = client.snapshot();
+        assert_eq!(rendered.rows, new.rows);
+        assert_eq!(rendered.cursor_x, new.cursor_x);
+        assert_eq!(rendered.cursor_y, new.cursor_y);
+        assert!(client.scrollback_lines().is_empty());
+        old = new;
+    }
+}
 
 // ---------------------------------------------------------------------------
 // PTY + Terminal: spawn a command in a PTY and feed output to RoseTerminal
@@ -347,6 +443,7 @@ fn ssp_sender_receiver_roundtrip() {
     let mut rows1 = vec![String::new(); 24];
     rows1[0] = "first".into();
     sender.push_state(ScreenState {
+        viewport: None,
         rows: rows1,
         cursor_x: 5,
         cursor_y: 0,
@@ -364,6 +461,7 @@ fn ssp_sender_receiver_roundtrip() {
     rows2[0] = "first".into();
     rows2[1] = "second".into();
     sender.push_state(ScreenState {
+        viewport: None,
         rows: rows2,
         cursor_x: 6,
         cursor_y: 1,
@@ -453,6 +551,7 @@ async fn ssp_over_quic() {
                 rows,
                 cursor_x: 8,
                 cursor_y: 1,
+                viewport: None,
             });
 
             let frame = sender.generate_frame().unwrap();
@@ -589,6 +688,7 @@ async fn ssp_oversized_frame_via_stream() {
                 rows,
                 cursor_x: 0,
                 cursor_y: 0,
+                viewport: None,
             });
 
             let frame = sender.generate_frame().unwrap();

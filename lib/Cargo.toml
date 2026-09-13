@@ -35,7 +35,7 @@ base64 = "0.22.1"
 bytes = "1.11.1"
 criterion.workspace = true
 insta.workspace = true
-russh = "0.57.0"
+russh = { version = "=0.63.2", features = ["aws-lc-rs", "flate2"] }
 time = "0.3.47"
 tokio = { workspace = true, features = ["full"] }
 tracing-chrome = "0.7.2"
