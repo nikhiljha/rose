@@ -37,7 +37,7 @@ criterion.workspace = true
 insta.workspace = true
 russh = { version = "=0.63.2", features = ["aws-lc-rs", "flate2"] }
 time = "0.3.47"
-tokio = { workspace = true, features = ["full"] }
+tokio = { workspace = true, features = ["full", "test-util"] }
 tracing-chrome = "0.7.2"
 tracing-subscriber = { workspace = true, features = ["registry"] }
 

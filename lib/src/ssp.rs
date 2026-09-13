@@ -636,11 +636,13 @@ pub fn render_diff_ansi(old: &ScreenState, new: &ScreenState) -> Vec<u8> {
 ///
 /// Used when scrollback changes, the terminal resizes, or the client
 /// reconnects — cases where incremental [`render_diff_ansi`] is insufficient.
+/// Scrollback must be ordered by increasing stable row index.
 // TODO: use terminal-specific scrollback editing OSCs (e.g., kitty's)
 // for smarter partial updates instead of full clear-and-redraw.
 #[must_use]
 #[tracing::instrument(level = "trace", skip_all)]
 pub fn render_full_redraw(scrollback: &[ScrollbackLine], visible: &ScreenState) -> Vec<u8> {
+    let scrollback = scrollback_before_viewport(scrollback, visible.viewport);
     let mut buf = Vec::new();
 
     // Begin synchronized output (prevents flicker during redraw)
@@ -680,6 +682,21 @@ pub fn render_full_redraw(scrollback: &[ScrollbackLine], visible: &ScreenState) 
     buf.extend_from_slice(b"\x1b[?2026l");
 
     buf
+}
+
+pub(crate) fn scrollback_before_viewport(
+    scrollback: &[ScrollbackLine],
+    viewport: Option<Viewport>,
+) -> &[ScrollbackLine] {
+    let Some(Viewport {
+        first_row,
+        alternate_screen: false,
+    }) = viewport
+    else {
+        return scrollback;
+    };
+    let end = scrollback.partition_point(|line| (line.stable_row as u64) < first_row);
+    &scrollback[..end]
 }
 
 #[cfg(test)]
