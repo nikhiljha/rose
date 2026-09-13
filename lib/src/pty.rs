@@ -9,6 +9,24 @@ use bytes::Bytes;
 use portable_pty::{Child, ChildKiller, CommandBuilder, ExitStatus, MasterPty, PtySize};
 use tokio::sync::{Notify, broadcast};
 
+use crate::terminal::RoseTerminal;
+
+struct PtyWriter(Arc<Mutex<Box<dyn std::io::Write + Send>>>);
+
+impl std::io::Write for PtyWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .expect("writer lock poisoned")
+            .write_all(buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.lock().expect("writer lock poisoned").flush()
+    }
+}
+
 /// Errors that can occur during PTY operations.
 #[derive(Debug, thiserror::Error)]
 pub enum PtyError {
@@ -39,6 +57,7 @@ pub struct PtySession {
     initial_rx: Mutex<Option<broadcast::Receiver<Bytes>>>,
     /// Notified when the PTY reader thread exits (shell closed).
     pty_closed: Arc<Notify>,
+    terminal: Option<Arc<Mutex<RoseTerminal>>>,
     _reader_handle: std::thread::JoinHandle<()>,
 }
 
@@ -50,7 +69,7 @@ impl PtySession {
     /// Returns `PtyError::Open` if the PTY cannot be created, or
     /// `PtyError::Spawn` if the shell cannot be started.
     pub fn open(rows: u16, cols: u16) -> Result<Self, PtyError> {
-        Self::open_internal(rows, cols, CommandBuilder::new_default_prog())
+        Self::open_internal(rows, cols, CommandBuilder::new_default_prog(), false)
     }
 
     /// Opens a PTY with the user's default login shell and additional
@@ -70,7 +89,7 @@ impl PtySession {
         for (key, val) in env_vars {
             builder.env(key, val);
         }
-        Self::open_internal(rows, cols, builder)
+        Self::open_internal(rows, cols, builder, false)
     }
 
     /// Opens a PTY running a specific command with arguments.
@@ -82,7 +101,7 @@ impl PtySession {
     pub fn open_command(rows: u16, cols: u16, cmd: &str, args: &[&str]) -> Result<Self, PtyError> {
         let mut builder = CommandBuilder::new(cmd);
         builder.args(args);
-        Self::open_internal(rows, cols, builder)
+        Self::open_internal(rows, cols, builder, false)
     }
 
     /// Opens a PTY running a specific command with arguments and extra
@@ -104,10 +123,32 @@ impl PtySession {
         for (key, val) in env_vars {
             builder.env(key, val);
         }
-        Self::open_internal(rows, cols, builder)
+        Self::open_internal(rows, cols, builder, false)
     }
 
-    fn open_internal(rows: u16, cols: u16, cmd: CommandBuilder) -> Result<Self, PtyError> {
+    /// Opens a command with an authoritative terminal that consumes every PTY
+    /// byte before broadcasting output, independently of network subscribers.
+    /// Emulator responses are written back to the PTY.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if opening the PTY or spawning the command fails.
+    pub fn open_terminal(rows: u16, cols: u16, cmd: CommandBuilder) -> Result<Self, PtyError> {
+        Self::open_internal(rows, cols, cmd, true)
+    }
+
+    /// Returns the authoritative emulator created by [`Self::open_terminal`].
+    #[must_use]
+    pub const fn terminal(&self) -> Option<&Arc<Mutex<RoseTerminal>>> {
+        self.terminal.as_ref()
+    }
+
+    fn open_internal(
+        rows: u16,
+        cols: u16,
+        cmd: CommandBuilder,
+        emulate: bool,
+    ) -> Result<Self, PtyError> {
         let pty_system = portable_pty::native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -128,6 +169,14 @@ impl PtySession {
             .take_writer()
             .map_err(|e| PtyError::Io(std::io::Error::other(e.to_string())))?;
         let writer = Arc::new(Mutex::new(writer));
+        let terminal = emulate.then(|| {
+            Arc::new(Mutex::new(RoseTerminal::with_writer(
+                rows,
+                cols,
+                Box::new(PtyWriter(Arc::clone(&writer))),
+            )))
+        });
+        let terminal_output = terminal.clone();
 
         let (output_tx, initial_rx) = broadcast::channel(256);
         let tx = output_tx.clone();
@@ -151,6 +200,12 @@ impl PtySession {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
+                        if let Some(terminal) = &terminal_output {
+                            terminal
+                                .lock()
+                                .expect("terminal lock poisoned")
+                                .advance(&buf[..n]);
+                        }
                         let chunk = Bytes::copy_from_slice(&buf[..n]);
                         // Ignore send errors — means no subscribers
                         let _ = tx.send(chunk);
@@ -172,6 +227,7 @@ impl PtySession {
             output_tx,
             initial_rx: Mutex::new(Some(initial_rx)),
             pty_closed,
+            terminal,
             _reader_handle: reader_handle,
         })
     }
@@ -179,9 +235,10 @@ impl PtySession {
     /// Subscribes to PTY output.
     ///
     /// The **first** call returns a receiver created before the reader
-    /// thread started, so it is guaranteed to contain every byte the
-    /// child has produced.  Subsequent calls create a new receiver that
-    /// only sees output produced after the call.
+    /// thread started. Subsequent calls only see output produced after
+    /// the call. All receivers can lag and lose bytes; when opened with
+    /// [`Self::open_terminal`], the authoritative emulator always consumes
+    /// output before it reaches this lossy observer channel.
     ///
     /// # Panics
     ///
@@ -274,6 +331,30 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[tokio::test]
+    async fn terminal_state_survives_a_lagging_output_observer() {
+        let mut command = CommandBuilder::new("sh");
+        command.args([
+            "-c",
+            "printf '\\033[31m'; head -c 20000000 /dev/zero; printf RED",
+        ]);
+        let pty = PtySession::open_terminal(5, 20, command).unwrap();
+        let mut observer = pty.subscribe_output();
+        tokio::time::timeout(Duration::from_secs(20), pty.closed().notified())
+            .await
+            .expect("PTY did not drain");
+        assert!(matches!(
+            observer.try_recv(),
+            Err(broadcast::error::TryRecvError::Lagged(_))
+        ));
+        let mut expected = RoseTerminal::new(5, 20);
+        expected.advance(b"\x1b[31mRED");
+        assert_eq!(
+            pty.terminal().unwrap().lock().unwrap().snapshot(),
+            expected.snapshot()
+        );
+    }
 
     fn poll_output_until(rx: &mut broadcast::Receiver<Bytes>, marker: &str) -> String {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);

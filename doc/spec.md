@@ -18,16 +18,36 @@ Man pages are generated at build time via `clap_mangen` (`rose.1`, `rose-connect
 
 ### Terminal Emulator
 
-Both the client and server embed wezterm's terminal emulator (via the `wezterm-term` crate):
+The server interprets terminal output with `wezterm-term`:
 
-- **Server side:** Interprets raw PTY output into a structured screen state. Diffs the screen state and sends updates to the client over QUIC datagrams.
-- **Client side:** Maintains a local copy of the screen state. Applies diffs received from the server. Performs local keystroke prediction for responsiveness.
+- **Server side:** Maintains the authoritative emulator throughout the PTY's lifetime. Diffs its visible screen state and sends updates over QUIC.
+- **Client side:** Maintains a replica of the visible screen and renders it into the local terminal with ANSI sequences.
 
-This mirrors Mosh's dual-emulator architecture but replaces Mosh's custom terminal emulator with wezterm, gaining full support for modern terminal features.
+#### Terminal Feature Boundary
+
+The current snapshot contains ANSI row strings, cursor coordinates, and viewport
+identity. This represents text, colors, cell attributes, scrolling, and
+alternate-screen contents. It is not a serialization of the complete emulator.
+Graphics, hyperlinks, cursor appearance, application input modes, clipboard
+events, and other terminal effects are not all represented in the wire format.
+WezTerm parsing a feature does not imply that the client can reproduce it.
+
+The server returns emulator-generated query responses directly to the PTY,
+including cursor-position reports, even while detached. These responses describe
+the server emulator; capability responses are not yet negotiated with the local
+display and may include features outside the current rendering contract.
 
 ### PTY Management
 
 The server uses `portable-pty` to manage the PTY. By default it spawns the user's login shell, but arbitrary commands can be specified (like SSH's `ssh user@host command`).
+
+For server sessions, the dedicated PTY reader thread advances the emulator before
+broadcasting output notifications. This continues during detach and naturally
+backpressures the child when emulation cannot keep up. Connection tasks may
+coalesce or lose notifications without losing authoritative terminal state.
+Resize operations hold the same terminal lock while resizing the PTY and emulator.
+The low-level `PtySession` constructors without an attached terminal expose a
+lossy broadcast stream for callers that need raw output.
 
 ## Transport Layer
 
@@ -108,6 +128,9 @@ Heavily inspired by Mosh's State Synchronization Protocol (SSP), but not wire-co
 - The client maintains a predicted screen state for local echo.
 - Both sides track sequence numbers to know what state the other side has acknowledged.
 - Diffs are computed from the last acknowledged state, so lost datagrams are automatically superseded.
+- The receiver retains up to 32 states and applies a diff to its actual base.
+  Duplicate frames and frames with unavailable bases still elicit an ACK of the
+  current state. Invalid diffs leave both the screen and its ACK unchanged.
 
 ### Viewport Identity
 
@@ -125,6 +148,8 @@ Sessions survive network changes (WiFi to cellular, IP address changes, NAT rebi
 
 - The client sends a `Reconnect` message with the session ID from the original `SessionInfo`.
 - The server resumes the detached session (PTY, terminal state, SSP sender are all preserved).
+- Output produced while detached has already been interpreted and is included in
+  the reattached screen and retained history.
 - The server resets its `SspSender` so the client gets a full init diff.
 - The client starts fresh SSP state each connection.
 
@@ -133,7 +158,9 @@ sends `Reconnect` on the first connection. The printed reattach command includes
 the session ID and any explicit certificate paths. The server checks the
 connecting client's certificate against the session owner.
 
-Sessions persist indefinitely until the server-side shell process exits. There is no idle timeout.
+Detached sessions are retained in server memory until the shell exits, the
+configured idle timeout expires, or the server stops. The default idle timeout is
+seven days. They do not survive a server process restart.
 
 ## Platforms
 
