@@ -507,6 +507,7 @@ impl Default for SspSender {
 pub struct SspReceiver {
     state: ScreenState,
     state_num: u64,
+    previous_states: VecDeque<(u64, ScreenState)>,
 }
 
 impl SspReceiver {
@@ -516,6 +517,7 @@ impl SspReceiver {
         Self {
             state: ScreenState::empty(rows),
             state_num: 0,
+            previous_states: VecDeque::new(),
         }
     }
 
@@ -538,17 +540,25 @@ impl SspReceiver {
             return Ok(None);
         }
 
-        // Accept init diffs (old_num=0) or diffs matching our current state
-        if frame.old_num != 0 && frame.old_num != self.state_num {
+        let mut next = if frame.old_num == 0 {
+            ScreenState::empty(diff.total_rows)
+        } else if frame.old_num == self.state_num {
+            self.state.clone()
+        } else if let Some((_, base)) = self
+            .previous_states
+            .iter()
+            .find(|(num, _)| *num == frame.old_num)
+        {
+            base.clone()
+        } else {
             return Ok(None);
+        };
+        next.apply_diff(diff)?;
+        let previous = std::mem::replace(&mut self.state, next);
+        self.previous_states.push_back((self.state_num, previous));
+        while self.previous_states.len() >= MAX_QUEUE_SIZE {
+            self.previous_states.pop_front();
         }
-
-        // For init diffs, reset state before applying
-        if frame.old_num == 0 {
-            self.state = ScreenState::empty(diff.total_rows);
-        }
-
-        self.state.apply_diff(diff)?;
         self.state_num = frame.new_num;
         Ok(Some(frame.new_num))
     }
@@ -1018,6 +1028,39 @@ mod tests {
     }
 
     // -- SspReceiver ----------------------------------------------------------
+
+    #[test]
+    fn receiver_applies_updates_from_a_retained_base_without_ack_roundtrips() {
+        let mut sender = SspSender::new();
+        let mut receiver = SspReceiver::new(4);
+        let mut initial = ScreenState::empty(4);
+        initial.rows = vec![
+            "first".into(),
+            "second".into(),
+            "third".into(),
+            "fourth".into(),
+        ];
+        sender.push_state(initial.clone());
+        receiver
+            .process_frame(&sender.generate_frame().unwrap())
+            .unwrap();
+        sender.process_ack(receiver.ack_num());
+
+        let mut intermediate = initial.clone();
+        intermediate.rows[0] = "temporary".into();
+        sender.push_state(intermediate);
+        receiver
+            .process_frame(&sender.generate_frame().unwrap())
+            .unwrap();
+
+        let mut latest = initial;
+        latest.rows[1] = "latest".into();
+        sender.push_state(latest.clone());
+        let frame = sender.generate_frame().unwrap();
+        assert_eq!(frame.old_num, 1);
+        assert_eq!(receiver.process_frame(&frame).unwrap(), Some(3));
+        assert_eq!(receiver.state(), &latest);
+    }
 
     #[test]
     fn receiver_apply_sequential() {
