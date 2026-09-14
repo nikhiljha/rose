@@ -3,12 +3,13 @@
 //! The server spawns a shell (or command) in a PTY and reads/writes to it.
 //! By default, spawns the user's login shell.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use bytes::Bytes;
 use portable_pty::{Child, CommandBuilder, ExitStatus, MasterPty, PtySize};
 use tokio::sync::{Notify, broadcast};
 
+use crate::input::ServerInput;
 use crate::terminal::RoseTerminal;
 
 struct PtyWriter(Arc<Mutex<Box<dyn std::io::Write + Send>>>);
@@ -45,6 +46,7 @@ pub enum PtyError {
 /// writing input, and handling resize events.
 pub struct PtySession {
     writer: Arc<Mutex<Box<dyn std::io::Write + Send>>>,
+    input: OnceLock<ServerInput>,
     master: Box<dyn MasterPty + Send>,
     child: Option<Box<dyn Child + Send + Sync>>,
     output_tx: broadcast::Sender<Bytes>,
@@ -61,6 +63,13 @@ pub struct PtySession {
 }
 
 impl PtySession {
+    /// Returns the persistent, ordered input writer for this PTY.
+    pub(crate) fn input(&self) -> ServerInput {
+        self.input
+            .get_or_init(|| ServerInput::new(Arc::clone(&self.writer)))
+            .clone()
+    }
+
     /// Opens a PTY with the user's default login shell.
     ///
     /// # Errors
@@ -219,6 +228,7 @@ impl PtySession {
 
         Ok(Self {
             writer,
+            input: OnceLock::new(),
             master: pair.master,
             child: Some(child),
             output_tx,

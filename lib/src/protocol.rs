@@ -33,7 +33,7 @@ pub enum ProtocolError {
 
 /// Current protocol version. Incremented when the wire format changes
 /// in an incompatible way.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Control messages exchanged over the reliable bi-stream.
 #[derive(Debug, Clone, PartialEq, Eq)]

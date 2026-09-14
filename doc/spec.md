@@ -69,10 +69,10 @@ RoSE uses QUIC (RFC 9000) via the `quinn` crate as its transport layer.
 
 #### Datagram Channel (RFC 9221)
 
-Interactive terminal data flows over QUIC datagrams (unreliable, unordered). The protocol uses a "most recent state wins" approach identical to Mosh:
+Replaceable screen updates flow over QUIC datagrams (unreliable, unordered).
+The protocol uses a "most recent state wins" approach identical to Mosh:
 
 - The server sends screen state diffs. If a datagram is lost, the next one contains a diff from the last acknowledged state, making the lost one irrelevant.
-- The client sends keystrokes. Lost keystrokes are naturally retried by the user.
 - Old unacknowledged frames are discarded.
 
 #### Reliable Streams
@@ -80,10 +80,20 @@ Interactive terminal data flows over QUIC datagrams (unreliable, unordered). The
 QUIC streams are used for data that must not be lost:
 
 - **Control stream (bi-directional):** Initial handshake (Hello/Reconnect), session setup (SessionInfo), resize events, and graceful disconnect (Goodbye).
+- **Input stream (bi-directional):** Each CLI connection opens a stream prefixed with a `0x03` type byte. The server first sends its eight-byte cumulative accepted input offset. The client then sends frames containing an eight-byte cumulative offset, a four-byte length, and 1–4096 input bytes. The server writes new bytes through the session-owned PTY writer and acknowledges its eight-byte cumulative accepted offset. All integers use big-endian encoding. Replayed overlaps are skipped, gaps are rejected, and up to 64 KiB of unacknowledged input survives automatic reconnects.
 - **Scrollback stream (uni, server→client):** Scrollback history synchronization. The server opens a long-lived uni stream prefixed with a `0x02` type byte and incrementally sends scrollback lines as they appear. This avoids head-of-line blocking on the interactive datagram channel.
 - **Oversized SSP frames (uni, server→client):** When an SSP frame exceeds the QUIC datagram MTU, it is sent via a one-shot uni stream prefixed with a `0x01` type byte, followed by the length-prefixed frame data.
 
-Additional reliable streams may be added in the future for features like file transfer and port forwarding.
+Input that reaches the 64 KiB retention bound backpressures the keyboard reader.
+An explicit detach waits until earlier input is acknowledged. An explicit
+disconnect may abandon unacknowledged input. An acknowledgment means the bytes
+were written to the PTY, not that the application executed them. A newly attached
+client adopts the session's accepted offset; an automatically reconnecting client
+validates that offset against its retained and previously sent bytes.
+
+The reliable input protocol requires handshake version 2 on both ends. The
+low-level `ClientSession::send_input` datagram API remains available without
+ordering or replay guarantees; the CLI uses the reliable stream.
 
 ## Connection Modes
 
