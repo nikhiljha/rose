@@ -1338,6 +1338,101 @@ async fn native_reconnect_preserves_first_keystroke() {
 }
 
 #[tokio::test]
+async fn native_reconnect_redraws_unchanged_screen() {
+    let fixture = MtlsFixture::new();
+    let home = ssh_bootstrap_helpers::isolated_home_dir();
+    let config_dir = home.join(".config/rose");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("client.crt.der"),
+        fixture.client_cert.cert_der.as_ref(),
+    )
+    .unwrap();
+    std::fs::write(
+        config_dir.join("client.key.der"),
+        &fixture.client_cert.key_der,
+    )
+    .unwrap();
+    let server_cert = config_dir.join("server.crt");
+    std::fs::write(&server_cert, fixture.server.server_cert_der().as_ref()).unwrap();
+
+    let mut cmd = CommandBuilder::new(ssh_bootstrap_helpers::build_rose_binary());
+    cmd.env("HOME", &home);
+    cmd.env("RUST_LOG", "info");
+    cmd.args([
+        "connect",
+        "127.0.0.1",
+        "--port",
+        &fixture.addr().port().to_string(),
+        "--cert",
+    ]);
+    cmd.arg(&server_cert);
+    let mut pty = ssh_bootstrap_helpers::spawn_in_pty(cmd);
+    let mut remote = rose::terminal::RoseTerminal::new(24, 80);
+    remote.advance(b"REMOTE_IDLE");
+    let expected = remote.snapshot();
+    let mut screens = Vec::new();
+    let mut cursor_count = 0;
+
+    for attempt in 0..2 {
+        let conn =
+            tokio::time::timeout(std::time::Duration::from_secs(10), fixture.server.accept())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        let (mut session, hello) = ServerSession::accept_any(conn.clone()).await.unwrap();
+        if attempt == 0 {
+            assert!(matches!(hello, ControlMessage::Hello { .. }));
+        } else {
+            assert!(matches!(
+                hello,
+                ControlMessage::Reconnect { session_id, .. } if session_id == [0x34; 16]
+            ));
+        }
+        session
+            .send_control(&ControlMessage::SessionInfo {
+                version: PROTOCOL_VERSION,
+                session_id: [0x34; 16],
+            })
+            .await
+            .unwrap();
+        let mut sender = SspSender::new();
+        sender.push_state(expected.clone());
+        conn.send_datagram(Bytes::from(sender.generate_frame().unwrap().encode()))
+            .unwrap();
+
+        let captured = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let captured = pty.captured_output();
+                let count = captured.matches("\x1b[1;12H").count();
+                if count > cursor_count {
+                    cursor_count = count;
+                    break captured;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut local = rose::terminal::RoseTerminal::new(24, 80);
+        local.advance(captured.as_bytes());
+        screens.push(local.snapshot());
+        conn.close(u32::from(attempt == 0).into(), b"test reconnect");
+    }
+    let status = ssh_bootstrap_helpers::wait_for_exit(&mut pty.child, 15)
+        .await
+        .unwrap();
+    assert_eq!(status.exit_code(), 0);
+    let captured = pty.finish();
+    assert_eq!(screens[0].rows, expected.rows, "initial screen");
+    assert_eq!(
+        screens[1].rows, expected.rows,
+        "reconnect left local notices on the idle screen: {captured:?}"
+    );
+}
+
+#[tokio::test]
 async fn native_detach_command_restores_shell_state() {
     let home = ssh_bootstrap_helpers::isolated_home_dir().join("native session 'home'");
     let paths = rose::config::RosePaths::with_base(home.join(".config/rose"));
