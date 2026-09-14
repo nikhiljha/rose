@@ -15,7 +15,7 @@ use wezterm_term::{
 type SequenceNo = usize;
 
 use crate::scrollback::MAX_SCROLLBACK_LINES;
-use crate::ssp::{CursorStyle, ScreenState, Viewport};
+use crate::ssp::{CursorStyle, InputModes, ScreenState, Viewport};
 
 /// Configuration for the wezterm terminal emulator.
 #[derive(Debug)]
@@ -432,6 +432,9 @@ impl RoseTerminal {
             cursor_style: CursorStyle {
                 shape: cursor.shape,
                 visibility: cursor.visibility,
+            },
+            input_modes: InputModes {
+                application_cursor_keys: self.inner.application_cursor_keys_enabled(),
             },
             viewport: Some(viewport),
         }
@@ -1169,6 +1172,14 @@ mod tests {
             snap.rows[0].contains("green"),
             "snapshot rows should contain text"
         );
+    }
+
+    #[test]
+    fn application_cursor_mode_changes_the_snapshot() {
+        let mut term = RoseTerminal::new(24, 80);
+        let normal = term.snapshot();
+        term.advance(b"\x1b[?1h");
+        assert_ne!(term.snapshot(), normal);
     }
 
     #[test]
