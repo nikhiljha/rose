@@ -205,4 +205,38 @@ mod tests {
         assert_eq!(&byte, b"y");
         assert_eq!(attempts, 2);
     }
+
+    #[test]
+    fn peer_closure_preserves_eof_and_write_errors() {
+        let (mut descriptor, peer) = filedescriptor::socketpair().unwrap();
+        descriptor.set_non_blocking(true).unwrap();
+        let (cancelled, _cancel) = filedescriptor::socketpair().unwrap();
+        let ready = Arc::new(PtyIo {
+            descriptor: descriptor.try_clone().unwrap(),
+            cancelled,
+        });
+        let mut stream = ready.wrap(descriptor);
+        drop(peer);
+        let (send, receive) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            send.send(stream.read(&mut [0])).unwrap();
+            send.send(stream.write(b"closed")).unwrap();
+        });
+        assert_eq!(
+            receive
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            receive
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        worker.join().unwrap();
+    }
 }
