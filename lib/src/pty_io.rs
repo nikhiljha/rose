@@ -124,3 +124,49 @@ impl<T: Write> Write for PtyStream<T> {
         self.inner.flush()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use portable_pty::{PtySize, native_pty_system};
+    use std::sync::mpsc;
+
+    #[test]
+    fn cancellation_wakes_idle_reader_and_preserves_empty_io() {
+        let pair = native_pty_system().openpty(PtySize::default()).unwrap();
+        let (ready, cancel) = PtyIo::new(pair.master.as_ref()).unwrap();
+        let mut reader = ready.wrap(pair.master.try_clone_reader().unwrap());
+        let mut writer = ready.wrap(pair.master.take_writer().unwrap());
+        let (send, receive) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            send.send(reader.read(&mut [])).unwrap();
+            send.send(reader.read(&mut [0])).unwrap();
+        });
+        assert_eq!(
+            receive
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        assert!(matches!(
+            receive.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(cancel);
+        assert_eq!(
+            receive
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(writer.write(&[]).unwrap(), 0);
+        assert_eq!(
+            writer.write(b"cancelled").unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        worker.join().unwrap();
+    }
+}
