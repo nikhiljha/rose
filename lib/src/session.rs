@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::pty::PtySession;
-use crate::ssp::SspSender;
+use crate::ssp::{ScreenState, SspFrame, SspSender};
 use crate::terminal::RoseTerminal;
 
 /// A session that has been detached from its network connection.
@@ -46,6 +46,22 @@ struct SessionState {
     sessions: HashMap<[u8; 16], DetachedSession>,
     ended: HashSet<[u8; 16]>,
     ended_order: VecDeque<[u8; 16]>,
+    final_screens: VecDeque<([u8; 16], Arc<FinalCheckpoint>)>,
+}
+
+/// A completed session's final screen, without PTY or emulator resources.
+pub(crate) struct FinalCheckpoint {
+    /// Length-prefixed full SSP frame with sequence number one.
+    pub data: Box<[u8]>,
+    /// Original session owner's TLS certificate.
+    pub owner_cert_der: Option<Vec<u8>>,
+    expires_at: Instant,
+}
+
+impl FinalCheckpoint {
+    fn retained_bytes(&self) -> usize {
+        self.data.len() + self.owner_cert_der.as_ref().map_or(0, Vec::len)
+    }
 }
 
 impl SessionStore {
@@ -97,6 +113,7 @@ impl SessionStore {
             && let Some(expired) = state.ended_order.pop_front()
         {
             state.ended.remove(&expired);
+            state.final_screens.retain(|(id, _)| *id != expired);
         }
     }
 
@@ -106,6 +123,77 @@ impl SessionStore {
             .expect("session store lock poisoned")
             .ended
             .contains(id)
+    }
+
+    /// Retains a final screen for at most one minute, within shared cache limits.
+    pub(crate) fn retain_final_screen(
+        &self,
+        id: [u8; 16],
+        screen: ScreenState,
+        owner_cert_der: Option<Vec<u8>>,
+    ) {
+        let frame = SspFrame {
+            old_num: 0,
+            new_num: 1,
+            ack_num: 0,
+            diff: Some(screen.bounded_for_transport().diff_from_empty()),
+        };
+        let checkpoint = Arc::new(FinalCheckpoint {
+            data: frame.encode_for_stream().into_boxed_slice(),
+            owner_cert_der,
+            expires_at: Instant::now() + Duration::from_secs(60),
+        });
+        let mut state = self.state.lock().expect("session store lock poisoned");
+        state
+            .final_screens
+            .retain(|(key, old)| *key != id && old.expires_at > Instant::now());
+        state.final_screens.push_back((id, checkpoint));
+        while state.final_screens.len() > 64
+            || state
+                .final_screens
+                .iter()
+                .map(|(_, checkpoint)| checkpoint.retained_bytes())
+                .sum::<usize>()
+                > 64 * 1024 * 1024
+        {
+            state.final_screens.pop_front();
+        }
+    }
+
+    /// Looks up a retained screen without consuming it on a failed reconnect.
+    pub(crate) fn final_screen(&self, id: &[u8; 16]) -> Option<Arc<FinalCheckpoint>> {
+        let mut state = self.state.lock().expect("session store lock poisoned");
+        state
+            .final_screens
+            .retain(|(_, checkpoint)| checkpoint.expires_at > Instant::now());
+        state
+            .final_screens
+            .iter()
+            .find(|(key, _)| key == id)
+            .map(|(_, checkpoint)| Arc::clone(checkpoint))
+    }
+
+    /// Releases a completed screen after its application acknowledgment.
+    pub(crate) fn remove_final_screen(&self, id: &[u8; 16]) {
+        self.state
+            .lock()
+            .expect("session store lock poisoned")
+            .final_screens
+            .retain(|(key, _)| key != id);
+    }
+
+    /// Remaining lifetime of the newest retained screen, including expired entries.
+    pub(crate) fn final_screen_timeout(&self) -> Option<Duration> {
+        self.state
+            .lock()
+            .expect("session store lock poisoned")
+            .final_screens
+            .back()
+            .map(|(_, checkpoint)| {
+                checkpoint
+                    .expires_at
+                    .saturating_duration_since(Instant::now())
+            })
     }
 
     /// Returns `true` if a session with the given ID exists.
@@ -213,6 +301,79 @@ impl Default for SessionStore {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn final_checkpoints_expire_without_extending_on_reconnect() {
+        let store = SessionStore::new();
+        let id = [1; 16];
+        store.mark_ended(id);
+        store.retain_final_screen(id, ScreenState::empty(2), None);
+        let first_expiry = store.final_screen(&id).unwrap().expires_at;
+        assert_eq!(store.final_screen(&id).unwrap().expires_at, first_expiry);
+        {
+            let mut state = store.state.lock().unwrap();
+            Arc::get_mut(&mut state.final_screens[0].1)
+                .unwrap()
+                .expires_at = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+        }
+        assert_eq!(store.final_screen_timeout(), Some(Duration::ZERO));
+        assert!(store.final_screen(&id).is_none());
+        assert!(store.final_screen_timeout().is_none());
+        assert!(store.is_ended(&id));
+    }
+
+    #[test]
+    fn final_checkpoint_count_and_replacement_are_bounded() {
+        let store = SessionStore::new();
+        for value in 0..=64 {
+            store.retain_final_screen([value; 16], ScreenState::empty(2), None);
+        }
+        assert!(store.final_screen(&[0; 16]).is_none());
+        assert!(store.final_screen(&[1; 16]).is_some());
+        store.retain_final_screen([64; 16], ScreenState::empty(3), None);
+        assert_eq!(store.state.lock().unwrap().final_screens.len(), 64);
+        assert!(store.final_screen(&[1; 16]).is_some());
+        let latest = store.final_screen(&[64; 16]).unwrap();
+        let frame = SspFrame::decode(&latest.data[4..]).unwrap();
+        assert_eq!(frame.diff.unwrap().total_rows, 3);
+        store.remove_final_screen(&[64; 16]);
+        assert!(store.final_screen(&[64; 16]).is_none());
+        assert_eq!(store.state.lock().unwrap().final_screens.len(), 63);
+    }
+
+    #[test]
+    fn final_checkpoint_bytes_are_bounded_independently_of_count() {
+        let store = SessionStore::new();
+        let mut screen = ScreenState::empty(200);
+        screen.rows.fill("x".repeat(65_000));
+        for value in 0..6 {
+            store.retain_final_screen([value; 16], screen.clone(), None);
+        }
+        let state = store.state.lock().unwrap();
+        assert_eq!(state.final_screens.len(), 5);
+        assert_eq!(state.final_screens.front().unwrap().0, [1; 16]);
+        assert!(
+            state
+                .final_screens
+                .iter()
+                .map(|(_, checkpoint)| checkpoint.retained_bytes())
+                .sum::<usize>()
+                <= 64 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn ended_id_eviction_also_releases_its_final_checkpoint() {
+        let store = SessionStore::new();
+        store.mark_ended([0; 16]);
+        store.retain_final_screen([0; 16], ScreenState::empty(2), None);
+        for value in 1_u16..=1_024 {
+            let mut id = [0; 16];
+            id[..2].copy_from_slice(&value.to_be_bytes());
+            store.mark_ended(id);
+        }
+        assert!(store.final_screen(&[0; 16]).is_none());
+    }
 
     #[test]
     fn ended_session_history_is_bounded() {

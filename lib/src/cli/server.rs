@@ -13,7 +13,7 @@ use crate::config::{self, CertKeyPair, RosePaths};
 use crate::protocol::{self, ControlMessage, ServerSession};
 use crate::pty::PtySession;
 use crate::scrollback::{self, ScrollbackSender};
-use crate::session::{DetachedSession, SessionStore};
+use crate::session::{DetachedSession, FinalCheckpoint, SessionStore};
 use crate::ssp::{DATAGRAM_KEYSTROKE, DATAGRAM_SSP_ACK, SspFrame, SspSender};
 use crate::terminal::RoseTerminal;
 use crate::transport::QuicServer;
@@ -190,7 +190,18 @@ pub(super) async fn run_server(
     }
 
     loop {
-        let conn = match server.accept().await {
+        let incoming = if bootstrap
+            && store.is_empty()
+            && let Some(timeout) = store.final_screen_timeout()
+        {
+            match tokio::time::timeout(timeout, server.accept()).await {
+                Ok(result) => result,
+                Err(_) => break,
+            }
+        } else {
+            server.accept().await
+        };
+        let conn = match incoming {
             Ok(Some(conn)) => conn,
             Ok(None) => break,
             Err(e) => {
@@ -213,7 +224,7 @@ pub(super) async fn run_server(
             if let Err(e) = handle_server_session(conn, store.clone(), true).await {
                 tracing::error!(%peer, "session error: {e}");
             }
-            if store.is_empty() {
+            if store.is_empty() && store.final_screen_timeout().is_none() {
                 break;
             }
         } else {
@@ -384,6 +395,13 @@ async fn handle_server_session(
             env_vars: _,
         } => {
             let Some(detached) = store.remove(&session_id) else {
+                if let Some(checkpoint) = store.final_screen(&session_id) {
+                    if checkpoint.owner_cert_der.as_deref() != peer_cert.as_deref() {
+                        anyhow::bail!("client certificate does not match session owner");
+                    }
+                    return replay_final_checkpoint(&mut session, session_id, &checkpoint, &store)
+                        .await;
+                }
                 if store.is_ended(&session_id) {
                     session.send_control(&ControlMessage::Goodbye).await?;
                     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -542,11 +560,14 @@ async fn handle_server_session(
     let mut control_task = control_task;
     let mut control_shutdown_tx = Some(control_shutdown_tx);
     let mut shell_exited;
+    let mut final_screen_delivered = false;
     let pty_from_control;
     tokio::select! {
         result = &mut output_task => {
             tracing::debug!(?session_id, ?result, "output task ended");
             shell_exited = result.unwrap_or(false);
+            final_screen_delivered = shell_exited
+                && ssp_sender.lock().expect("sender lock poisoned").generate_frame().is_none();
             pty_from_control = None;
         },
         _ = &mut input_task => {
@@ -578,7 +599,12 @@ async fn handle_server_session(
     scrollback_task.abort();
 
     let mut detached_pty = None;
-    if !shell_exited {
+    if shell_exited {
+        if let Some(tx) = control_shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        let _ = control_task.await;
+    } else {
         detached_pty = if let Some(pty) = pty_from_control {
             Some(pty)
         } else {
@@ -598,8 +624,16 @@ async fn handle_server_session(
     }
 
     if shell_exited {
+        if !final_screen_delivered {
+            let screen = terminal.lock().expect("terminal lock poisoned").snapshot();
+            store.retain_final_screen(session_id, screen, peer_cert);
+        }
         store.mark_ended(session_id);
-        close_conn.close(0u32.into(), b"shell exited");
+        if final_screen_delivered {
+            close_conn.close(0u32.into(), b"shell exited");
+        } else {
+            close_conn.close(1u32.into(), b"final screen pending");
+        }
         // Give the I/O driver a moment to flush the CONNECTION_CLOSE
         // frame so the client receives it before we return.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -622,6 +656,47 @@ async fn handle_server_session(
         }
     }
 
+    Ok(())
+}
+
+async fn replay_final_checkpoint(
+    session: &mut ServerSession,
+    session_id: [u8; 16],
+    checkpoint: &FinalCheckpoint,
+    store: &SessionStore,
+) -> anyhow::Result<()> {
+    session
+        .send_control(&ControlMessage::SessionInfo {
+            version: protocol::PROTOCOL_VERSION,
+            session_id,
+        })
+        .await?;
+    let conn = session.connection();
+    let acknowledged = async {
+        loop {
+            let data = conn.read_datagram().await?;
+            if data.first() == Some(&DATAGRAM_SSP_ACK)
+                && let Ok(frame) = SspFrame::decode(&data[1..])
+                && frame.ack_num == 1
+            {
+                return Ok(());
+            }
+        }
+    };
+    if matches!(
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            deliver_final_data(conn, &checkpoint.data, acknowledged),
+        )
+        .await,
+        Ok(Ok(()))
+    ) {
+        store.remove_final_screen(&session_id);
+        conn.close(0u32.into(), b"shell exited");
+    } else {
+        conn.close(1u32.into(), b"final screen pending");
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
     Ok(())
 }
 
@@ -737,25 +812,46 @@ async fn deliver_final_frame(
     frame: &SspFrame,
 ) -> anyhow::Result<()> {
     let data = frame.encode_for_stream();
-    let mut retry = tokio::time::interval(Duration::from_millis(100));
-    let mut check_ack = tokio::time::interval(Duration::from_millis(10));
-    loop {
-        tokio::select! {
-            _ = retry.tick() => {
-                let mut stream = conn.open_uni().await?;
-                stream.write_all(&[scrollback::stream_type::SSP_FRAME]).await?;
-                stream.write_all(&data).await?;
-                stream.finish()?;
-                if stream.stopped().await?.is_some() {
-                    anyhow::bail!("client rejected final screen");
-                }
-            }
-            _ = check_ack.tick() => {
-                if sender.lock().expect("sender lock poisoned").generate_frame().is_none() {
-                    return Ok(());
-                }
+    let acknowledged = async {
+        let mut check_ack = tokio::time::interval(Duration::from_millis(10));
+        loop {
+            check_ack.tick().await;
+            if sender
+                .lock()
+                .expect("sender lock poisoned")
+                .generate_frame()
+                .is_none()
+            {
+                return Ok(());
             }
         }
+    };
+    deliver_final_data(conn, &data, acknowledged).await
+}
+
+async fn deliver_final_data(
+    conn: &quinn::Connection,
+    data: &[u8],
+    acknowledged: impl Future<Output = anyhow::Result<()>>,
+) -> anyhow::Result<()> {
+    let transmit = async {
+        let mut retry = tokio::time::interval(Duration::from_millis(100));
+        loop {
+            retry.tick().await;
+            let mut stream = conn.open_uni().await?;
+            stream
+                .write_all(&[scrollback::stream_type::SSP_FRAME])
+                .await?;
+            stream.write_all(data).await?;
+            stream.finish()?;
+            if stream.stopped().await?.is_some() {
+                anyhow::bail!("client rejected final screen");
+            }
+        }
+    };
+    tokio::select! {
+        result = transmit => result,
+        result = acknowledged => result,
     }
 }
 
@@ -1113,6 +1209,97 @@ mod tests {
                 .await
                 .is_pending()
         );
+    }
+
+    #[tokio::test]
+    async fn final_checkpoint_survives_delivery_timeout_and_failed_reconnect() {
+        let native = NativeSession::new().await;
+        native.send_command(
+            "printf '\\033[0m\\033[2J\\033[HRETAINED_FINAL\\n\\033[6 q\\033[?25l'; exit",
+        );
+        let original = receive_stream_frame(native.session.connection()).await;
+        tokio::time::timeout(Duration::from_secs(3), native.task)
+            .await
+            .expect("final delivery did not release the session")
+            .unwrap()
+            .unwrap();
+        assert!(native.store.is_empty());
+        assert!(matches!(
+            native.session.connection().closed().await,
+            quinn::ConnectionError::ApplicationClosed(close)
+                if close.error_code == quinn::VarInt::from_u32(1)
+        ));
+
+        for attempt in 0..3 {
+            let (server_conn, client_conn) = tokio::join!(
+                native._fixture.server.accept(),
+                native._fixture.connect(&native._client)
+            );
+            let task = tokio::spawn(handle_server_session(
+                server_conn.unwrap().unwrap(),
+                native.store.clone(),
+                false,
+            ));
+            let mut session =
+                ClientSession::reconnect(client_conn, 5, 80, native.session_id, vec![])
+                    .await
+                    .unwrap();
+            let handshake = session.recv_control().await.unwrap();
+            if attempt == 2 {
+                assert_eq!(handshake, Some(ControlMessage::Goodbye));
+            } else {
+                assert_eq!(
+                    handshake,
+                    Some(ControlMessage::SessionInfo {
+                        version: protocol::PROTOCOL_VERSION,
+                        session_id: native.session_id,
+                    })
+                );
+                let frame = receive_stream_frame(session.connection()).await;
+                let mut expected = SspReceiver::new(5);
+                expected.process_frame(&original).unwrap();
+                let mut actual = SspReceiver::new(5);
+                actual.process_frame(&frame).unwrap();
+                assert_eq!(actual.state(), expected.state());
+                assert_eq!(actual.state().rows[0], "RETAINED_FINAL");
+                if attempt == 0 {
+                    session
+                        .connection()
+                        .close(1u32.into(), b"reconnect interrupted");
+                } else {
+                    let mut ack = vec![DATAGRAM_SSP_ACK];
+                    ack.extend_from_slice(&SspFrame::ack_only(actual.ack_num()).encode());
+                    session.send_input(ack.into()).unwrap();
+                }
+            }
+            tokio::time::timeout(Duration::from_secs(3), task)
+                .await
+                .expect("completed checkpoint kept the handler alive")
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_checkpoint_rejects_a_different_owner_without_consuming_it() {
+        let (client_conn, server_conn, _fixture, _client) = crate::testutil::connected_pair().await;
+        let store = SessionStore::new();
+        let id = [0x55; 16];
+        store.mark_ended(id);
+        store.retain_final_screen(id, crate::ssp::ScreenState::empty(5), Some(vec![0xff]));
+        let task = tokio::spawn(handle_server_session(server_conn, store.clone(), false));
+        let mut session = ClientSession::reconnect(client_conn, 5, 80, id, vec![])
+            .await
+            .unwrap();
+        assert!(session.recv_control().await.is_err());
+        assert!(
+            task.await
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("does not match session owner")
+        );
+        assert!(store.final_screen(&id).is_some());
     }
 
     #[tokio::test]
