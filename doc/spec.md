@@ -65,8 +65,22 @@ At PTY EOF or the drain deadline, the server snapshots the final authoritative
 state regardless of pending output notifications or frame throttling. It sends a full SSP frame on a
 reliable stream and waits for the client's SSP acknowledgment before closing the
 connection. Missing application acknowledgments trigger another reliable copy.
-Final delivery is bounded to two seconds; connection failure or timeout can
-still prevent delivery.
+Each final delivery attempt is bounded to two seconds. If it fails, the server
+releases the PTY and retains an encoded final screen for reconnect. It closes
+with a nonzero application error so the client retries instead of treating the
+undelivered screen as a successful shell exit.
+
+The same authenticated owner can reconnect, receive `SessionInfo` and a full
+screen frame, then acknowledge it before the server closes successfully.
+Interrupted attempts leave the checkpoint available without extending its
+lifetime. Receipt of the SSP acknowledgment releases it.
+
+Final checkpoints expire after 60 seconds and share limits of 64 entries and
+64 MiB of encoded screens and owner certificates. Oldest entries are evicted
+first. They contain the visible screen, viewport identity and cursor style at
+the original dimensions; they do not retain PTY workers, the emulator, or
+scrollback. Expiration is checked on cache access. A bootstrap server remains
+available until its completed screens are acknowledged or expire.
 
 ## Transport Layer
 
@@ -246,10 +260,12 @@ configured idle timeout expires, or the server stops. The default idle timeout i
 seven days. They do not survive a server process restart.
 
 The server remembers the most recent 1,024 ended or pruned session IDs. A
-reconnect to one receives `Goodbye` instead of `SessionInfo`; the client stops
-retrying and restores its local terminal. IDs absent from both stores remain
-retryable because the previous connection may still be handing off a live
-session. This completion history retains IDs only, not the final screen.
+reconnect to one without a retained final checkpoint receives `Goodbye` instead
+of `SessionInfo`; the client stops retrying and restores its local terminal.
+IDs absent from both stores remain retryable because the previous connection
+may still be handing off a live session. Ended-ID eviction also releases any
+associated checkpoint. Detached sessions removed by pruning retain only their
+ended ID.
 
 ## Platforms
 
