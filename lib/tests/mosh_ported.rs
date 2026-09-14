@@ -1220,6 +1220,72 @@ async fn ssh_bootstrap_mode() {
 }
 
 #[tokio::test]
+async fn native_initial_screen_establishes_default_cursor() {
+    let fixture = MtlsFixture::new();
+    let home = ssh_bootstrap_helpers::isolated_home_dir();
+    let config_dir = home.join(".config/rose");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("client.crt.der"),
+        fixture.client_cert.cert_der.as_ref(),
+    )
+    .unwrap();
+    std::fs::write(
+        config_dir.join("client.key.der"),
+        &fixture.client_cert.key_der,
+    )
+    .unwrap();
+    let server_cert = config_dir.join("server.crt");
+    std::fs::write(&server_cert, fixture.server.server_cert_der().as_ref()).unwrap();
+    let mut cmd = CommandBuilder::new(ssh_bootstrap_helpers::build_rose_binary());
+    cmd.env("HOME", &home);
+    cmd.args([
+        "connect",
+        "127.0.0.1",
+        "--port",
+        &fixture.addr().port().to_string(),
+        "--cert",
+    ]);
+    cmd.arg(server_cert);
+    let mut pty = ssh_bootstrap_helpers::spawn_in_pty(cmd);
+    let conn = tokio::time::timeout(std::time::Duration::from_secs(30), fixture.server.accept())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let (mut session, _, _) = ServerSession::accept(conn.clone()).await.unwrap();
+    session
+        .send_control(&ControlMessage::SessionInfo {
+            version: PROTOCOL_VERSION,
+            session_id: [0x20; 16],
+        })
+        .await
+        .unwrap();
+    let mut authority = rose::terminal::RoseTerminal::new(24, 80);
+    authority.advance(b"DEFAULT_CURSOR_READY");
+    let expected = authority.snapshot();
+    let mut sender = SspSender::new();
+    sender.push_state(expected.clone());
+    conn.send_datagram(Bytes::from(sender.generate_frame().unwrap().encode()))
+        .unwrap();
+    assert!(
+        ssh_bootstrap_helpers::wait_for_output_contains(&pty, "DEFAULT_CURSOR_READY", 30).await,
+        "initial screen not received: {}",
+        pty.captured_output()
+    );
+    let captured = pty.captured_output();
+    let mut physical = rose::terminal::RoseTerminal::new(24, 80);
+    physical.advance(b"\x1b[6 q\x1b[?25l");
+    physical.advance(captured.as_bytes());
+    let actual = physical.snapshot();
+    conn.close(0u32.into(), b"finished");
+    let _ = ssh_bootstrap_helpers::wait_for_exit(&mut pty.child, 15).await;
+    pty.finish();
+    assert_eq!(actual.rows, expected.rows);
+    assert_eq!(actual.cursor_style, expected.cursor_style);
+}
+
+#[tokio::test]
 async fn native_reconnect_preserves_first_keystroke() {
     let fixture = MtlsFixture::new();
     let home = ssh_bootstrap_helpers::isolated_home_dir();
