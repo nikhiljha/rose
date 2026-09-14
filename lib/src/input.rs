@@ -322,7 +322,63 @@ mod tests {
     use std::future::Future;
     use std::task::{Context, Waker};
 
+    #[cfg(unix)]
+    use portable_pty::CommandBuilder;
+
     use super::*;
+    #[cfg(unix)]
+    use crate::pty::PtySession;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_pty_cancels_blocked_input_and_releases_its_writer() {
+        let mut command = CommandBuilder::new("sh");
+        command.args([
+            "-c",
+            "stty raw -echo; trap '' HUP; printf READY; sleep 5 & wait",
+        ]);
+        let pty = PtySession::open_terminal(5, 20, command).unwrap();
+        let writer = Arc::downgrade(&pty.clone_writer());
+        let mut output = pty.subscribe_output();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut text = String::new();
+            while !text.contains("READY") {
+                text.push_str(&String::from_utf8_lossy(&output.recv().await.unwrap()));
+            }
+        })
+        .await
+        .unwrap();
+        let input = pty.input();
+        let mut writing = tokio::spawn(async move {
+            for offset in (0..MAX_PENDING_INPUT).step_by(MAX_FRAME_INPUT) {
+                input
+                    .write(offset as u64, Bytes::from(vec![b'x'; MAX_FRAME_INPUT]))
+                    .await?;
+            }
+            Ok::<(), InputError>(())
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut writing)
+                .await
+                .is_err(),
+            "input did not reach PTY backpressure"
+        );
+        drop(pty);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), writing)
+                .await
+                .expect("session destruction left the input worker blocked")
+                .unwrap()
+                .is_err()
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while writer.strong_count() != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("PTY writer remained owned after session destruction");
+    }
 
     #[test]
     fn partial_writes_and_overlapping_replays_preserve_each_byte_once() {

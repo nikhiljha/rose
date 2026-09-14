@@ -46,6 +46,8 @@ pub enum PtyError {
 /// writing input, and handling resize events.
 pub struct PtySession {
     writer: Arc<Mutex<Box<dyn std::io::Write + Send>>>,
+    #[cfg(unix)]
+    cancel_io: Option<filedescriptor::FileDescriptor>,
     input: OnceLock<ServerInput>,
     master: Box<dyn MasterPty + Send>,
     child: Option<Box<dyn Child + Send + Sync>>,
@@ -167,6 +169,8 @@ impl PtySession {
             })
             .map_err(|e| PtyError::Open(e.to_string()))?;
 
+        #[cfg(unix)]
+        let (io, cancel_io) = crate::pty_io::PtyIo::new(pair.master.as_ref())?;
         let child = pair
             .slave
             .spawn_command(cmd)
@@ -175,6 +179,8 @@ impl PtySession {
             .master
             .take_writer()
             .map_err(|e| PtyError::Io(std::io::Error::other(e.to_string())))?;
+        #[cfg(unix)]
+        let writer: Box<dyn std::io::Write + Send> = Box::new(io.wrap(writer));
         let writer = Arc::new(Mutex::new(writer));
         let terminal = emulate.then(|| {
             Arc::new(Mutex::new(RoseTerminal::with_writer(
@@ -188,10 +194,13 @@ impl PtySession {
         let (output_tx, initial_rx) = broadcast::channel(256);
         let tx = output_tx.clone();
 
-        let mut reader = pair
+        let reader = pair
             .master
             .try_clone_reader()
             .map_err(|e| PtyError::Io(std::io::Error::other(e.to_string())))?;
+        #[cfg(unix)]
+        let reader: Box<dyn std::io::Read + Send> = Box::new(io.wrap(reader));
+        let mut reader = reader;
 
         // Notified when the reader thread exits (shell closed / PTY EOF).
         let pty_closed = Arc::new(Notify::new());
@@ -228,6 +237,8 @@ impl PtySession {
 
         Ok(Self {
             writer,
+            #[cfg(unix)]
+            cancel_io: Some(cancel_io),
             input: OnceLock::new(),
             master: pair.master,
             child: Some(child),
@@ -344,6 +355,8 @@ impl PtySession {
 
 impl Drop for PtySession {
     fn drop(&mut self) {
+        #[cfg(unix)]
+        drop(self.cancel_io.take());
         if let Some(mut child) = self.child.take()
             && !matches!(child.try_wait(), Ok(Some(_)))
         {

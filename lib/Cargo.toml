@@ -45,3 +45,6 @@ tracing-subscriber = { workspace = true, features = ["registry"] }
 name = "e2e_latency"
 harness = false
 
+[target."cfg(unix)".dependencies]
+filedescriptor = "0.8.3"
+

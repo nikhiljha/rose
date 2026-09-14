@@ -54,6 +54,12 @@ a descendant retains the slave PTY, output continues draining until EOF or for
 one additional second, whichever comes first. Child polling does not cancel
 partially received control messages.
 
+On Unix, PTY reads and writes use nonblocking descriptors with cancellable
+readiness waits. Destroying the session wakes both workers, even if input is
+backed up and a descendant still holds the slave open. Detach and reconnect
+preserve the session and do not cancel its I/O. Session creation fails before
+spawning the shell when the platform cannot monitor the allocated descriptors.
+
 At PTY EOF or the drain deadline, the server snapshots the final authoritative
 state regardless of pending output notifications or frame throttling. It sends a full SSP frame on a
 reliable stream and waits for the client's SSP acknowledgment before closing the

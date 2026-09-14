@@ -1178,7 +1178,7 @@ async fn ssh_bootstrap_mode() {
     let marker = format!("rose_exit_probe_{}", std::process::id());
     {
         let w = pty.writer.as_mut().unwrap();
-        let probe = format!("echo {marker}\n");
+        let probe = format!("printf 'rose_exit_probe_%s\\n' {}\n", std::process::id());
         std::io::Write::write_all(w, probe.as_bytes()).unwrap();
         std::io::Write::flush(w).unwrap();
     }
