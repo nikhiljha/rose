@@ -1,4 +1,152 @@
-use crossterm::event::{KeyCode, KeyModifiers};
+use std::io::Write;
+use std::sync::{Arc, Mutex};
+
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+use crate::input::{InputBuffer, InputError};
+
+const MAX_KEY_LOOKAHEAD: usize = 128;
+const MAX_KEY_BYTES: usize = 32;
+
+pub(super) fn read_keyboard_events(sender: tokio::sync::mpsc::Sender<Event>) {
+    while let Ok(event) = crossterm::event::read() {
+        if sender.blocking_send(event).is_err() {
+            break;
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum InputAction {
+    Disconnect,
+    Detach,
+}
+
+#[derive(Clone)]
+pub(super) struct KeyboardInput {
+    pub(super) buffer: InputBuffer,
+    events: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Event>>>,
+    state: Arc<Mutex<KeyboardState>>,
+}
+
+struct KeyboardState {
+    escape: EscapeState,
+    action: Option<InputAction>,
+    pending: Vec<u8>,
+}
+
+impl KeyboardInput {
+    pub(super) fn new(events: tokio::sync::mpsc::Receiver<Event>) -> Self {
+        Self {
+            buffer: InputBuffer::default(),
+            events: Arc::new(tokio::sync::Mutex::new(events)),
+            state: Arc::new(Mutex::new(KeyboardState {
+                escape: EscapeState::Normal,
+                action: None,
+                pending: Vec::new(),
+            })),
+        }
+    }
+
+    pub(super) async fn next(&self) -> Result<Option<InputAction>, InputError> {
+        let mut events = self.events.lock().await;
+        let mut consumed = false;
+        loop {
+            let (pending, action) = {
+                let mut state = self.state.lock().expect("keyboard lock poisoned");
+                if !state.pending.is_empty() {
+                    match self.buffer.push(&state.pending) {
+                        Ok(()) => state.pending.clear(),
+                        Err(InputError::Full) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                (state.pending.len(), state.action)
+            };
+            if let Some(action) = action {
+                if action == InputAction::Detach {
+                    if pending > 0 {
+                        self.buffer.wait_for_capacity(pending).await;
+                        continue;
+                    }
+                    self.buffer
+                        .wait_for_capacity(crate::input::MAX_PENDING_INPUT)
+                        .await;
+                }
+                return Ok(Some(action));
+            }
+            if consumed {
+                return Ok(None);
+            }
+            if pending > MAX_KEY_LOOKAHEAD - MAX_KEY_BYTES {
+                self.buffer.wait_for_capacity(pending).await;
+                continue;
+            }
+            let event = tokio::select! {
+                event = events.recv() => event,
+                () = self.buffer.wait_for_capacity(pending), if pending > 0 => continue,
+            };
+            let mut state = self.state.lock().expect("keyboard lock poisoned");
+            state.action = match event {
+                Some(Event::Key(key)) => process_key(&key, &mut state),
+                None => Some(InputAction::Disconnect),
+                Some(_) => None,
+            };
+            consumed = true;
+        }
+    }
+}
+
+fn process_key(key: &KeyEvent, state: &mut KeyboardState) -> Option<InputAction> {
+    let bytes = key_event_to_bytes(key);
+    if bytes.is_empty() {
+        return None;
+    }
+    let escape = &mut state.escape;
+    let pending = &mut state.pending;
+    match escape {
+        EscapeState::Normal => {
+            pending.extend_from_slice(&bytes);
+            if key.code == KeyCode::Enter {
+                *escape = EscapeState::AfterEnter;
+            }
+        }
+        EscapeState::AfterEnter => {
+            if key.code == KeyCode::Char('~') {
+                *escape = EscapeState::AfterTilde;
+            } else {
+                pending.extend_from_slice(&bytes);
+                if key.code != KeyCode::Enter {
+                    *escape = EscapeState::Normal;
+                }
+            }
+        }
+        EscapeState::AfterTilde => {
+            *escape = EscapeState::Normal;
+            match key.code {
+                KeyCode::Char('.') => return Some(InputAction::Disconnect),
+                KeyCode::Char('d') => return Some(InputAction::Detach),
+                KeyCode::Char('~') => pending.push(b'~'),
+                KeyCode::Char('?') => {
+                    let mut stdout = std::io::stdout();
+                    let _ = stdout.write_all(
+                        b"\r\nSupported escape sequences:\r\n\
+                          \x20 ~.  - disconnect\r\n\
+                          \x20 ~d  - detach (session stays alive)\r\n\
+                          \x20 ~~  - send literal ~\r\n\
+                          \x20 ~?  - this help\r\n",
+                    );
+                    let _ = stdout.flush();
+                }
+                _ => {
+                    pending.push(b'~');
+                    pending.extend_from_slice(&bytes);
+                }
+            }
+        }
+    }
+    None
+}
 
 /// SSH-style escape sequence state machine.
 ///
@@ -164,7 +312,245 @@ pub(super) fn f_key_escape(n: u8, mods: KeyModifiers) -> Vec<u8> {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+
     use super::*;
+
+    #[tokio::test]
+    async fn detach_survives_cancellation_and_waits_for_prior_keys() {
+        let (send, receive) = tokio::sync::mpsc::channel(16);
+        let keyboard = KeyboardInput::new(receive);
+        for code in [
+            KeyCode::Enter,
+            KeyCode::Char('~'),
+            KeyCode::Char('?'),
+            KeyCode::Enter,
+            KeyCode::Char('~'),
+            KeyCode::Char('~'),
+            KeyCode::Enter,
+            KeyCode::Char('~'),
+            KeyCode::Char('x'),
+            KeyCode::Enter,
+            KeyCode::Char('~'),
+            KeyCode::Char('d'),
+        ] {
+            send.send(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+                .await
+                .unwrap();
+        }
+        for _ in 0..11 {
+            assert_eq!(keyboard.next().await.unwrap(), None);
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), keyboard.next())
+                .await
+                .is_err()
+        );
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let input =
+            crate::input::ServerInput::new(Arc::new(Mutex::new(Box::new(file.reopen().unwrap()))));
+        let connection =
+            crate::testutil::InputConnection::new(input, keyboard.buffer.clone()).await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), keyboard.next())
+                .await
+                .unwrap()
+                .unwrap(),
+            Some(InputAction::Detach)
+        );
+        assert_eq!(std::fs::read(file.path()).unwrap(), b"\r\r~\r~x\r");
+        connection.close().await;
+    }
+
+    #[tokio::test]
+    async fn explicit_disconnect_does_not_wait_for_input_acknowledgments() {
+        let (send, receive) = tokio::sync::mpsc::channel(8);
+        let keyboard = KeyboardInput::new(receive);
+        for code in [KeyCode::Enter, KeyCode::Char('~'), KeyCode::Char('.')] {
+            send.send(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+                .await
+                .unwrap();
+        }
+        assert_eq!(keyboard.next().await.unwrap(), None);
+        assert_eq!(keyboard.next().await.unwrap(), None);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(100), keyboard.next())
+                .await
+                .unwrap()
+                .unwrap(),
+            Some(InputAction::Disconnect)
+        );
+    }
+
+    #[test]
+    fn terminal_reader_drains_large_pastes_without_another_key() {
+        const CAPTURE: &str = "ROSE_TEST_INPUT_CAPTURE";
+        const LENGTH: usize = 80 * 1024;
+        if let Some(path) = std::env::var_os(CAPTURE) {
+            crossterm::terminal::enable_raw_mode().unwrap();
+            let (send, mut receive) = tokio::sync::mpsc::channel(128);
+            std::thread::spawn(move || read_keyboard_events(send));
+            println!("INPUT_READER_READY");
+            std::io::stdout().flush().unwrap();
+            let mut bytes = Vec::new();
+            while bytes.len() < LENGTH {
+                if let Event::Key(key) = receive.blocking_recv().unwrap() {
+                    bytes.extend(key_event_to_bytes(&key));
+                }
+            }
+            std::fs::write(path, bytes).unwrap();
+            return;
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let capture = directory.path().join("input");
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let mut command = portable_pty::CommandBuilder::new(std::env::current_exe().unwrap());
+        command.args([
+            "--exact",
+            "cli::input::tests::terminal_reader_drains_large_pastes_without_another_key",
+            "--nocapture",
+        ]);
+        command.env(CAPTURE, &capture);
+        let mut child = pair.slave.spawn_command(command).unwrap();
+        drop(pair.slave);
+        let mut reader = pair.master.try_clone_reader().unwrap();
+        let (output, receive) = std::sync::mpsc::channel();
+        let reading = std::thread::spawn(move || {
+            let mut bytes = [0; 4096];
+            while let Ok(length) = reader.read(&mut bytes) {
+                if length == 0 || output.send(bytes[..length].to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut writer = pair.master.take_writer().unwrap();
+        let payload: Vec<u8> = (0..LENGTH).map(|i| b'a' + (i % 26) as u8).collect();
+        let expected = payload.clone();
+        let mut writing = None;
+        let mut output = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let Ok(bytes) = receive.recv_timeout(Duration::from_millis(50)) {
+                output.extend(bytes);
+            }
+            if writing.is_none() && output.windows(18).any(|s| s == b"INPUT_READER_READY") {
+                writing = Some(std::thread::spawn(move || writer.write_all(&payload)));
+                break;
+            }
+        }
+        while Instant::now() < deadline && child.try_wait().unwrap().is_none() {
+            let _ = receive.recv_timeout(Duration::from_millis(50));
+        }
+        let exited = child.try_wait().unwrap().is_some();
+        if !exited {
+            child.kill().unwrap();
+        }
+        let status = child.wait().unwrap();
+        reading.join().unwrap();
+        assert!(exited, "terminal reader stalled without another key");
+        if let Some(writing) = writing {
+            let _ = writing.join().unwrap();
+        }
+        assert!(status.success());
+        assert_eq!(std::fs::read(capture).unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn full_input_still_accepts_local_disconnect() {
+        for free in [31, 0] {
+            let (send, receive) = tokio::sync::mpsc::channel(8);
+            let keyboard = KeyboardInput::new(receive);
+            keyboard
+                .buffer
+                .push(&vec![b'a'; crate::input::MAX_PENDING_INPUT - free])
+                .unwrap();
+            for code in [
+                KeyCode::Char('x'),
+                KeyCode::Enter,
+                KeyCode::Char('~'),
+                KeyCode::Char('.'),
+            ] {
+                send.send(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                tokio::time::timeout(Duration::from_millis(100), async {
+                    loop {
+                        if let Some(action) = keyboard.next().await.unwrap() {
+                            break action;
+                        }
+                    }
+                })
+                .await
+                .expect("retained input blocked the local disconnect"),
+                InputAction::Disconnect
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn backpressured_keys_survive_cancellation_and_flush_before_detach() {
+        let (send, receive) = tokio::sync::mpsc::channel(256);
+        let keyboard = KeyboardInput::new(receive);
+        let prefix = vec![b'a'; crate::input::MAX_PENDING_INPUT];
+        keyboard.buffer.push(&prefix).unwrap();
+        for code in std::iter::repeat_n(KeyCode::Char('x'), 128).chain([
+            KeyCode::Enter,
+            KeyCode::Char('~'),
+            KeyCode::Char('~'),
+            KeyCode::Enter,
+            KeyCode::Char('~'),
+            KeyCode::Char('d'),
+        ]) {
+            send.send(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+                .await
+                .unwrap();
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), async {
+                loop {
+                    assert_eq!(keyboard.next().await.unwrap(), None);
+                }
+            })
+            .await
+            .is_err()
+        );
+        let queued = keyboard.events.lock().await.len();
+        assert!(queued > 0 && queued < 134, "lookahead must be bounded");
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let input =
+            crate::input::ServerInput::new(Arc::new(Mutex::new(Box::new(file.reopen().unwrap()))));
+        let connection =
+            crate::testutil::InputConnection::new(input, keyboard.buffer.clone()).await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Some(action) = keyboard.next().await.unwrap() {
+                        break action;
+                    }
+                }
+            })
+            .await
+            .unwrap(),
+            InputAction::Detach
+        );
+        assert_eq!(
+            std::fs::read(file.path()).unwrap(),
+            [prefix.as_slice(), &[b'x'; 128], b"\r~\r"].concat()
+        );
+        connection.close().await;
+    }
 
     #[test]
     fn key_event_ctrl_c() {

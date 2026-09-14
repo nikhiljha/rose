@@ -6,6 +6,7 @@ use quinn::Connection;
 use rustls::pki_types::CertificateDer;
 
 use crate::config::{self, CertKeyPair};
+use crate::input::{InputBuffer, InputError, ServerInput};
 use crate::transport::{QuicClient, QuicServer};
 
 pub struct MtlsFixture {
@@ -77,4 +78,34 @@ pub async fn connected_pair() -> (Connection, Connection, MtlsFixture, QuicClien
     let server_conn = accept.await.unwrap();
 
     (client_conn, server_conn, fixture, client)
+}
+
+pub struct InputConnection {
+    connection: Connection,
+    server: tokio::task::JoinHandle<Result<(), InputError>>,
+    client: tokio::task::JoinHandle<Result<(), InputError>>,
+    _fixture: MtlsFixture,
+    _endpoint: QuicClient,
+}
+
+impl InputConnection {
+    pub async fn new(input: ServerInput, buffer: InputBuffer) -> Self {
+        let (connection, server_conn, fixture, endpoint) = connected_pair().await;
+        let server = tokio::spawn(async move { input.serve(&server_conn).await });
+        let client_conn = connection.clone();
+        let client = tokio::spawn(async move { buffer.connect(&client_conn).await });
+        Self {
+            connection,
+            server,
+            client,
+            _fixture: fixture,
+            _endpoint: endpoint,
+        }
+    }
+
+    pub async fn close(self) {
+        self.connection.close(1u32.into(), b"done");
+        assert!(self.server.await.unwrap().is_err());
+        assert!(self.client.await.unwrap().is_err());
+    }
 }

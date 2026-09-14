@@ -7,19 +7,19 @@ use std::task::Poll;
 use std::time::Duration;
 
 use bytes::Bytes;
-use crossterm::event::{Event, KeyCode};
 use crossterm::terminal;
 
-use super::input::{EscapeState, key_event_to_bytes};
+use super::input::{InputAction, KeyboardInput, read_keyboard_events};
 use super::util::{
     RawModeGuard, connect_command, extract_peer_cert, hex_encode, load_or_generate_client_cert,
 };
 use crate::config::{self, CertKeyPair, RosePaths};
+use crate::input::InputError;
 use crate::protocol::{ClientSession, ControlMessage};
 use crate::scrollback::{self, ScrollbackLine, ScrollbackReceiver};
 use crate::ssp::{
-    DATAGRAM_KEYSTROKE, DATAGRAM_SSP_ACK, ScreenState, SspFrame, SspReceiver, render_diff_ansi,
-    render_full_redraw, scrollback_before_viewport,
+    DATAGRAM_SSP_ACK, ScreenState, SspFrame, SspReceiver, render_diff_ansi, render_full_redraw,
+    scrollback_before_viewport,
 };
 use crate::transport::QuicClient;
 
@@ -316,15 +316,9 @@ async fn client_session_loop_inner(
     // the last known content instead of a blank screen while reconnecting.
     let mut prev_client_screen: Option<ScreenState> = None;
 
-    let (key_tx, key_rx) = tokio::sync::mpsc::unbounded_channel();
-    let key_rx = Arc::new(tokio::sync::Mutex::new(key_rx));
-    std::thread::spawn(move || {
-        while let Ok(event) = crossterm::event::read() {
-            if key_tx.send(event).is_err() {
-                break;
-            }
-        }
-    });
+    let (key_tx, key_rx) = tokio::sync::mpsc::channel(128);
+    let keyboard = KeyboardInput::new(key_rx);
+    std::thread::spawn(move || read_keyboard_events(key_tx));
 
     loop {
         if session_id.is_none() && initial_conn.is_none() {
@@ -365,10 +359,9 @@ async fn client_session_loop_inner(
                         }
                         Ok(Err(e)) => {
                             tracing::debug!(?backoff, "STUN reconnect failed: {e}");
-                            if wait_or_disconnect(&key_rx, backoff).await {
-                                let mut stdout = std::io::stdout();
-                                let _ = stdout.write_all(b"\r\n[RoSE: disconnected]\r\n");
-                                let _ = stdout.flush();
+                            if wait_or_disconnect(&keyboard, backoff, session_id, &reattach_command)
+                                .await?
+                            {
                                 break Ok(());
                             }
                             backoff = (backoff * 2).min(Duration::from_secs(5));
@@ -376,10 +369,9 @@ async fn client_session_loop_inner(
                         }
                         Err(_) => {
                             tracing::debug!(?backoff, "STUN reconnect timed out");
-                            if wait_or_disconnect(&key_rx, backoff).await {
-                                let mut stdout = std::io::stdout();
-                                let _ = stdout.write_all(b"\r\n[RoSE: disconnected]\r\n");
-                                let _ = stdout.flush();
+                            if wait_or_disconnect(&keyboard, backoff, session_id, &reattach_command)
+                                .await?
+                            {
                                 break Ok(());
                             }
                             backoff = (backoff * 2).min(Duration::from_secs(5));
@@ -389,10 +381,8 @@ async fn client_session_loop_inner(
                 }
                 Err(e) => {
                     tracing::debug!(?backoff, "STUN rediscovery failed: {e}");
-                    if wait_or_disconnect(&key_rx, backoff).await {
-                        let mut stdout = std::io::stdout();
-                        let _ = stdout.write_all(b"\r\n[RoSE: disconnected]\r\n");
-                        let _ = stdout.flush();
+                    if wait_or_disconnect(&keyboard, backoff, session_id, &reattach_command).await?
+                    {
                         break Ok(());
                     }
                     backoff = (backoff * 2).min(Duration::from_secs(5));
@@ -404,10 +394,8 @@ async fn client_session_loop_inner(
                 Ok(c) => c,
                 Err(e) => {
                     tracing::debug!(?backoff, "failed to create endpoint: {e}");
-                    if wait_or_disconnect(&key_rx, backoff).await {
-                        let mut stdout = std::io::stdout();
-                        let _ = stdout.write_all(b"\r\n[RoSE: disconnected]\r\n");
-                        let _ = stdout.flush();
+                    if wait_or_disconnect(&keyboard, backoff, session_id, &reattach_command).await?
+                    {
                         break Ok(());
                     }
                     backoff = (backoff * 2).min(Duration::from_secs(5));
@@ -426,10 +414,8 @@ async fn client_session_loop_inner(
                 }
                 Ok(Err(e)) => {
                     eprintln!("[RoSE: {e}]");
-                    if wait_or_disconnect(&key_rx, backoff).await {
-                        let mut stdout = std::io::stdout();
-                        let _ = stdout.write_all(b"\r\n[RoSE: disconnected]\r\n");
-                        let _ = stdout.flush();
+                    if wait_or_disconnect(&keyboard, backoff, session_id, &reattach_command).await?
+                    {
                         break Ok(());
                     }
                     backoff = (backoff * 2).min(Duration::from_secs(5));
@@ -437,10 +423,8 @@ async fn client_session_loop_inner(
                 }
                 Err(_) => {
                     eprintln!("[RoSE: connection timed out]");
-                    if wait_or_disconnect(&key_rx, backoff).await {
-                        let mut stdout = std::io::stdout();
-                        let _ = stdout.write_all(b"\r\n[RoSE: disconnected]\r\n");
-                        let _ = stdout.flush();
+                    if wait_or_disconnect(&keyboard, backoff, session_id, &reattach_command).await?
+                    {
                         break Ok(());
                     }
                     backoff = (backoff * 2).min(Duration::from_secs(5));
@@ -456,10 +440,8 @@ async fn client_session_loop_inner(
                 Ok(s) => s,
                 Err(e) => {
                     tracing::debug!(?backoff, "reconnect handshake failed: {e}");
-                    if wait_or_disconnect(&key_rx, backoff).await {
-                        let mut stdout = std::io::stdout();
-                        let _ = stdout.write_all(b"\r\n[RoSE: disconnected]\r\n");
-                        let _ = stdout.flush();
+                    if wait_or_disconnect(&keyboard, backoff, session_id, &reattach_command).await?
+                    {
                         break Ok(());
                     }
                     backoff = (backoff * 2).min(Duration::from_secs(5));
@@ -482,10 +464,7 @@ async fn client_session_loop_inner(
             }
             Ok(Ok(None) | Err(_)) | Err(_) => {
                 tracing::debug!(?backoff, "handshake timed out");
-                if wait_or_disconnect(&key_rx, backoff).await {
-                    let mut stdout = std::io::stdout();
-                    let _ = stdout.write_all(b"\r\n[RoSE: disconnected]\r\n");
-                    let _ = stdout.flush();
+                if wait_or_disconnect(&keyboard, backoff, session_id, &reattach_command).await? {
                     break Ok(());
                 }
                 backoff = (backoff * 2).min(Duration::from_secs(5));
@@ -626,100 +605,16 @@ async fn client_session_loop_inner(
         });
 
         let input_conn = session.connection().clone();
-        let input_key_rx = Arc::clone(&key_rx);
-        #[derive(Clone, Copy)]
-        enum InputResult {
-            Disconnect,
-            Detach,
-            ConnectionLost,
-        }
-
+        let input_buffer = keyboard.buffer.clone();
+        let input_transport_task =
+            tokio::spawn(async move { input_buffer.connect(&input_conn).await });
+        let input = keyboard.clone();
         let input_task = tokio::spawn(async move {
-            let mut escape = EscapeState::Normal;
-
-            fn send_keys(conn: &quinn::Connection, bytes: &[u8]) -> bool {
-                let mut data = vec![DATAGRAM_KEYSTROKE];
-                data.extend_from_slice(bytes);
-                conn.send_datagram(Bytes::from(data)).is_ok()
-            }
-
             loop {
-                let event = input_key_rx.lock().await.recv().await;
-                match event {
-                    Some(Event::Key(key)) => {
-                        let key_bytes = key_event_to_bytes(&key);
-                        if key_bytes.is_empty() {
-                            continue;
-                        }
-
-                        match escape {
-                            EscapeState::Normal => {
-                                if key.code == crossterm::event::KeyCode::Enter {
-                                    escape = EscapeState::AfterEnter;
-                                    if !send_keys(&input_conn, &key_bytes) {
-                                        break;
-                                    }
-                                } else if !send_keys(&input_conn, &key_bytes) {
-                                    break;
-                                }
-                            }
-                            EscapeState::AfterEnter => {
-                                if key.code == crossterm::event::KeyCode::Char('~') {
-                                    escape = EscapeState::AfterTilde;
-                                } else if key.code == crossterm::event::KeyCode::Enter {
-                                    if !send_keys(&input_conn, &key_bytes) {
-                                        break;
-                                    }
-                                } else {
-                                    escape = EscapeState::Normal;
-                                    if !send_keys(&input_conn, &key_bytes) {
-                                        break;
-                                    }
-                                }
-                            }
-                            EscapeState::AfterTilde => match key.code {
-                                crossterm::event::KeyCode::Char('.') => {
-                                    return InputResult::Disconnect;
-                                }
-                                crossterm::event::KeyCode::Char('d') => {
-                                    return InputResult::Detach;
-                                }
-                                crossterm::event::KeyCode::Char('~') => {
-                                    escape = EscapeState::Normal;
-                                    if !send_keys(&input_conn, b"~") {
-                                        break;
-                                    }
-                                }
-                                crossterm::event::KeyCode::Char('?') => {
-                                    let mut stdout = std::io::stdout();
-                                    let _ = stdout.write_all(
-                                        b"\r\nSupported escape sequences:\r\n\
-                                              \x20 ~.  - disconnect\r\n\
-                                              \x20 ~d  - detach (session stays alive)\r\n\
-                                              \x20 ~~  - send literal ~\r\n\
-                                              \x20 ~?  - this help\r\n",
-                                    );
-                                    let _ = stdout.flush();
-                                    escape = EscapeState::Normal;
-                                }
-                                _ => {
-                                    escape = EscapeState::Normal;
-                                    if !send_keys(&input_conn, b"~") {
-                                        break;
-                                    }
-                                    if !send_keys(&input_conn, &key_bytes) {
-                                        break;
-                                    }
-                                }
-                            },
-                        }
-                    }
-                    Some(Event::Resize(_, _)) => {}
-                    None => break,
-                    _ => {}
+                if let Some(action) = input.next().await? {
+                    return Ok::<_, InputError>(action);
                 }
             }
-            InputResult::ConnectionLost
         });
 
         let check_conn = session.connection().clone();
@@ -760,20 +655,30 @@ async fn client_session_loop_inner(
             UserDisconnect,
             UserDetach,
             ConnectionLost,
+            InputRejected(InputError),
         }
 
         let mut output_task = output_task;
         let mut stream_task = stream_task;
         let mut input_task = input_task;
+        let mut input_transport_task = input_transport_task;
         let mut control_task = control_task;
         let exit = tokio::select! {
             _ = &mut output_task => SessionExit::ConnectionLost,
             _ = &mut stream_task => SessionExit::ConnectionLost,
             result = &mut input_task => {
-                match result.ok().unwrap_or(InputResult::ConnectionLost) {
-                    InputResult::Disconnect => SessionExit::UserDisconnect,
-                    InputResult::Detach => SessionExit::UserDetach,
-                    InputResult::ConnectionLost => SessionExit::ConnectionLost,
+                match result {
+                    Ok(Ok(InputAction::Disconnect)) => SessionExit::UserDisconnect,
+                    Ok(Ok(InputAction::Detach)) => SessionExit::UserDetach,
+                    Ok(Err(error)) => SessionExit::InputRejected(error),
+                    Err(_) => SessionExit::ConnectionLost,
+                }
+            },
+            result = &mut input_transport_task => {
+                match result {
+                    Ok(Err(error @ (InputError::Offset { .. } | InputError::Length))) =>
+                        SessionExit::InputRejected(error),
+                    _ => SessionExit::ConnectionLost,
                 }
             },
             result = &mut control_task => {
@@ -788,6 +693,7 @@ async fn client_session_loop_inner(
         output_task.abort();
         stream_task.abort();
         input_task.abort();
+        input_transport_task.abort();
         control_task.abort();
 
         let exit = match exit {
@@ -817,6 +723,10 @@ async fn client_session_loop_inner(
         };
 
         match exit {
+            SessionExit::InputRejected(error) => {
+                check_conn.close(1u32.into(), b"input state mismatch");
+                return Err(error.into());
+            }
             SessionExit::ShellExited => {
                 let mut stdout = std::io::stdout();
                 let _ = stdout.write_all(b"\r\n[RoSE: shell exited]\r\n");
@@ -837,17 +747,7 @@ async fn client_session_loop_inner(
                 // Give the I/O driver a moment to flush the frame.
                 tokio::time::sleep(Duration::from_millis(50)).await;
 
-                let _ = terminal::disable_raw_mode();
-                let mut stdout = std::io::stdout();
-                let _ = stdout.write_all(
-                    format!(
-                        "\r\n[RoSE: detached]\r\n\
-                         [RoSE: to reattach, run: {reattach_command} --session {}]\r\n",
-                        hex_encode(&session_id.expect("session ID received during handshake"))
-                    )
-                    .as_bytes(),
-                );
-                let _ = stdout.flush();
+                print_detached(session_id, &reattach_command);
                 break Ok(());
             }
             SessionExit::ConnectionLost => {
@@ -865,52 +765,54 @@ async fn client_session_loop_inner(
     }
 }
 
-/// Waits for `duration` but returns early if the user types Enter~.
-///
-/// Used during reconnection backoff so the user can quit even when
-/// disconnected. Returns `true` if the user typed Enter~.
-///
-/// COVERAGE: CLI helper tested via integration/e2e tests.
-#[cfg_attr(coverage_nightly, coverage(off))]
+/// Retains input during backoff, while honoring local escape commands.
 async fn wait_or_disconnect(
-    key_rx: &Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Event>>>,
+    keyboard: &KeyboardInput,
     duration: Duration,
-) -> bool {
+    session_id: Option<[u8; 16]>,
+    reattach_command: &str,
+) -> Result<bool, InputError> {
     let deadline = tokio::time::Instant::now() + duration;
-    let mut escape = EscapeState::Normal;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            return false;
+            return Ok(false);
         }
         tokio::select! {
-            event = async { key_rx.lock().await.recv().await } => {
-                if let Some(Event::Key(key)) = event {
-                    match escape {
-                        EscapeState::Normal => {
-                            if key.code == KeyCode::Enter {
-                                escape = EscapeState::AfterEnter;
-                            }
-                        }
-                        EscapeState::AfterEnter => match key.code {
-                            KeyCode::Char('~') => escape = EscapeState::AfterTilde,
-                            KeyCode::Enter => {}
-                            _ => escape = EscapeState::Normal,
-                        },
-                        EscapeState::AfterTilde => {
-                            if key.code == KeyCode::Char('.') {
-                                return true;
-                            }
-                            escape = EscapeState::Normal;
+            action = keyboard.next() => {
+                if let Some(action) = action? {
+                    match action {
+                        InputAction::Detach => print_detached(session_id, reattach_command),
+                        InputAction::Disconnect => {
+                            let mut stdout = std::io::stdout();
+                            let _ = stdout.write_all(b"\r\n[RoSE: disconnected]\r\n");
+                            let _ = stdout.flush();
                         }
                     }
+                    return Ok(true);
                 }
             }
             () = tokio::time::sleep(remaining) => {
-                return false;
+                return Ok(false);
             }
         }
     }
+}
+
+fn print_detached(session_id: Option<[u8; 16]>, command: &str) {
+    let _ = terminal::disable_raw_mode();
+    let mut stdout = std::io::stdout();
+    let message = session_id.map_or_else(
+        || "\r\n[RoSE: disconnected before session creation]\r\n".to_owned(),
+        |id| {
+            format!(
+                "\r\n[RoSE: detached]\r\n[RoSE: to reattach, run: {command} --session {}]\r\n",
+                hex_encode(&id),
+            )
+        },
+    );
+    let _ = stdout.write_all(message.as_bytes());
+    let _ = stdout.flush();
 }
 
 /// Performs a full terminal redraw (scrollback + visible) and resets the
@@ -1034,7 +936,127 @@ fn process_ssp_frame(
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
+    use crossterm::event::{Event, KeyCode};
+
     use super::*;
+
+    #[tokio::test]
+    async fn backoff_honors_local_disconnect_and_keyboard_eof() {
+        for explicit in [true, false] {
+            let (send, receive) = tokio::sync::mpsc::channel(8);
+            let keyboard = KeyboardInput::new(receive);
+            if explicit {
+                for code in [
+                    KeyCode::Enter,
+                    KeyCode::Char('x'),
+                    KeyCode::Enter,
+                    KeyCode::Enter,
+                    KeyCode::Char('~'),
+                    KeyCode::Char('.'),
+                ] {
+                    send.send(Event::Key(crossterm::event::KeyEvent::new(
+                        code,
+                        crossterm::event::KeyModifiers::NONE,
+                    )))
+                    .await
+                    .unwrap();
+                }
+            } else {
+                drop(send);
+            }
+            assert!(
+                !wait_or_disconnect(&keyboard, Duration::ZERO, None, "")
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(100),
+                    wait_or_disconnect(&keyboard, Duration::from_secs(5), None, ""),
+                )
+                .await
+                .expect("local disconnect waited for the reconnect backoff")
+                .unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn backoff_detach_resumes_after_prior_input_is_acknowledged() {
+        for session_id in [None, Some([3; 16])] {
+            let (send, receive) = tokio::sync::mpsc::channel(8);
+            let keyboard = KeyboardInput::new(receive);
+            for event in [
+                Event::Resize(80, 24),
+                Event::Key(crossterm::event::KeyEvent::new(
+                    KeyCode::Enter,
+                    crossterm::event::KeyModifiers::NONE,
+                )),
+                Event::Key(crossterm::event::KeyEvent::new(
+                    KeyCode::Char('~'),
+                    crossterm::event::KeyModifiers::NONE,
+                )),
+                Event::Key(crossterm::event::KeyEvent::new(
+                    KeyCode::Char('d'),
+                    crossterm::event::KeyModifiers::NONE,
+                )),
+            ] {
+                send.send(event).await.unwrap();
+            }
+            assert!(
+                !wait_or_disconnect(&keyboard, Duration::from_millis(20), session_id, "rose")
+                    .await
+                    .unwrap()
+            );
+            let file = tempfile::NamedTempFile::new().unwrap();
+            let input = crate::input::ServerInput::new(Arc::new(Mutex::new(Box::new(
+                file.reopen().unwrap(),
+            ))));
+            let connection =
+                crate::testutil::InputConnection::new(input, keyboard.buffer.clone()).await;
+            assert!(
+                wait_or_disconnect(&keyboard, Duration::from_secs(2), session_id, "rose")
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(std::fs::read(file.path()).unwrap(), b"\r");
+            connection.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn backoff_preserves_typed_input_for_the_next_connection() {
+        let (send, receive) = tokio::sync::mpsc::channel(8);
+        let keyboard = KeyboardInput::new(receive);
+        for code in [KeyCode::Char('a'), KeyCode::Char('b'), KeyCode::Enter] {
+            send.send(Event::Key(crossterm::event::KeyEvent::new(
+                code,
+                crossterm::event::KeyModifiers::NONE,
+            )))
+            .await
+            .unwrap();
+        }
+        assert!(
+            !wait_or_disconnect(&keyboard, Duration::from_millis(20), None, "")
+                .await
+                .unwrap()
+        );
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let input =
+            crate::input::ServerInput::new(Arc::new(Mutex::new(Box::new(file.reopen().unwrap()))));
+        let connection =
+            crate::testutil::InputConnection::new(input, keyboard.buffer.clone()).await;
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            keyboard
+                .buffer
+                .wait_for_capacity(crate::input::MAX_PENDING_INPUT),
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(file.path()).unwrap(), b"ab\r");
+        connection.close().await;
+    }
 
     #[tokio::test]
     async fn duplicate_and_unknown_base_frames_acknowledge_current_state() {

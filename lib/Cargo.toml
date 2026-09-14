@@ -11,7 +11,7 @@ workspace = true
 anyhow.workspace = true
 bytes = "1.11.1"
 clap = { version = "4.5.60", features = ["derive"] }
-crossterm = "0.29.0"
+crossterm = { version = "0.29.0", features = ["use-dev-tty"] }
 getrandom = "0.2"
 portable-pty = "0.9.0"
 quinn = "0.11.9"

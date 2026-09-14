@@ -399,6 +399,10 @@ async fn handle_server_session(
     let pty_closed = pty.closed();
     let child_exited = Arc::new(tokio::sync::Notify::new());
     let pty_writer = pty.clone_writer();
+    let reliable_input = pty.input();
+    let reliable_conn = session.connection().clone();
+    let reliable_input_task =
+        tokio::spawn(async move { reliable_input.serve(&reliable_conn).await });
 
     let session_conn = session.connection().clone();
     let terminal_out = Arc::clone(&terminal);
@@ -528,6 +532,7 @@ async fn handle_server_session(
 
     let mut output_task = output_task;
     let mut input_task = input_task;
+    let mut reliable_input_task = reliable_input_task;
     let mut scrollback_task = scrollback_task;
     let mut control_task = control_task;
     let mut control_shutdown_tx = Some(control_shutdown_tx);
@@ -541,6 +546,12 @@ async fn handle_server_session(
         },
         _ = &mut input_task => {
             tracing::debug!(?session_id, "input task ended");
+            shell_exited = false;
+            pty_from_control = None;
+        },
+        result = &mut reliable_input_task => {
+            tracing::debug!(?session_id, ?result, "reliable input task ended");
+            close_conn.close(1u32.into(), b"input stream ended");
             shell_exited = false;
             pty_from_control = None;
         },
@@ -558,6 +569,7 @@ async fn handle_server_session(
 
     output_task.abort();
     input_task.abort();
+    reliable_input_task.abort();
     scrollback_task.abort();
 
     let mut detached_pty = None;
@@ -824,6 +836,78 @@ mod tests {
             .await
             .expect("remote program did not produce its marker");
         }
+    }
+
+    #[tokio::test]
+    async fn reliable_input_replay_is_deduplicated_after_reattachment() {
+        let native = NativeSession::new().await;
+        let (mut send, mut recv) = native.session.connection().open_bi().await.unwrap();
+        send.write_all(&[3]).await.unwrap();
+        let mut accepted = [0; 8];
+        tokio::time::timeout(Duration::from_secs(1), recv.read_exact(&mut accepted))
+            .await
+            .expect("server did not accept reliable input")
+            .unwrap();
+        assert_eq!(u64::from_be_bytes(accepted), 0);
+
+        let command = b"ROSE_INPUT_TOTAL=$(( ${ROSE_INPUT_TOTAL:-0} + 1 )); \
+            printf '\\033[2J\\033[HCOUNT=%s\\n' \"$ROSE_INPUT_TOTAL\"\r";
+        let frame = [
+            0_u64.to_be_bytes().as_slice(),
+            (command.len() as u32).to_be_bytes().as_slice(),
+            command,
+        ]
+        .concat();
+        send.write_all(&frame).await.unwrap();
+        native.wait_for_marker("COUNT=1").await;
+        native
+            .session
+            .connection()
+            .close(1u32.into(), b"lost input acknowledgment");
+        native.task.await.unwrap().unwrap();
+
+        let (server_conn, client_conn) = tokio::join!(
+            native._fixture.server.accept(),
+            native._fixture.connect(&native._client)
+        );
+        let task = tokio::spawn(handle_server_session(
+            server_conn.unwrap().unwrap(),
+            native.store.clone(),
+            false,
+        ));
+        let mut session = ClientSession::reconnect(client_conn, 5, 80, native.session_id, vec![])
+            .await
+            .unwrap();
+        session.recv_control().await.unwrap().unwrap();
+        let (mut send, mut recv) = session.connection().open_bi().await.unwrap();
+        send.write_all(&[3]).await.unwrap();
+        recv.read_exact(&mut accepted).await.unwrap();
+        assert_eq!(u64::from_be_bytes(accepted), command.len() as u64);
+        send.write_all(&frame).await.unwrap();
+        recv.read_exact(&mut accepted).await.unwrap();
+        assert_eq!(u64::from_be_bytes(accepted), command.len() as u64);
+        let check = b"printf '\\033[2J\\033[HSAVED=%s\\n' \"$ROSE_INPUT_TOTAL\"\r";
+        send.write_all(&accepted).await.unwrap();
+        send.write_all(&(check.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        send.write_all(check).await.unwrap();
+        let mut receiver = SspReceiver::new(5);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let data = session.recv_output().await.unwrap();
+                receiver
+                    .process_frame(&SspFrame::decode(&data).unwrap())
+                    .unwrap();
+                if receiver.state().rows.iter().any(|row| row == "SAVED=1") {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("replayed input ran twice or ordered input was lost");
+        session.connection().close(1u32.into(), b"done");
+        task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
