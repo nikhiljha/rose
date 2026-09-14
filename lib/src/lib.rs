@@ -5,6 +5,7 @@
 
 pub mod cli;
 pub mod config;
+mod input;
 pub mod protocol;
 pub mod pty;
 pub mod scrollback;

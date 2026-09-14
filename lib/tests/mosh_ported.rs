@@ -12,7 +12,7 @@ use std::process::Stdio;
 use bytes::Bytes;
 use portable_pty::CommandBuilder;
 use rose::protocol::{ControlMessage, PROTOCOL_VERSION, ServerSession};
-use rose::ssp::{DATAGRAM_KEYSTROKE, SspSender};
+use rose::ssp::SspSender;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 mod common;
@@ -1251,6 +1251,7 @@ async fn native_reconnect_preserves_first_keystroke() {
     cmd.arg(&server_cert);
     let mut pty = ssh_bootstrap_helpers::spawn_in_pty(cmd);
     let session_id = [0x12; 16];
+    let mut accepted = 0u64;
 
     for attempt in 0..2 {
         let conn =
@@ -1275,6 +1276,19 @@ async fn native_reconnect_preserves_first_keystroke() {
             .await
             .unwrap();
 
+        let (mut acknowledgments, mut input) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), conn.accept_bi())
+                .await
+                .unwrap()
+                .unwrap();
+        let mut kind = [0];
+        input.read_exact(&mut kind).await.unwrap();
+        assert_eq!(kind, [3]);
+        acknowledgments
+            .write_all(&accepted.to_be_bytes())
+            .await
+            .unwrap();
+
         let ready = format!("CONNECTION_READY_{attempt}");
         let mut terminal = rose::terminal::RoseTerminal::new(24, 80);
         terminal.advance(ready.as_bytes());
@@ -1290,23 +1304,30 @@ async fn native_reconnect_preserves_first_keystroke() {
         let writer = pty.writer.as_mut().unwrap();
         writer.write_all(b"ab").unwrap();
         writer.flush().unwrap();
-        for expected in b"ab" {
-            let data = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                loop {
-                    let data = conn.read_datagram().await.unwrap();
-                    if data.first() == Some(&DATAGRAM_KEYSTROKE) {
-                        break data;
-                    }
-                }
-            })
-            .await
-            .unwrap();
-            assert_eq!(
-                &data[1..],
-                &[*expected],
-                "connection {attempt} lost a keystroke"
-            );
-        }
+        let received = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut received = Vec::new();
+            while received.len() < 2 {
+                let mut offset = [0; 8];
+                let mut length = [0; 4];
+                input.read_exact(&mut offset).await.unwrap();
+                input.read_exact(&mut length).await.unwrap();
+                assert_eq!(u64::from_be_bytes(offset), accepted);
+                let length = u32::from_be_bytes(length) as usize;
+                assert!((1..=4096).contains(&length));
+                let mut bytes = vec![0; length];
+                input.read_exact(&mut bytes).await.unwrap();
+                accepted += length as u64;
+                received.extend(bytes);
+                acknowledgments
+                    .write_all(&accepted.to_be_bytes())
+                    .await
+                    .unwrap();
+            }
+            received
+        })
+        .await
+        .unwrap();
+        assert_eq!(received, b"ab", "connection {attempt} lost a keystroke");
         conn.close(u32::from(attempt == 0).into(), b"test reconnect");
     }
     let status = ssh_bootstrap_helpers::wait_for_exit(&mut pty.child, 15)
