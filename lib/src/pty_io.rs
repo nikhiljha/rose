@@ -2,6 +2,7 @@
 
 use std::io::{self, Read, Write};
 use std::sync::Arc;
+use std::time::Duration;
 
 use filedescriptor::{AsRawFileDescriptor, FileDescriptor, POLLIN, POLLOUT, poll, pollfd};
 use portable_pty::MasterPty;
@@ -23,13 +24,17 @@ impl PtyIo {
             .set_non_blocking(true)
             .map_err(io::Error::other)?;
         let (cancelled, cancel) = filedescriptor::socketpair().map_err(io::Error::other)?;
-        Ok((
-            Arc::new(Self {
-                descriptor,
-                cancelled,
-            }),
-            cancel,
-        ))
+        let ready = Arc::new(Self {
+            descriptor,
+            cancelled,
+        });
+        ready.wait(POLLIN, Some(Duration::ZERO)).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("PTY readiness is unsupported: {error}"),
+            )
+        })?;
+        Ok((ready, cancel))
     }
 
     /// Wrap an existing PTY reader or writer with cancellable readiness waits.
@@ -40,11 +45,7 @@ impl PtyIo {
         }
     }
 
-    fn perform<T>(
-        &self,
-        events: i16,
-        mut operation: impl FnMut() -> io::Result<T>,
-    ) -> io::Result<T> {
+    fn wait(&self, events: i16, timeout: Option<Duration>) -> io::Result<()> {
         loop {
             let mut descriptors = [
                 pollfd {
@@ -58,7 +59,7 @@ impl PtyIo {
                     revents: 0,
                 },
             ];
-            match poll(&mut descriptors, None) {
+            match poll(&mut descriptors, timeout) {
                 Err(filedescriptor::Error::Poll(error))
                     if error.kind() == io::ErrorKind::Interrupted =>
                 {
@@ -73,6 +74,17 @@ impl PtyIo {
                     "PTY session closed",
                 ));
             }
+            return Ok(());
+        }
+    }
+
+    fn perform<T>(
+        &self,
+        events: i16,
+        mut operation: impl FnMut() -> io::Result<T>,
+    ) -> io::Result<T> {
+        loop {
+            self.wait(events, None)?;
             match operation() {
                 Err(error)
                     if matches!(
