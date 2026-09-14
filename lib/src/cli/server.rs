@@ -1055,6 +1055,7 @@ mod tests {
         let (_tx, rx) = tokio::sync::broadcast::channel(1);
         let mut protocol = SspSender::new();
         protocol.push_state(crate::ssp::ScreenState {
+            cursor_style: Default::default(),
             viewport: None,
             rows: vec!["x".repeat(60_000); 300],
             cursor_x: 0,

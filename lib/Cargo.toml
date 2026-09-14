@@ -27,6 +27,7 @@ tokio = { workspace = true, features = ["full"] }
 toml = "1.0.3"
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
+wezterm-surface = { git = "https://github.com/wezterm/wezterm", branch = "main", version = "0.1.0" }
 wezterm-term = { git = "https://github.com/wezterm/wezterm", branch = "main", version = "0.1.0" }
 x509-parser = "0.18.1"
 

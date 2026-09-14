@@ -25,10 +25,11 @@ The server interprets terminal output with `wezterm-term`:
 
 #### Terminal Feature Boundary
 
-The current snapshot contains ANSI row strings, cursor coordinates, and viewport
-identity. This represents text, colors, cell attributes, scrolling, and
+The current snapshot contains ANSI row strings, cursor coordinates, cursor
+visibility and shape (including blink policy), and viewport identity. This
+represents text, colors, cell attributes, scrolling, and
 alternate-screen contents. It is not a serialization of the complete emulator.
-Graphics, hyperlinks, cursor appearance, application input modes, clipboard
+Graphics, hyperlinks, dynamic cursor colors, application input modes, clipboard
 events, and other terminal effects are not all represented in the wire format.
 WezTerm parsing a feature does not imply that the client can reproduce it.
 
@@ -202,6 +203,22 @@ Clients only synthesize native scrolling when both snapshots identify movement
 within the primary screen and the overlapping rows match. Without this metadata,
 history arrives through the reliable scrollback stream. Older decoders ignore
 the extension; newer decoders accept frames without it.
+
+### Cursor Appearance
+
+A diff can append `[0xc0: u8][cursor_style: u8]` after its rows and optional
+viewport metadata. The style byte uses bit 7 for hidden visibility and bits 0–6
+for the DECSCUSR shape: 0 = default, 1/2 = blinking/steady block,
+3/4 = blinking/steady underline, 5/6 = blinking/steady bar. Other shape values
+are invalid. Omitted cursor metadata means a visible cursor with default shape,
+including when restoring that state after a non-default style.
+
+Cursor appearance participates in snapshot equality and SSP recovery even when
+no text or cursor coordinates change. Incremental rendering emits DECSCUSR and
+DECTCEM when the style changes; a full redraw always restores it. Client teardown
+shows the cursor and restores the local terminal's default shape. Production
+snapshots include viewport metadata before cursor metadata, so viewport-only
+decoders can ignore the cursor suffix.
 
 ### Session Persistence
 

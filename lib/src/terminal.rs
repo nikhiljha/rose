@@ -15,7 +15,7 @@ use wezterm_term::{
 type SequenceNo = usize;
 
 use crate::scrollback::MAX_SCROLLBACK_LINES;
-use crate::ssp::{ScreenState, Viewport};
+use crate::ssp::{CursorStyle, ScreenState, Viewport};
 
 /// Configuration for the wezterm terminal emulator.
 #[derive(Debug)]
@@ -424,11 +424,15 @@ impl RoseTerminal {
         self.last_first_row = viewport.first_row;
         self.last_alternate_screen = viewport.alternate_screen;
 
-        let (cx, cy) = self.cursor_pos();
+        let cursor = self.inner.cursor_pos();
         ScreenState {
             rows: self.cached_rows.clone(),
-            cursor_x: cx as u16,
-            cursor_y: cy as u16,
+            cursor_x: cursor.x as u16,
+            cursor_y: cursor.y as u16,
+            cursor_style: CursorStyle {
+                shape: cursor.shape,
+                visibility: cursor.visibility,
+            },
             viewport: Some(viewport),
         }
     }
@@ -438,6 +442,45 @@ impl RoseTerminal {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+    use crate::ssp::{SspFrame, SspReceiver, SspSender, render_diff_ansi, render_full_redraw};
+
+    #[test]
+    fn cursor_style_survives_replication_and_checkpoint() {
+        let mut authority = RoseTerminal::new(4, 20);
+        let mut display = RoseTerminal::new(4, 20);
+        let mut sender = SspSender::new();
+        let mut receiver = SspReceiver::new(4);
+        for sequence in [
+            "\x1b[?25l",
+            "\x1b[?25h",
+            "\x1b[1 q",
+            "\x1b[2 q",
+            "\x1b[3 q",
+            "\x1b[4 q",
+            "\x1b[5 q",
+            "\x1b[6 q",
+            "\x1b[0 q",
+        ] {
+            authority.advance(sequence.as_bytes());
+            sender.push_state(authority.snapshot());
+            let frame = SspFrame::decode(&sender.generate_frame().unwrap().encode()).unwrap();
+            let previous = receiver.state().clone();
+            receiver.process_frame(&frame).unwrap();
+            sender.process_ack(receiver.ack_num());
+            display.advance(&render_diff_ansi(&previous, receiver.state()));
+
+            let expected = authority.inner.cursor_pos();
+            let actual = display.inner.cursor_pos();
+            assert_eq!(actual.visibility, expected.visibility, "{sequence:?}");
+            assert_eq!(actual.shape, expected.shape, "{sequence:?}");
+
+            let mut reconnected = RoseTerminal::new(4, 20);
+            reconnected.advance(&render_full_redraw(&[], receiver.state()));
+            let restored = reconnected.inner.cursor_pos();
+            assert_eq!(restored.visibility, expected.visibility, "{sequence:?}");
+            assert_eq!(restored.shape, expected.shape, "{sequence:?}");
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Basic terminal functionality
