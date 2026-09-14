@@ -1181,6 +1181,7 @@ mod tests {
         let mut protocol = SspSender::new();
         protocol.push_state(crate::ssp::ScreenState {
             cursor_style: Default::default(),
+            input_modes: Default::default(),
             viewport: None,
             rows: vec!["x".repeat(60_000); 300],
             cursor_x: 0,

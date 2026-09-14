@@ -26,10 +26,11 @@ The server interprets terminal output with `wezterm-term`:
 #### Terminal Feature Boundary
 
 The current snapshot contains ANSI row strings, cursor coordinates, cursor
-visibility and shape (including blink policy), and viewport identity. This
+visibility and shape (including blink policy), viewport identity, and DECCKM
+application cursor-key mode. This
 represents text, colors, cell attributes, scrolling, and
 alternate-screen contents. It is not a serialization of the complete emulator.
-Graphics, hyperlinks, dynamic cursor colors, application input modes, clipboard
+Graphics, hyperlinks, dynamic cursor colors, other application input modes, clipboard
 events, and other terminal effects are not all represented in the wire format.
 WezTerm parsing a feature does not imply that the client can reproduce it.
 
@@ -115,7 +116,9 @@ were written to the PTY, not that the application executed them. A newly attache
 client adopts the session's accepted offset; an automatically reconnecting client
 validates that offset against its retained and previously sent bytes.
 
-The reliable input protocol requires handshake version 2 on both ends. The
+The CLI requires handshake version 3 on both ends, including `SessionInfo`.
+Clients and servers must be upgraded together; there is no v2 compatibility
+codec. The
 low-level `ClientSession::send_input` datagram API remains available without
 ordering or replay guarantees; the CLI uses the reliable stream.
 
@@ -208,20 +211,29 @@ Heavily inspired by Mosh's State Synchronization Protocol (SSP), but not wire-co
   Duplicate frames and frames with unavailable bases still elicit an ACK of the
   current state. Invalid diffs leave both the screen and its ACK unchanged.
 
+### Checkpoint Metadata
+
+Protocol v3 diffs append zero or more tagged fields after the changed rows:
+`[tag: u16][length: u32][payload]`, with integers in big-endian order. Known tags
+are 1 (viewport, nine bytes), 2 (cursor style, one byte), and 3 (input modes, one
+byte). Unknown tags, duplicate tags, truncated fields, invalid values, and
+incorrect lengths are rejected. No metadata field allocates according to a
+peer-provided length. The entire frame remains subject to the SSP frame limit.
+An omitted field restores its default value, including in incremental diffs.
+
 ### Viewport Identity
 
-Screen diffs may append a nine-byte viewport extension after the changed rows:
+The viewport field (tag 1) contains
 `[alternate_screen: u8][first_row: u64 big-endian]`. The stable first-row index
 distinguishes actual scrolling from a redraw that happens to reuse row text.
 Clients only synthesize native scrolling when both snapshots identify movement
 within the primary screen and the overlapping rows match. Without this metadata,
-history arrives through the reliable scrollback stream. Older decoders ignore
-the extension; newer decoders accept frames without it.
+history arrives through the reliable scrollback stream. Only 0 (primary) and
+1 (alternate) are valid screen-buffer values.
 
 ### Cursor Appearance
 
-A diff can append `[0xc0: u8][cursor_style: u8]` after its rows and optional
-viewport metadata. The style byte uses bit 7 for hidden visibility and bits 0–6
+The cursor-style field (tag 2) uses bit 7 for hidden visibility and bits 0–6
 for the DECSCUSR shape: 0 = default, 1/2 = blinking/steady block,
 3/4 = blinking/steady underline, 5/6 = blinking/steady bar. Other shape values
 are invalid. Omitted cursor metadata means a visible cursor with default shape,
@@ -230,9 +242,22 @@ including when restoring that state after a non-default style.
 Cursor appearance participates in snapshot equality and SSP recovery even when
 no text or cursor coordinates change. Incremental rendering emits DECSCUSR and
 DECTCEM when the style changes; a full redraw always restores it. Client teardown
-shows the cursor and restores the local terminal's default shape. Production
-snapshots include viewport metadata before cursor metadata, so viewport-only
-decoders can ignore the cursor suffix.
+shows the cursor and restores the local terminal's default shape.
+
+### Application Cursor Keys
+
+The input-mode field (tag 3) contains a boolean DECCKM value: 0 for normal mode
+and 1 for application cursor-key mode. The server snapshots this state from its
+authoritative terminal even when no visible text changes. Full frames and
+reconnect checkpoints carry the current value.
+
+The client encodes unmodified arrows and Home/End as SS3 (`ESC O A/B/C/D/H/F`)
+when application mode is enabled, and CSI (`ESC [ A/B/C/D/H/F`) otherwise.
+Modified keys retain their CSI modifier parameters. Press and repeat events
+produce input; release events are ignored before processing local escape
+commands. Encoding uses the latest accepted state; stale or rejected frames
+cannot change it. Bytes already queued for reliable delivery retain their
+original encoding and input offsets across reconnects.
 
 ### Session Persistence
 

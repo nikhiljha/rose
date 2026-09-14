@@ -40,6 +40,13 @@ pub struct CursorStyle {
     pub visibility: CursorVisibility,
 }
 
+/// Application-controlled terminal modes that affect client input encoding.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct InputModes {
+    /// Whether DECCKM application cursor-key mode is enabled.
+    pub application_cursor_keys: bool,
+}
+
 impl CursorStyle {
     const fn shape_code(self) -> u8 {
         match self.shape {
@@ -88,7 +95,10 @@ impl CursorStyle {
     }
 }
 
-const CURSOR_STYLE_EXTENSION: u8 = 0xc0;
+const VIEWPORT_EXTENSION: u16 = 1;
+const CURSOR_STYLE_EXTENSION: u16 = 2;
+const INPUT_MODES_EXTENSION: u16 = 3;
+const EXTENSION_HEADER_BYTES: usize = 6;
 
 /// Snapshot of visible terminal screen.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,7 +111,9 @@ pub struct ScreenState {
     pub cursor_y: u16,
     /// Cursor appearance.
     pub cursor_style: CursorStyle,
-    /// Viewport identity, absent in frames from older peers.
+    /// Application-controlled input modes.
+    pub input_modes: InputModes,
+    /// Optional viewport identity for native scrolling and scrollback ordering.
     pub viewport: Option<Viewport>,
 }
 
@@ -114,6 +126,7 @@ impl ScreenState {
             cursor_x: 0,
             cursor_y: 0,
             cursor_style: CursorStyle::default(),
+            input_modes: InputModes::default(),
             viewport: None,
         }
     }
@@ -146,6 +159,7 @@ impl ScreenState {
         }
         ScreenDiff {
             cursor_style: self.cursor_style,
+            input_modes: self.input_modes,
             viewport: self.viewport,
             changed_rows,
             cursor_x: self.cursor_x,
@@ -166,6 +180,7 @@ impl ScreenState {
             .collect();
         ScreenDiff {
             cursor_style: self.cursor_style,
+            input_modes: self.input_modes,
             viewport: self.viewport,
             changed_rows,
             cursor_x: self.cursor_x,
@@ -195,6 +210,7 @@ impl ScreenState {
         self.cursor_x = diff.cursor_x;
         self.cursor_y = diff.cursor_y;
         self.cursor_style = diff.cursor_style;
+        self.input_modes = diff.input_modes;
         self.viewport = diff.viewport;
         Ok(())
     }
@@ -211,9 +227,11 @@ pub struct ScreenDiff {
     pub cursor_y: u16,
     /// New cursor appearance; defaults for frames without cursor metadata.
     pub cursor_style: CursorStyle,
+    /// New application-controlled input modes.
+    pub input_modes: InputModes,
     /// Total row count (handles resize).
     pub total_rows: u16,
-    /// Viewport identity, absent in frames from older peers.
+    /// Optional viewport identity for native scrolling and scrollback ordering.
     pub viewport: Option<Viewport>,
 }
 
@@ -222,8 +240,8 @@ impl ScreenDiff {
     ///
     /// Format: `[cursor_x: u16][cursor_y: u16][total_rows: u16][num_changed: u16]`
     /// followed by each changed row: `[row_index: u16][text_len: u16][text bytes]`
-    /// and optionally `[alternate_screen: u8][first_row: u64]`, followed
-    /// by `[0xc0: u8][cursor_style: u8]` for non-default cursor appearance.
+    /// followed by zero or more metadata fields encoded as
+    /// `[tag: u16][length: u32][payload]`.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::new();
@@ -237,11 +255,24 @@ impl ScreenDiff {
             buf.extend_from_slice(text.as_bytes());
         }
         if let Some(viewport) = self.viewport {
-            buf.push(u8::from(viewport.alternate_screen));
-            buf.extend_from_slice(&viewport.first_row.to_be_bytes());
+            let mut payload = [0; 9];
+            payload[0] = u8::from(viewport.alternate_screen);
+            payload[1..].copy_from_slice(&viewport.first_row.to_be_bytes());
+            encode_extension(VIEWPORT_EXTENSION, &payload, &mut buf);
         }
         if self.cursor_style != CursorStyle::default() {
-            buf.extend_from_slice(&[CURSOR_STYLE_EXTENSION, self.cursor_style.encode()]);
+            encode_extension(
+                CURSOR_STYLE_EXTENSION,
+                &[self.cursor_style.encode()],
+                &mut buf,
+            );
+        }
+        if self.input_modes != InputModes::default() {
+            encode_extension(
+                INPUT_MODES_EXTENSION,
+                &[u8::from(self.input_modes.application_cursor_keys)],
+                &mut buf,
+            );
         }
         buf
     }
@@ -280,49 +311,89 @@ impl ScreenDiff {
             offset += text_len;
             changed_rows.push((idx, text));
         }
-        let viewport = if data.len() == offset || data[offset] == CURSOR_STYLE_EXTENSION {
-            None
-        } else {
-            let bytes = data
-                .get(offset..offset + 9)
-                .ok_or_else(|| SspError::MalformedFrame("truncated viewport".to_string()))?;
-            let alternate_screen = match bytes[0] {
-                0 => false,
-                1 => true,
-                _ => {
-                    return Err(SspError::MalformedFrame(
-                        "invalid screen buffer".to_string(),
-                    ));
+        let mut viewport = None;
+        let mut cursor_style = CursorStyle::default();
+        let mut input_modes = InputModes::default();
+        let mut seen_viewport = false;
+        let mut seen_cursor_style = false;
+        let mut seen_input_modes = false;
+        while offset < data.len() {
+            let header = data
+                .get(offset..offset + EXTENSION_HEADER_BYTES)
+                .ok_or_else(|| SspError::MalformedFrame("truncated extension header".to_owned()))?;
+            let tag = u16::from_be_bytes([header[0], header[1]]);
+            let length = u32::from_be_bytes([header[2], header[3], header[4], header[5]]) as usize;
+            offset += EXTENSION_HEADER_BYTES;
+            let payload = data[offset..].get(..length).ok_or_else(|| {
+                SspError::MalformedFrame("truncated extension payload".to_owned())
+            })?;
+            offset += length;
+            match tag {
+                VIEWPORT_EXTENSION => {
+                    if seen_viewport || payload.len() != 9 {
+                        return Err(SspError::MalformedFrame(
+                            "invalid viewport extension".to_owned(),
+                        ));
+                    }
+                    seen_viewport = true;
+                    let alternate_screen = match payload[0] {
+                        0 => false,
+                        1 => true,
+                        _ => {
+                            return Err(SspError::MalformedFrame(
+                                "invalid screen buffer".to_owned(),
+                            ));
+                        }
+                    };
+                    viewport = Some(Viewport {
+                        first_row: u64::from_be_bytes([
+                            payload[1], payload[2], payload[3], payload[4], payload[5], payload[6],
+                            payload[7], payload[8],
+                        ]),
+                        alternate_screen,
+                    });
                 }
-            };
-            offset += 9;
-            Some(Viewport {
-                first_row: u64::from_be_bytes([
-                    bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], bytes[8],
-                ]),
-                alternate_screen,
-            })
-        };
-        let cursor_style = if offset == data.len() {
-            CursorStyle::default()
-        } else {
-            let extension = &data[offset..];
-            if extension.len() != 2 || extension[0] != CURSOR_STYLE_EXTENSION {
-                return Err(SspError::MalformedFrame(
-                    "invalid cursor extension".to_owned(),
-                ));
+                CURSOR_STYLE_EXTENSION => {
+                    if seen_cursor_style || payload.len() != 1 {
+                        return Err(SspError::MalformedFrame(
+                            "invalid cursor extension".to_owned(),
+                        ));
+                    }
+                    seen_cursor_style = true;
+                    cursor_style = CursorStyle::decode(payload[0])?;
+                }
+                INPUT_MODES_EXTENSION => {
+                    if seen_input_modes || payload.len() != 1 || payload[0] > 1 {
+                        return Err(SspError::MalformedFrame(
+                            "invalid input modes extension".to_owned(),
+                        ));
+                    }
+                    seen_input_modes = true;
+                    input_modes.application_cursor_keys = payload[0] == 1;
+                }
+                _ => {
+                    return Err(SspError::MalformedFrame(format!(
+                        "unknown extension tag {tag}"
+                    )));
+                }
             }
-            CursorStyle::decode(extension[1])?
-        };
+        }
         Ok(Self {
             changed_rows,
             cursor_x,
             cursor_y,
             cursor_style,
+            input_modes,
             total_rows,
             viewport,
         })
     }
+}
+
+fn encode_extension(tag: u16, payload: &[u8], output: &mut Vec<u8>) {
+    output.extend_from_slice(&tag.to_be_bytes());
+    output.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    output.extend_from_slice(payload);
 }
 
 // Wire format constants
@@ -610,8 +681,9 @@ fn state_is_representable(state: &ScreenState) -> bool {
     }
     let mut encoded_size = 25
         + 8
-        + usize::from(state.viewport.is_some()) * 9
-        + usize::from(state.cursor_style != CursorStyle::default()) * 2
+        + usize::from(state.viewport.is_some()) * 15
+        + usize::from(state.cursor_style != CursorStyle::default()) * 7
+        + usize::from(state.input_modes != InputModes::default()) * 7
         + 4 * state.rows.len();
     for row in state.rows.iter().filter(|row| !row.is_empty()) {
         if row.len() > usize::from(u16::MAX) {
@@ -863,6 +935,7 @@ mod tests {
             ack_num: ack,
             diff: Some(ScreenDiff {
                 cursor_style: Default::default(),
+                input_modes: Default::default(),
                 viewport: None,
                 changed_rows: rows.iter().map(|(i, s)| (*i, (*s).into())).collect(),
                 cursor_x: cx,
@@ -878,6 +951,7 @@ mod tests {
     fn diff_identical_states() {
         let state = ScreenState {
             cursor_style: Default::default(),
+            input_modes: Default::default(),
             viewport: None,
             rows: vec!["hello".into(), "world".into()],
             cursor_x: 3,
@@ -894,6 +968,7 @@ mod tests {
     fn diff_one_row_changed() {
         let old = ScreenState {
             cursor_style: Default::default(),
+            input_modes: Default::default(),
             viewport: None,
             rows: vec!["hello".into(), "world".into()],
             cursor_x: 0,
@@ -901,6 +976,7 @@ mod tests {
         };
         let new = ScreenState {
             cursor_style: Default::default(),
+            input_modes: Default::default(),
             viewport: None,
             rows: vec!["hello".into(), "earth".into()],
             cursor_x: 0,
@@ -914,6 +990,7 @@ mod tests {
     fn diff_cursor_only() {
         let old = ScreenState {
             cursor_style: Default::default(),
+            input_modes: Default::default(),
             viewport: None,
             rows: vec!["abc".into()],
             cursor_x: 0,
@@ -921,6 +998,7 @@ mod tests {
         };
         let new = ScreenState {
             cursor_style: Default::default(),
+            input_modes: Default::default(),
             viewport: None,
             rows: vec!["abc".into()],
             cursor_x: 3,
@@ -935,6 +1013,7 @@ mod tests {
     fn diff_from_none_includes_all_nonempty() {
         let state = ScreenState {
             cursor_style: Default::default(),
+            input_modes: Default::default(),
             viewport: None,
             rows: vec!["hello".into(), String::new(), "world".into()],
             cursor_x: 5,
@@ -952,6 +1031,7 @@ mod tests {
     fn apply_diff_roundtrip() {
         let old = ScreenState {
             cursor_style: Default::default(),
+            input_modes: Default::default(),
             viewport: None,
             rows: vec!["aaa".into(), "bbb".into(), "ccc".into()],
             cursor_x: 0,
@@ -959,6 +1039,7 @@ mod tests {
         };
         let new = ScreenState {
             cursor_style: Default::default(),
+            input_modes: Default::default(),
             viewport: None,
             rows: vec!["aaa".into(), "XXX".into(), "ccc".into()],
             cursor_x: 2,
@@ -974,6 +1055,7 @@ mod tests {
     fn apply_diff_resize() {
         let mut state = ScreenState {
             cursor_style: Default::default(),
+            input_modes: Default::default(),
             viewport: None,
             rows: vec!["a".into(), "b".into()],
             cursor_x: 0,
@@ -981,6 +1063,7 @@ mod tests {
         };
         let diff = ScreenDiff {
             cursor_style: Default::default(),
+            input_modes: Default::default(),
             viewport: None,
             changed_rows: vec![(2, "c".into())],
             cursor_x: 0,
@@ -999,6 +1082,7 @@ mod tests {
     fn screen_diff_encode_decode() {
         let diff = ScreenDiff {
             cursor_style: Default::default(),
+            input_modes: Default::default(),
             viewport: None,
             changed_rows: vec![(0, "hello".into()), (3, "world".into())],
             cursor_x: 5,
@@ -1011,11 +1095,14 @@ mod tests {
     }
 
     #[test]
-    fn viewport_extension_roundtrip_and_legacy_decode() {
+    fn viewport_extension_roundtrip_and_default_reset() {
         let mut state = ScreenState::empty(3);
         state.rows[0] = "hello".into();
-        let legacy = state.diff_from_empty().encode();
-        assert_eq!(ScreenDiff::decode(&legacy).unwrap().viewport, None);
+        let without_metadata = state.diff_from_empty().encode();
+        assert_eq!(
+            ScreenDiff::decode(&without_metadata).unwrap().viewport,
+            None
+        );
 
         for alternate_screen in [false, true] {
             state.viewport = Some(Viewport {
@@ -1024,7 +1111,8 @@ mod tests {
             });
             let diff = state.diff_from_empty();
             let encoded = diff.encode();
-            assert_eq!(&encoded[..legacy.len()], legacy);
+            assert_eq!(&encoded[..without_metadata.len()], without_metadata);
+            assert_eq!(&encoded[without_metadata.len()..][..6], &[0, 1, 0, 0, 0, 9]);
             let decoded = ScreenDiff::decode(&encoded).unwrap();
             let mut received = ScreenState::empty(3);
             received.apply_diff(&decoded).unwrap();
@@ -1034,13 +1122,13 @@ mod tests {
 
     #[test]
     fn viewport_extension_rejects_malformed_data() {
-        let legacy = ScreenState::empty(3).diff_from_empty().encode();
-        let mut truncated = legacy.clone();
+        let base = ScreenState::empty(3).diff_from_empty().encode();
+        let mut truncated = base.clone();
         truncated.push(0);
         assert!(ScreenDiff::decode(&truncated).is_err());
 
-        let mut invalid = legacy;
-        invalid.extend_from_slice(&[2; 9]);
+        let mut invalid = base;
+        encode_extension(VIEWPORT_EXTENSION, &[2; 9], &mut invalid);
         assert!(ScreenDiff::decode(&invalid).is_err());
     }
 
@@ -1061,7 +1149,7 @@ mod tests {
         ] {
             state.viewport = viewport;
             let encoded = state.diff_from_empty().encode();
-            assert!(encoded.ends_with(&[CURSOR_STYLE_EXTENSION, 0x86]));
+            assert!(encoded.ends_with(&[0, 2, 0, 0, 0, 1, 0x86]));
             received
                 .apply_diff(&ScreenDiff::decode(&encoded).unwrap())
                 .unwrap();
@@ -1086,16 +1174,70 @@ mod tests {
         ] {
             let mut state = ScreenState::empty(3);
             state.viewport = viewport;
-            let legacy = state.diff_from_empty().encode();
-            for suffix in [&[0xc0][..], &[0xc0, 7], &[0xc0, 0x88], &[0xc0, 1, 0]] {
-                let mut invalid = legacy.clone();
-                invalid.extend_from_slice(suffix);
+            let base = state.diff_from_empty().encode();
+            for payload in [&[][..], &[7], &[0x88], &[1, 0]] {
+                let mut invalid = base.clone();
+                encode_extension(CURSOR_STYLE_EXTENSION, payload, &mut invalid);
                 assert!(
                     ScreenDiff::decode(&invalid).is_err(),
-                    "{viewport:?}: {suffix:?}"
+                    "{viewport:?}: {payload:?}"
                 );
             }
         }
+    }
+
+    #[test]
+    fn input_modes_extension_roundtrip_and_default_reset() {
+        let mut state = ScreenState::empty(3);
+        let mut received = state.clone();
+        for enabled in [true, false] {
+            state.input_modes.application_cursor_keys = enabled;
+            let diff = state.diff_from(&received);
+            assert!(diff.changed_rows.is_empty());
+            let encoded = diff.encode();
+            if enabled {
+                assert!(encoded.ends_with(&[0, 3, 0, 0, 0, 1, 1]));
+            }
+            received
+                .apply_diff(&ScreenDiff::decode(&encoded).unwrap())
+                .unwrap();
+            assert_eq!(received, state);
+        }
+    }
+
+    #[test]
+    fn metadata_rejects_duplicates_unknown_tags_and_invalid_lengths() {
+        let base = ScreenState::empty(3).diff_from_empty().encode();
+        for (tag, payload) in [
+            (VIEWPORT_EXTENSION, &[0; 9][..]),
+            (CURSOR_STYLE_EXTENSION, &[0][..]),
+            (INPUT_MODES_EXTENSION, &[0][..]),
+        ] {
+            let mut encoded = base.clone();
+            encode_extension(tag, payload, &mut encoded);
+            assert!(ScreenDiff::decode(&encoded).is_ok());
+            for end in base.len() + 1..encoded.len() {
+                assert!(ScreenDiff::decode(&encoded[..end]).is_err());
+            }
+            encode_extension(tag, payload, &mut encoded);
+            assert!(ScreenDiff::decode(&encoded).is_err());
+
+            let mut invalid = base.clone();
+            encode_extension(tag, &[], &mut invalid);
+            assert!(ScreenDiff::decode(&invalid).is_err());
+        }
+        for (tag, payload) in [
+            (u16::MAX, &[0][..]),
+            (INPUT_MODES_EXTENSION, &[2][..]),
+            (INPUT_MODES_EXTENSION, &[0, 0][..]),
+        ] {
+            let mut invalid = base.clone();
+            encode_extension(tag, payload, &mut invalid);
+            assert!(ScreenDiff::decode(&invalid).is_err());
+        }
+        let mut invalid = base;
+        invalid.extend_from_slice(&[0, 3, 0xff, 0xff, 0xff, 0xff]);
+        assert!(ScreenDiff::decode(&invalid).is_err());
     }
 
     // -- SspFrame encode/decode -----------------------------------------------
@@ -1129,6 +1271,7 @@ mod tests {
             cursor_x: 5,
             cursor_y: 0,
             cursor_style: Default::default(),
+            input_modes: Default::default(),
             viewport: None,
         });
 
@@ -1150,6 +1293,7 @@ mod tests {
         rows1[2] = "line three".into();
         sender.push_state(ScreenState {
             cursor_style: Default::default(),
+            input_modes: Default::default(),
             viewport: None,
             rows: rows1,
             cursor_x: 0,
@@ -1164,6 +1308,7 @@ mod tests {
         rows2[2] = "line three".into();
         sender.push_state(ScreenState {
             cursor_style: Default::default(),
+            input_modes: Default::default(),
             viewport: None,
             rows: rows2,
             cursor_x: 0,
@@ -1196,6 +1341,7 @@ mod tests {
         rows[0] = "hello".into();
         sender.push_state(ScreenState {
             cursor_style: Default::default(),
+            input_modes: Default::default(),
             viewport: None,
             rows: rows.clone(),
             cursor_x: 0,
@@ -1207,6 +1353,7 @@ mod tests {
         for _ in 0..32 {
             sender.push_state(ScreenState {
                 cursor_style: Default::default(),
+                input_modes: Default::default(),
                 viewport: None,
                 rows: rows.clone(),
                 cursor_x: 0,
@@ -1219,6 +1366,7 @@ mod tests {
         rows2[0] = "hello world".into();
         sender.push_state(ScreenState {
             cursor_style: Default::default(),
+            input_modes: Default::default(),
             viewport: None,
             rows: rows2,
             cursor_x: 0,
@@ -1375,6 +1523,7 @@ mod tests {
     fn render_diff_changed_row() {
         let old = ScreenState {
             cursor_style: Default::default(),
+            input_modes: Default::default(),
             viewport: None,
             rows: vec!["abc".into(), "def".into()],
             cursor_x: 0,
@@ -1382,6 +1531,7 @@ mod tests {
         };
         let new = ScreenState {
             cursor_style: Default::default(),
+            input_modes: Default::default(),
             viewport: None,
             rows: vec!["abc".into(), "xyz".into()],
             cursor_x: 0,
@@ -1401,6 +1551,7 @@ mod tests {
     fn render_diff_cursor_position() {
         let old = ScreenState {
             cursor_style: Default::default(),
+            input_modes: Default::default(),
             viewport: None,
             rows: vec!["same".into()],
             cursor_x: 0,
@@ -1408,6 +1559,7 @@ mod tests {
         };
         let new = ScreenState {
             cursor_style: Default::default(),
+            input_modes: Default::default(),
             viewport: None,
             rows: vec!["same".into()],
             cursor_x: 4,
@@ -1425,6 +1577,7 @@ mod tests {
     fn render_full_redraw_no_scrollback() {
         let state = ScreenState {
             cursor_style: Default::default(),
+            input_modes: Default::default(),
             viewport: None,
             rows: vec!["hello".into(), "world".into()],
             cursor_x: 5,
@@ -1477,6 +1630,7 @@ mod tests {
         ];
         let state = ScreenState {
             cursor_style: Default::default(),
+            input_modes: Default::default(),
             viewport: None,
             rows: vec!["visible A".into(), "visible B".into()],
             cursor_x: 3,
@@ -1540,6 +1694,7 @@ mod tests {
         let mut state = ScreenState::empty(2);
         let diff = ScreenDiff {
             cursor_style: Default::default(),
+            input_modes: Default::default(),
             viewport: None,
             changed_rows: vec![(5, "oob".into())],
             cursor_x: 0,
@@ -1624,6 +1779,7 @@ mod tests {
             .collect();
         sender.push_state(ScreenState {
             cursor_style: Default::default(),
+            input_modes: Default::default(),
             viewport: None,
             rows: rows1,
             cursor_x: 0,
@@ -1638,6 +1794,7 @@ mod tests {
         rows2[0] = "only this row".into();
         sender.push_state(ScreenState {
             cursor_style: Default::default(),
+            input_modes: Default::default(),
             viewport: None,
             rows: rows2,
             cursor_x: 0,
@@ -1715,6 +1872,7 @@ mod tests {
             ack_num: 0,
             diff: Some(ScreenDiff {
                 cursor_style: Default::default(),
+                input_modes: Default::default(),
                 viewport: None,
                 changed_rows: vec![(5, "oob".into())],
                 cursor_x: 0,
@@ -1743,6 +1901,7 @@ mod tests {
     fn detect_scroll_up_no_scroll() {
         let state = ScreenState {
             cursor_style: Default::default(),
+            input_modes: Default::default(),
             viewport: Some(Viewport {
                 first_row: 0,
                 alternate_screen: false,
@@ -1758,6 +1917,7 @@ mod tests {
     fn detect_scroll_up_one_line() {
         let old = ScreenState {
             cursor_style: Default::default(),
+            input_modes: Default::default(),
             viewport: Some(Viewport {
                 first_row: 0,
                 alternate_screen: false,
@@ -1768,6 +1928,7 @@ mod tests {
         };
         let new = ScreenState {
             cursor_style: Default::default(),
+            input_modes: Default::default(),
             viewport: Some(Viewport {
                 first_row: 1,
                 alternate_screen: false,
@@ -1783,6 +1944,7 @@ mod tests {
     fn detect_scroll_up_mismatched_content() {
         let old = ScreenState {
             cursor_style: Default::default(),
+            input_modes: Default::default(),
             viewport: Some(Viewport {
                 first_row: 0,
                 alternate_screen: false,
@@ -1793,6 +1955,7 @@ mod tests {
         };
         let new = ScreenState {
             cursor_style: Default::default(),
+            input_modes: Default::default(),
             viewport: Some(Viewport {
                 first_row: 1,
                 alternate_screen: false,
@@ -1811,6 +1974,7 @@ mod tests {
         for i in 0..35 {
             let state = ScreenState {
                 cursor_style: Default::default(),
+                input_modes: Default::default(),
                 viewport: None,
                 rows: vec![format!("line {i}")],
                 cursor_x: 0,
@@ -1830,6 +1994,7 @@ mod tests {
         let mut sender = SspSender::new();
         sender.push_state(ScreenState {
             cursor_style: Default::default(),
+            input_modes: Default::default(),
             viewport: None,
             rows: vec!["x".repeat(60_000); 300],
             cursor_x: 0,
@@ -1857,6 +2022,7 @@ mod tests {
             let mut sender = SspSender::new();
             sender.push_state(ScreenState {
                 cursor_style: Default::default(),
+                input_modes: Default::default(),
                 viewport: Some(Viewport {
                     first_row: 100,
                     alternate_screen: true,

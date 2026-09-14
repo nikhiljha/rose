@@ -1,9 +1,10 @@
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::input::{InputBuffer, InputError};
+use crate::ssp::InputModes;
 
 const MAX_KEY_LOOKAHEAD: usize = 128;
 const MAX_KEY_BYTES: usize = 32;
@@ -33,6 +34,7 @@ struct KeyboardState {
     escape: EscapeState,
     action: Option<InputAction>,
     pending: Vec<u8>,
+    input_modes: InputModes,
 }
 
 impl KeyboardInput {
@@ -44,8 +46,16 @@ impl KeyboardInput {
                 escape: EscapeState::Normal,
                 action: None,
                 pending: Vec::new(),
+                input_modes: InputModes::default(),
             })),
         }
+    }
+
+    pub(super) fn set_input_modes(&self, input_modes: InputModes) {
+        self.state
+            .lock()
+            .expect("keyboard lock poisoned")
+            .input_modes = input_modes;
     }
 
     pub(super) async fn next(&self) -> Result<Option<InputAction>, InputError> {
@@ -98,7 +108,7 @@ impl KeyboardInput {
 }
 
 fn process_key(key: &KeyEvent, state: &mut KeyboardState) -> Option<InputAction> {
-    let bytes = key_event_to_bytes(key);
+    let bytes = key_event_to_bytes_with_modes(key, state.input_modes);
     if bytes.is_empty() {
         return None;
     }
@@ -192,6 +202,14 @@ fn csi_key(final_byte: u8, mods: KeyModifiers) -> Vec<u8> {
     }
 }
 
+fn cursor_key(final_byte: u8, mods: KeyModifiers, application_mode: bool) -> Vec<u8> {
+    if application_mode && mods.is_empty() {
+        vec![0x1b, b'O', final_byte]
+    } else {
+        csi_key(final_byte, mods)
+    }
+}
+
 /// Builds a CSI tilde-style sequence with an optional modifier parameter.
 ///
 /// Without modifiers: `ESC [ code ~`
@@ -210,7 +228,11 @@ fn csi_tilde(code: &str, mods: KeyModifiers) -> Vec<u8> {
 /// Encodes modifier keys (Shift, Alt, Ctrl) on special keys using the standard
 /// xterm modifier parameter encoding. This is compatible with the kitty
 /// keyboard protocol and allows applications to distinguish modified keys.
-pub(super) fn key_event_to_bytes(key: &crossterm::event::KeyEvent) -> Vec<u8> {
+fn key_event_to_bytes_with_modes(key: &KeyEvent, input_modes: InputModes) -> Vec<u8> {
+    if key.kind == KeyEventKind::Release {
+        return Vec::new();
+    }
+
     // Ctrl+letter maps to ASCII control codes (0x01-0x1a).
     // With the kitty keyboard protocol enabled, crossterm may report uppercase
     // characters for Ctrl+Shift+letter, so we normalize to lowercase first.
@@ -265,12 +287,12 @@ pub(super) fn key_event_to_bytes(key: &crossterm::event::KeyEvent) -> Vec<u8> {
         KeyCode::Tab => vec![b'\t'],
         KeyCode::BackTab => b"\x1b[Z".to_vec(),
         KeyCode::Esc => vec![0x1b],
-        KeyCode::Up => csi_key(b'A', key.modifiers),
-        KeyCode::Down => csi_key(b'B', key.modifiers),
-        KeyCode::Right => csi_key(b'C', key.modifiers),
-        KeyCode::Left => csi_key(b'D', key.modifiers),
-        KeyCode::Home => csi_key(b'H', key.modifiers),
-        KeyCode::End => csi_key(b'F', key.modifiers),
+        KeyCode::Up => cursor_key(b'A', key.modifiers, input_modes.application_cursor_keys),
+        KeyCode::Down => cursor_key(b'B', key.modifiers, input_modes.application_cursor_keys),
+        KeyCode::Right => cursor_key(b'C', key.modifiers, input_modes.application_cursor_keys),
+        KeyCode::Left => cursor_key(b'D', key.modifiers, input_modes.application_cursor_keys),
+        KeyCode::Home => cursor_key(b'H', key.modifiers, input_modes.application_cursor_keys),
+        KeyCode::End => cursor_key(b'F', key.modifiers, input_modes.application_cursor_keys),
         KeyCode::PageUp => csi_tilde("5", key.modifiers),
         KeyCode::PageDown => csi_tilde("6", key.modifiers),
         KeyCode::Delete => csi_tilde("3", key.modifiers),
@@ -316,6 +338,10 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+
+    fn key_event_to_bytes(key: &KeyEvent) -> Vec<u8> {
+        key_event_to_bytes_with_modes(key, InputModes::default())
+    }
 
     #[tokio::test]
     async fn detach_survives_cancellation_and_waits_for_prior_keys() {
@@ -704,6 +730,81 @@ mod tests {
     fn key_event_unknown_returns_empty() {
         let key = crossterm::event::KeyEvent::new(KeyCode::Null, KeyModifiers::NONE);
         assert!(key_event_to_bytes(&key).is_empty());
+    }
+
+    #[test]
+    fn key_release_events_are_ignored() {
+        let key = crossterm::event::KeyEvent::new_with_kind(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+            crossterm::event::KeyEventKind::Release,
+        );
+        assert!(key_event_to_bytes(&key).is_empty());
+    }
+
+    #[test]
+    fn application_cursor_keys_preserve_modifiers_and_repeats() {
+        let modes = InputModes {
+            application_cursor_keys: true,
+        };
+        for (code, suffix) in [
+            (KeyCode::Up, b'A'),
+            (KeyCode::Down, b'B'),
+            (KeyCode::Right, b'C'),
+            (KeyCode::Left, b'D'),
+            (KeyCode::Home, b'H'),
+            (KeyCode::End, b'F'),
+        ] {
+            for kind in [KeyEventKind::Press, KeyEventKind::Repeat] {
+                let key = KeyEvent::new_with_kind(code, KeyModifiers::NONE, kind);
+                assert_eq!(
+                    key_event_to_bytes_with_modes(&key, modes),
+                    [0x1b, b'O', suffix]
+                );
+                assert_eq!(key_event_to_bytes(&key), [0x1b, b'[', suffix]);
+            }
+            let key = KeyEvent::new(code, KeyModifiers::SHIFT | KeyModifiers::CONTROL);
+            assert_eq!(
+                key_event_to_bytes_with_modes(&key, modes),
+                [0x1b, b'[', b'1', b';', b'6', suffix]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn release_events_do_not_consume_local_escape_commands() {
+        let (send, receive) = tokio::sync::mpsc::channel(1);
+        let keyboard = KeyboardInput::new(receive);
+        for code in [KeyCode::Enter, KeyCode::Char('~')] {
+            for kind in [KeyEventKind::Press, KeyEventKind::Release] {
+                send.send(Event::Key(KeyEvent::new_with_kind(
+                    code,
+                    KeyModifiers::NONE,
+                    kind,
+                )))
+                .await
+                .unwrap();
+                assert_eq!(keyboard.next().await.unwrap(), None);
+            }
+        }
+        send.send(Event::Key(KeyEvent::new_with_kind(
+            KeyCode::Char('.'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        )))
+        .await
+        .unwrap();
+        assert_eq!(keyboard.next().await.unwrap(), None);
+        send.send(Event::Key(KeyEvent::new(
+            KeyCode::Char('.'),
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+        assert_eq!(
+            keyboard.next().await.unwrap(),
+            Some(InputAction::Disconnect)
+        );
     }
 
     #[test]

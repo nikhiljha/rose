@@ -15,7 +15,7 @@ use super::util::{
 };
 use crate::config::{self, CertKeyPair, RosePaths};
 use crate::input::InputError;
-use crate::protocol::{ClientSession, ControlMessage};
+use crate::protocol::{ClientSession, ControlMessage, PROTOCOL_VERSION};
 use crate::scrollback::{
     self, MAX_SCROLLBACK_BYTES, ScrollbackLine, ScrollbackRange, ScrollbackReceiver,
 };
@@ -372,9 +372,15 @@ enum SessionHandshake {
 async fn receive_session_id(session: &mut ClientSession) -> anyhow::Result<SessionHandshake> {
     match tokio::time::timeout(Duration::from_secs(5), session.recv_control()).await {
         Ok(Ok(Some(ControlMessage::SessionInfo {
-            version: _,
+            version,
             session_id,
-        }))) => Ok(SessionHandshake::Ready(session_id)),
+        }))) => {
+            anyhow::ensure!(
+                version == PROTOCOL_VERSION,
+                "unsupported protocol version {version} (expected {PROTOCOL_VERSION})"
+            );
+            Ok(SessionHandshake::Ready(session_id))
+        }
         Ok(Ok(Some(ControlMessage::Goodbye))) => Ok(SessionHandshake::Unavailable),
         Ok(Ok(Some(other))) => anyhow::bail!("expected SessionInfo, got {other:?}"),
         Ok(Ok(None) | Err(_)) | Err(_) => Ok(SessionHandshake::Retry),
@@ -585,6 +591,7 @@ async fn client_session_loop_inner(
         let client_dgram = Arc::clone(&client_screen);
         let sb_rx_dgram = Arc::clone(&scrollback_rx);
         let sb_range_dgram = Arc::clone(&rendered_sb_range);
+        let keyboard_dgram = keyboard.clone();
         let output_task = tokio::spawn(async move {
             let mut sb_check = tokio::time::interval(Duration::from_millis(200));
             loop {
@@ -601,6 +608,7 @@ async fn client_session_loop_inner(
                                         &output_conn,
                                         &sb_rx_dgram,
                                         &sb_range_dgram,
+                                        &keyboard_dgram,
                                     );
                                 }
                             }
@@ -624,6 +632,7 @@ async fn client_session_loop_inner(
         let client_stream = Arc::clone(&client_screen);
         let sb_rx_stream = Arc::clone(&scrollback_rx);
         let sb_range_stream = Arc::clone(&rendered_sb_range);
+        let keyboard_stream = keyboard.clone();
         let stream_task = tokio::spawn(receive_uni_streams(
             stream_conn.clone(),
             Arc::clone(&scrollback_rx),
@@ -635,6 +644,7 @@ async fn client_session_loop_inner(
                     &stream_conn,
                     &sb_rx_stream,
                     &sb_range_stream,
+                    &keyboard_stream,
                 );
             },
         ));
@@ -937,12 +947,14 @@ fn process_ssp_frame(
     conn: &quinn::Connection,
     scrollback_rx: &Arc<Mutex<ScrollbackReceiver>>,
     rendered_sb_range: &Arc<Mutex<ScrollbackRange>>,
+    keyboard: &KeyboardInput,
 ) {
     let mut recv = receiver.lock().expect("receiver lock poisoned");
     let first_frame = recv.ack_num() == 0;
     match recv.process_frame(frame) {
         Ok(Some(_)) => {
             let new_state = recv.state().clone();
+            keyboard.set_input_modes(new_state.input_modes);
             let mut screen = client_screen.lock().expect("client screen lock poisoned");
 
             let needs_full_redraw = {
@@ -1024,6 +1036,31 @@ mod tests {
             receive_session_id(&mut session).await.unwrap(),
             SessionHandshake::Unavailable
         );
+        let _ = release.send(());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_info_requires_current_protocol_version() {
+        let (client, server, _fixture, _endpoint) = crate::testutil::connected_pair().await;
+        let (release, released) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut session, _) = crate::protocol::ServerSession::accept_any(server)
+                .await
+                .unwrap();
+            session
+                .send_control(&ControlMessage::SessionInfo {
+                    version: 2,
+                    session_id: [0x55; 16],
+                })
+                .await
+                .unwrap();
+            let _ = released.await;
+        });
+        let mut session = ClientSession::connect(client, 24, 80, vec![])
+            .await
+            .unwrap();
+        assert!(receive_session_id(&mut session).await.is_err());
         let _ = release.send(());
         server.await.unwrap();
     }
@@ -1418,6 +1455,8 @@ mod tests {
         let screen = Arc::new(Mutex::new(ScreenState::empty(4)));
         let history = Arc::new(Mutex::new(ScrollbackReceiver::new()));
         let rendered = Arc::new(Mutex::new(None));
+        let (_send, receive) = tokio::sync::mpsc::channel(1);
+        let keyboard = KeyboardInput::new(receive);
         let initial = SspFrame {
             old_num: 0,
             new_num: 2,
@@ -1430,7 +1469,9 @@ mod tests {
             ..initial.clone()
         };
         for frame in [&initial, &initial, &unknown_base] {
-            process_ssp_frame(frame, &receiver, &screen, &client, &history, &rendered);
+            process_ssp_frame(
+                frame, &receiver, &screen, &client, &history, &rendered, &keyboard,
+            );
             let data = tokio::time::timeout(Duration::from_secs(1), server.read_datagram())
                 .await
                 .expect("every valid screen frame must elicit an ACK")
@@ -1438,6 +1479,68 @@ mod tests {
             assert_eq!(data[0], DATAGRAM_SSP_ACK);
             assert_eq!(SspFrame::decode(&data[1..]).unwrap().ack_num, 2);
         }
+    }
+
+    #[tokio::test]
+    async fn authoritative_frames_control_keyboard_encoding_across_reconnect() {
+        let (client, _server, _fixture, _endpoint) = crate::testutil::connected_pair().await;
+        let receiver = Arc::new(Mutex::new(SspReceiver::new(4)));
+        let screen = Arc::new(Mutex::new(ScreenState::empty(4)));
+        let history = Arc::new(Mutex::new(ScrollbackReceiver::new()));
+        let rendered = Arc::new(Mutex::new(None));
+        let (send, receive) = tokio::sync::mpsc::channel(1);
+        let keyboard = KeyboardInput::new(receive);
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let input =
+            crate::input::ServerInput::new(Arc::new(Mutex::new(Box::new(file.reopen().unwrap()))));
+        let connection =
+            crate::testutil::InputConnection::new(input, keyboard.buffer.clone()).await;
+        let mut terminal = crate::terminal::RoseTerminal::new(4, 80);
+        let mut sender = crate::ssp::SspSender::new();
+        for (output, reconnect) in [
+            (&b"\x1b[?1h"[..], false),
+            (&b""[..], true),
+            (&b"\x1b[?1l"[..], false),
+        ] {
+            terminal.advance(output);
+            if reconnect {
+                *receiver.lock().unwrap() = SspReceiver::new(4);
+                sender = crate::ssp::SspSender::new();
+            }
+            sender.push_state(terminal.snapshot());
+            let frame = SspFrame::decode(&sender.generate_frame().unwrap().encode()).unwrap();
+            process_ssp_frame(
+                &frame, &receiver, &screen, &client, &history, &rendered, &keyboard,
+            );
+            sender.process_ack(receiver.lock().unwrap().ack_num());
+            let mut stale = frame.clone();
+            stale
+                .diff
+                .as_mut()
+                .unwrap()
+                .input_modes
+                .application_cursor_keys ^= true;
+            process_ssp_frame(
+                &stale, &receiver, &screen, &client, &history, &rendered, &keyboard,
+            );
+            send.send(Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Up,
+                crossterm::event::KeyModifiers::NONE,
+            )))
+            .await
+            .unwrap();
+            assert_eq!(keyboard.next().await.unwrap(), None);
+        }
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            keyboard
+                .buffer
+                .wait_for_capacity(crate::input::MAX_PENDING_INPUT),
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(file.path()).unwrap(), b"\x1bOA\x1bOA\x1b[A");
+        connection.close().await;
     }
 
     #[tokio::test]

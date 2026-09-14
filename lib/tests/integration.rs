@@ -74,6 +74,7 @@ fn ssp_shrink_preserves_remaining_rows() {
     let mut receiver = SspReceiver::new(8);
     let mut state = ScreenState {
         cursor_style: Default::default(),
+        input_modes: Default::default(),
         viewport: None,
         rows: (0..8).map(|i| format!("line {i}")).collect(),
         cursor_x: 0,
@@ -505,6 +506,7 @@ fn ssp_sender_receiver_roundtrip() {
     rows1[0] = "first".into();
     sender.push_state(ScreenState {
         cursor_style: Default::default(),
+        input_modes: Default::default(),
         viewport: None,
         rows: rows1,
         cursor_x: 5,
@@ -524,6 +526,7 @@ fn ssp_sender_receiver_roundtrip() {
     rows2[1] = "second".into();
     sender.push_state(ScreenState {
         cursor_style: Default::default(),
+        input_modes: Default::default(),
         viewport: None,
         rows: rows2,
         cursor_x: 6,
@@ -615,6 +618,7 @@ async fn ssp_over_quic() {
                 cursor_x: 8,
                 cursor_y: 1,
                 cursor_style: Default::default(),
+                input_modes: Default::default(),
                 viewport: None,
             });
 
@@ -753,6 +757,7 @@ async fn ssp_oversized_frame_via_stream() {
                 cursor_x: 0,
                 cursor_y: 0,
                 cursor_style: Default::default(),
+                input_modes: Default::default(),
                 viewport: None,
             });
 
