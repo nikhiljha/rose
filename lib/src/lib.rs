@@ -8,6 +8,8 @@ pub mod config;
 mod input;
 pub mod protocol;
 pub mod pty;
+#[cfg(unix)]
+mod pty_io;
 pub mod scrollback;
 pub mod session;
 pub mod ssp;
