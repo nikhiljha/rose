@@ -383,9 +383,14 @@ async fn handle_server_session(
             session_id,
             env_vars: _,
         } => {
-            let detached = store
-                .remove(&session_id)
-                .ok_or_else(|| anyhow::anyhow!("session not found for reconnect"))?;
+            let Some(detached) = store.remove(&session_id) else {
+                if store.is_ended(&session_id) {
+                    session.send_control(&ControlMessage::Goodbye).await?;
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    return Ok(());
+                }
+                anyhow::bail!("session not found for reconnect");
+            };
             if detached.owner_cert_der.as_deref() != peer_cert.as_deref() {
                 let _ = store.insert(session_id, detached);
                 anyhow::bail!("client certificate does not match session owner");
@@ -593,6 +598,7 @@ async fn handle_server_session(
     }
 
     if shell_exited {
+        store.mark_ended(session_id);
         close_conn.close(0u32.into(), b"shell exited");
         // Give the I/O driver a moment to flush the CONNECTION_CLOSE
         // frame so the client receives it before we return.
@@ -844,6 +850,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconnecting_missing_session_receives_goodbye() {
+        let fixture = MtlsFixture::new();
+        let client = QuicClient::new().unwrap();
+        let (server_conn, client_conn) =
+            tokio::join!(fixture.server.accept(), fixture.connect(&client));
+        let store = SessionStore::new();
+        store.mark_ended([0x44; 16]);
+        let task = tokio::spawn(handle_server_session(
+            server_conn.unwrap().unwrap(),
+            store,
+            false,
+        ));
+        let mut session = ClientSession::reconnect(client_conn, 5, 80, [0x44; 16], vec![])
+            .await
+            .unwrap();
+        assert_eq!(
+            session.recv_control().await.unwrap(),
+            Some(ControlMessage::Goodbye)
+        );
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn reliable_input_replay_is_deduplicated_after_reattachment() {
         let native = NativeSession::new().await;
         let (mut send, mut recv) = native.session.connection().open_bi().await.unwrap();
@@ -1055,6 +1084,7 @@ mod tests {
         let (_tx, rx) = tokio::sync::broadcast::channel(1);
         let mut protocol = SspSender::new();
         protocol.push_state(crate::ssp::ScreenState {
+            cursor_style: Default::default(),
             viewport: None,
             rows: vec!["x".repeat(60_000); 300],
             cursor_x: 0,

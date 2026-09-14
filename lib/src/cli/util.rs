@@ -350,6 +350,9 @@ impl RawModeGuard {
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
+        let mut stdout = std::io::stdout();
+        let _ = stdout.write_all(b"\x1b[?25h\x1b[0 q");
+        let _ = stdout.flush();
         if self.kitty_enabled {
             let _ = crossterm::execute!(
                 std::io::stdout(),

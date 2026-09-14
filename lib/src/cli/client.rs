@@ -85,27 +85,26 @@ async fn receive_uni_streams(
     history: Arc<Mutex<ScrollbackReceiver>>,
     on_frame: impl Fn(&SspFrame) + Send + Sync + 'static,
 ) {
-    let on_frame = Arc::new(on_frame);
     let mut workers = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
             incoming = connection.accept_uni(), if workers.len() < 8 => {
                 let Ok(mut stream) = incoming else { return; };
-                let on_frame = Arc::clone(&on_frame);
                 let history = Arc::clone(&history);
                 workers.spawn(async move {
                     let mut prefix = [0];
                     stream.read_exact(&mut prefix).await?;
                     match prefix[0] {
-                        scrollback::stream_type::SSP_FRAME => on_frame(&receive_ssp_frame(&mut stream).await?),
+                        scrollback::stream_type::SSP_FRAME => return Ok(Some(receive_ssp_frame(&mut stream).await?)),
                         scrollback::stream_type::SCROLLBACK => receive_history(stream, history).await?,
                         _ => anyhow::bail!("unknown uni stream type {}", prefix[0]),
                     }
-                    Ok::<_, anyhow::Error>(())
+                    Ok::<_, anyhow::Error>(None)
                 });
             }
             result = workers.join_next(), if !workers.is_empty() => {
                 match result {
+                    Some(Ok(Ok(Some(frame)))) => on_frame(&frame),
                     Some(Ok(Err(error))) => tracing::debug!(%error, "invalid incoming stream"),
                     Some(Err(error)) => tracing::warn!(%error, "stream reader task failed"),
                     _ => {}
@@ -363,6 +362,25 @@ async fn stun_reconnect(stun_servers: Option<Vec<String>>) -> anyhow::Result<Qui
     QuicClient::from_socket(socket).map_err(Into::into)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum SessionHandshake {
+    Ready([u8; 16]),
+    Unavailable,
+    Retry,
+}
+
+async fn receive_session_id(session: &mut ClientSession) -> anyhow::Result<SessionHandshake> {
+    match tokio::time::timeout(Duration::from_secs(5), session.recv_control()).await {
+        Ok(Ok(Some(ControlMessage::SessionInfo {
+            version: _,
+            session_id,
+        }))) => Ok(SessionHandshake::Ready(session_id)),
+        Ok(Ok(Some(ControlMessage::Goodbye))) => Ok(SessionHandshake::Unavailable),
+        Ok(Ok(Some(other))) => anyhow::bail!("expected SessionInfo, got {other:?}"),
+        Ok(Ok(None) | Err(_)) | Err(_) => Ok(SessionHandshake::Retry),
+    }
+}
+
 /// Core reconnection loop. If `first_conn` is provided, skips the connect
 /// phase for the first iteration. If `stun_ctx` is provided, uses STUN
 /// hole-punching for reconnection instead of direct connect.
@@ -523,17 +541,13 @@ async fn client_session_loop_inner(
             ClientSession::connect(conn, rows, cols, env).await?
         };
 
-        match tokio::time::timeout(Duration::from_secs(5), session.recv_control()).await {
-            Ok(Ok(Some(ControlMessage::SessionInfo {
-                version: _,
-                session_id: sid,
-            }))) => {
-                session_id = Some(sid);
+        match receive_session_id(&mut session).await? {
+            SessionHandshake::Ready(sid) => session_id = Some(sid),
+            SessionHandshake::Unavailable => {
+                eprintln!("[RoSE: remote session no longer exists]");
+                break Ok(());
             }
-            Ok(Ok(Some(other))) => {
-                anyhow::bail!("expected SessionInfo, got {other:?}");
-            }
-            Ok(Ok(None) | Err(_)) | Err(_) => {
+            SessionHandshake::Retry => {
                 tracing::debug!(?backoff, "handshake timed out");
                 if wait_or_disconnect(&keyboard, backoff, session_id, &reattach_command).await? {
                     break Ok(());
@@ -554,7 +568,7 @@ async fn client_session_loop_inner(
         // the last known content so the user doesn't see a blank screen.
         if prev_client_screen.is_none() {
             let mut stdout = std::io::stdout();
-            let _ = stdout.write_all(b"\x1b[3J\x1b[2J\x1b[H");
+            let _ = stdout.write_all(b"\x1b[3J\x1b[2J\x1b[H\x1b[?25h\x1b[0 q");
             let _ = stdout.flush();
         }
 
@@ -713,11 +727,13 @@ async fn client_session_loop_inner(
             },
         };
 
-        output_task.abort();
-        stream_task.abort();
-        input_task.abort();
-        input_transport_task.abort();
-        control_task.abort();
+        tokio::join!(
+            stop_task(output_task),
+            stop_task(stream_task),
+            stop_task(input_task),
+            stop_task(input_transport_task),
+            stop_task(control_task),
+        );
 
         let exit = match exit {
             SessionExit::ConnectionLost => {
@@ -785,6 +801,13 @@ async fn client_session_loop_inner(
                 );
             }
         }
+    }
+}
+
+async fn stop_task<T>(task: tokio::task::JoinHandle<T>) {
+    task.abort();
+    if !task.is_finished() {
+        let _ = task.await;
     }
 }
 
@@ -983,6 +1006,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_session_goodbye_ends_reconnect_handshake() {
+        let (client, server, _fixture, _endpoint) = crate::testutil::connected_pair().await;
+        let (release, released) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut session, _) = crate::protocol::ServerSession::accept_any(server)
+                .await
+                .unwrap();
+            session
+                .send_control(&ControlMessage::Goodbye)
+                .await
+                .unwrap();
+            let _ = released.await;
+        });
+        let mut session = ClientSession::reconnect(client, 24, 80, [0x44; 16], vec![])
+            .await
+            .unwrap();
+        assert_eq!(
+            receive_session_id(&mut session).await.unwrap(),
+            SessionHandshake::Unavailable
+        );
+        let _ = release.send(());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn cancelling_stream_receiver_stops_its_history_reader() {
         let (client, server, _fixture, _endpoint) = crate::testutil::connected_pair().await;
         let history = Arc::new(Mutex::new(ScrollbackReceiver::new()));
@@ -1021,6 +1069,59 @@ mod tests {
                 .is_some()
         );
         assert!(client.close_reason().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_stream_receiver_waits_for_active_render() {
+        let (client, server, _fixture, _endpoint) = crate::testutil::connected_pair().await;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let render_started = Arc::clone(&started);
+        let render_release = Arc::clone(&release);
+        let mut reader = tokio::spawn(receive_uni_streams(
+            client,
+            Arc::new(Mutex::new(ScrollbackReceiver::new())),
+            move |_| {
+                render_started.notify_one();
+                render_release.wait();
+            },
+        ));
+        let mut send = server.open_uni().await.unwrap();
+        send.write_all(&[scrollback::stream_type::SSP_FRAME])
+            .await
+            .unwrap();
+        send.write_all(&SspFrame::ack_only(1).encode_for_stream())
+            .await
+            .unwrap();
+        send.finish().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .expect("render callback did not start");
+        reader.abort();
+        let finished_early = tokio::time::timeout(Duration::from_millis(50), &mut reader)
+            .await
+            .is_ok();
+        release.wait();
+        assert!(
+            !finished_early,
+            "render callback outlived its receiver task"
+        );
+        let _ = reader.await;
+    }
+
+    #[tokio::test]
+    async fn stopping_tasks_handles_consumed_results_and_pending_work() {
+        let mut finished = tokio::spawn(async {});
+        (&mut finished).await.unwrap();
+        stop_task(finished).await;
+
+        let (send, receive) = tokio::sync::oneshot::channel::<()>();
+        let pending = tokio::spawn(async move {
+            let _send = send;
+            std::future::pending::<()>().await;
+        });
+        stop_task(pending).await;
+        assert!(receive.await.is_err());
     }
 
     #[tokio::test]

@@ -5,7 +5,7 @@
 //! state are preserved in a [`SessionStore`]. Reconnecting clients
 //! can resume where they left off.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -38,7 +38,14 @@ pub struct DetachedSession {
 /// Thread-safe store of detached sessions indexed by session ID.
 #[derive(Clone)]
 pub struct SessionStore {
-    sessions: Arc<Mutex<HashMap<[u8; 16], DetachedSession>>>,
+    state: Arc<Mutex<SessionState>>,
+}
+
+#[derive(Default)]
+struct SessionState {
+    sessions: HashMap<[u8; 16], DetachedSession>,
+    ended: HashSet<[u8; 16]>,
+    ended_order: VecDeque<[u8; 16]>,
 }
 
 impl SessionStore {
@@ -46,7 +53,7 @@ impl SessionStore {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            sessions: Arc::new(Mutex::new(HashMap::new())),
+            state: Arc::new(Mutex::new(SessionState::default())),
         }
     }
 
@@ -58,9 +65,10 @@ impl SessionStore {
     /// Panics if the session store mutex is poisoned.
     #[must_use]
     pub fn insert(&self, id: [u8; 16], session: DetachedSession) -> Option<DetachedSession> {
-        self.sessions
+        self.state
             .lock()
             .expect("session store lock poisoned")
+            .sessions
             .insert(id, session)
     }
 
@@ -71,10 +79,33 @@ impl SessionStore {
     /// Panics if the session store mutex is poisoned.
     #[must_use]
     pub fn remove(&self, id: &[u8; 16]) -> Option<DetachedSession> {
-        self.sessions
+        self.state
             .lock()
             .expect("session store lock poisoned")
+            .sessions
             .remove(id)
+    }
+
+    pub(crate) fn mark_ended(&self, id: [u8; 16]) {
+        const MAX_ENDED_SESSIONS: usize = 1_024;
+
+        let mut state = self.state.lock().expect("session store lock poisoned");
+        if state.ended.insert(id) {
+            state.ended_order.push_back(id);
+        }
+        if state.ended_order.len() > MAX_ENDED_SESSIONS
+            && let Some(expired) = state.ended_order.pop_front()
+        {
+            state.ended.remove(&expired);
+        }
+    }
+
+    pub(crate) fn is_ended(&self, id: &[u8; 16]) -> bool {
+        self.state
+            .lock()
+            .expect("session store lock poisoned")
+            .ended
+            .contains(id)
     }
 
     /// Returns `true` if a session with the given ID exists.
@@ -84,9 +115,10 @@ impl SessionStore {
     /// Panics if the session store mutex is poisoned.
     #[must_use]
     pub fn contains(&self, id: &[u8; 16]) -> bool {
-        self.sessions
+        self.state
             .lock()
             .expect("session store lock poisoned")
+            .sessions
             .contains_key(id)
     }
 
@@ -97,9 +129,10 @@ impl SessionStore {
     /// Panics if the session store mutex is poisoned.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.sessions
+        self.state
             .lock()
             .expect("session store lock poisoned")
+            .sessions
             .len()
     }
 
@@ -116,9 +149,9 @@ impl SessionStore {
     /// Panics if the session store mutex is poisoned.
     #[must_use]
     pub fn remove_any(&self) -> Option<([u8; 16], DetachedSession)> {
-        let mut sessions = self.sessions.lock().expect("session store lock poisoned");
-        let id = *sessions.keys().next()?;
-        sessions.remove(&id).map(|session| (id, session))
+        let mut state = self.state.lock().expect("session store lock poisoned");
+        let id = *state.sessions.keys().next()?;
+        state.sessions.remove(&id).map(|session| (id, session))
     }
 
     /// Removes detached sessions that have been idle longer than `timeout`.
@@ -129,10 +162,20 @@ impl SessionStore {
     /// Panics if the session store mutex is poisoned.
     #[must_use]
     pub fn prune_idle(&self, timeout: Duration) -> usize {
-        let mut sessions = self.sessions.lock().expect("session store lock poisoned");
-        let before = sessions.len();
-        sessions.retain(|_, detached| detached.detached_at.elapsed() < timeout);
-        before.saturating_sub(sessions.len())
+        let mut state = self.state.lock().expect("session store lock poisoned");
+        let expired: Vec<_> = state
+            .sessions
+            .iter()
+            .filter_map(|(id, detached)| (detached.detached_at.elapsed() >= timeout).then_some(*id))
+            .collect();
+        for id in &expired {
+            state.sessions.remove(id);
+        }
+        drop(state);
+        for id in &expired {
+            self.mark_ended(*id);
+        }
+        expired.len()
     }
 
     /// Removes detached sessions whose PTY child has already exited.
@@ -143,10 +186,20 @@ impl SessionStore {
     /// Panics if the session store mutex is poisoned.
     #[must_use]
     pub fn prune_exited(&self) -> usize {
-        let mut sessions = self.sessions.lock().expect("session store lock poisoned");
-        let before = sessions.len();
-        sessions.retain(|_, detached| detached.pty.try_wait().ok().flatten().is_none());
-        before.saturating_sub(sessions.len())
+        let mut state = self.state.lock().expect("session store lock poisoned");
+        let exited: Vec<_> = state
+            .sessions
+            .iter_mut()
+            .filter_map(|(id, detached)| detached.pty.try_wait().ok().flatten().map(|_| *id))
+            .collect();
+        for id in &exited {
+            state.sessions.remove(id);
+        }
+        drop(state);
+        for id in &exited {
+            self.mark_ended(*id);
+        }
+        exited.len()
     }
 }
 
@@ -160,6 +213,20 @@ impl Default for SessionStore {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ended_session_history_is_bounded() {
+        let store = SessionStore::new();
+        for value in 0_u16..=1_024 {
+            let mut id = [0; 16];
+            id[..2].copy_from_slice(&value.to_be_bytes());
+            store.mark_ended(id);
+        }
+        assert!(!store.is_ended(&[0; 16]));
+        let mut newest = [0; 16];
+        newest[..2].copy_from_slice(&1_024_u16.to_be_bytes());
+        assert!(store.is_ended(&newest));
+    }
 
     fn make_detached() -> DetachedSession {
         let pty = PtySession::open_command(24, 80, "cat", &[]).unwrap();
@@ -238,6 +305,7 @@ mod tests {
             }
         }
         assert!(store.is_empty());
+        assert!(store.is_ended(&id));
     }
 
     #[test]
@@ -252,6 +320,7 @@ mod tests {
 
         assert_eq!(store.prune_idle(Duration::from_secs(50)), 1);
         assert!(store.is_empty());
+        assert!(store.is_ended(&id));
     }
 
     #[test]
