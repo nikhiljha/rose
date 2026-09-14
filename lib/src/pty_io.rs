@@ -169,4 +169,40 @@ mod tests {
         );
         worker.join().unwrap();
     }
+
+    #[test]
+    fn read_retries_when_another_consumer_drains_readiness() {
+        let (mut reader, mut sender) = filedescriptor::socketpair().unwrap();
+        reader.set_non_blocking(true).unwrap();
+        let mut other_reader = reader.try_clone().unwrap();
+        let (cancelled, _cancel) = filedescriptor::socketpair().unwrap();
+        let ready = PtyIo {
+            descriptor: reader.try_clone().unwrap(),
+            cancelled,
+        };
+        sender.write_all(b"x").unwrap();
+        let mut attempts = 0;
+        let mut byte = [0];
+        let count = ready
+            .perform(POLLIN, || {
+                attempts += 1;
+                if attempts == 1 {
+                    let mut consumed = [0];
+                    other_reader.read_exact(&mut consumed)?;
+                    assert_eq!(&consumed, b"x");
+                    let result = reader.read(&mut byte);
+                    assert_eq!(
+                        result.as_ref().unwrap_err().kind(),
+                        io::ErrorKind::WouldBlock
+                    );
+                    sender.write_all(b"y")?;
+                    return result;
+                }
+                reader.read(&mut byte)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(&byte, b"y");
+        assert_eq!(attempts, 2);
+    }
 }
