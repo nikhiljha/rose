@@ -222,7 +222,11 @@ decoders can ignore the cursor suffix.
 
 ### Session Persistence
 
-Sessions survive network changes (WiFi to cellular, IP address changes, NAT rebinding). The client automatically reconnects with exponential backoff (100ms to 5s) when the connection is lost. On reconnect:
+Sessions survive network changes (WiFi to cellular, IP address changes, NAT
+rebinding). The client automatically reconnects when the connection is lost.
+Failed connection or session handshakes retry with exponential backoff (100ms
+to 5s). Only acceptance of `SessionInfo` resets the delay; establishing QUIC
+alone does not reset it. On reconnect:
 
 - The client sends a `Reconnect` message with the session ID from the original `SessionInfo`.
 - The server resumes the detached session (PTY, terminal state, SSP sender are all preserved).
