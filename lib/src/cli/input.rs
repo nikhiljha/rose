@@ -28,13 +28,37 @@ pub(super) struct KeyboardInput {
     pub(super) buffer: InputBuffer,
     events: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Event>>>,
     state: Arc<Mutex<KeyboardState>>,
+    modes_ready: Arc<tokio::sync::Notify>,
 }
 
 struct KeyboardState {
     escape: EscapeState,
     action: Option<InputAction>,
     pending: Vec<u8>,
-    input_modes: InputModes,
+    input_modes: Option<InputModes>,
+    deferred: Vec<KeyEvent>,
+    deferred_bytes: usize,
+}
+
+impl KeyboardState {
+    fn queue_key(&mut self, key: &KeyEvent, bytes: &[u8]) {
+        let needs_modes = key.modifiers.is_empty()
+            && matches!(
+                key.code,
+                KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::Right
+                    | KeyCode::Left
+                    | KeyCode::Home
+                    | KeyCode::End
+            );
+        if !self.deferred.is_empty() || (self.input_modes.is_none() && needs_modes) {
+            self.deferred.push(*key);
+            self.deferred_bytes += bytes.len();
+        } else {
+            self.pending.extend_from_slice(bytes);
+        }
+    }
 }
 
 impl KeyboardInput {
@@ -46,23 +70,34 @@ impl KeyboardInput {
                 escape: EscapeState::Normal,
                 action: None,
                 pending: Vec::new(),
-                input_modes: InputModes::default(),
+                input_modes: None,
+                deferred: Vec::new(),
+                deferred_bytes: 0,
             })),
+            modes_ready: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
     pub(super) fn set_input_modes(&self, input_modes: InputModes) {
-        self.state
-            .lock()
-            .expect("keyboard lock poisoned")
-            .input_modes = input_modes;
+        let mut state = self.state.lock().expect("keyboard lock poisoned");
+        let first = state.input_modes.is_none();
+        state.input_modes = Some(input_modes);
+        for key in std::mem::take(&mut state.deferred) {
+            state
+                .pending
+                .extend(key_event_to_bytes_with_modes(&key, input_modes));
+        }
+        state.deferred_bytes = 0;
+        if first {
+            self.modes_ready.notify_one();
+        }
     }
 
     pub(super) async fn next(&self) -> Result<Option<InputAction>, InputError> {
         let mut events = self.events.lock().await;
         let mut consumed = false;
         loop {
-            let (pending, action) = {
+            let (pending, deferred, action) = {
                 let mut state = self.state.lock().expect("keyboard lock poisoned");
                 if !state.pending.is_empty() {
                     match self.buffer.push(&state.pending) {
@@ -71,10 +106,14 @@ impl KeyboardInput {
                         Err(error) => return Err(error),
                     }
                 }
-                (state.pending.len(), state.action)
+                (state.pending.len(), state.deferred_bytes, state.action)
             };
             if let Some(action) = action {
                 if action == InputAction::Detach {
+                    if deferred > 0 {
+                        self.modes_ready.notified().await;
+                        continue;
+                    }
                     if pending > 0 {
                         self.buffer.wait_for_capacity(pending).await;
                         continue;
@@ -88,13 +127,17 @@ impl KeyboardInput {
             if consumed {
                 return Ok(None);
             }
-            if pending > MAX_KEY_LOOKAHEAD - MAX_KEY_BYTES {
-                self.buffer.wait_for_capacity(pending).await;
+            if pending + deferred > MAX_KEY_LOOKAHEAD - MAX_KEY_BYTES {
+                tokio::select! {
+                    () = self.buffer.wait_for_capacity(pending), if pending > 0 => {},
+                    () = self.modes_ready.notified(), if deferred > 0 => {},
+                }
                 continue;
             }
             let event = tokio::select! {
                 event = events.recv() => event,
                 () = self.buffer.wait_for_capacity(pending), if pending > 0 => continue,
+                () = self.modes_ready.notified(), if deferred > 0 => continue,
             };
             let mut state = self.state.lock().expect("keyboard lock poisoned");
             state.action = match event {
@@ -108,35 +151,35 @@ impl KeyboardInput {
 }
 
 fn process_key(key: &KeyEvent, state: &mut KeyboardState) -> Option<InputAction> {
-    let bytes = key_event_to_bytes_with_modes(key, state.input_modes);
+    let bytes = key_event_to_bytes_with_modes(key, state.input_modes.unwrap_or_default());
     if bytes.is_empty() {
         return None;
     }
-    let escape = &mut state.escape;
-    let pending = &mut state.pending;
-    match escape {
+    match state.escape {
         EscapeState::Normal => {
-            pending.extend_from_slice(&bytes);
+            state.queue_key(key, &bytes);
             if key.code == KeyCode::Enter {
-                *escape = EscapeState::AfterEnter;
+                state.escape = EscapeState::AfterEnter;
             }
         }
         EscapeState::AfterEnter => {
             if key.code == KeyCode::Char('~') {
-                *escape = EscapeState::AfterTilde;
+                state.escape = EscapeState::AfterTilde;
             } else {
-                pending.extend_from_slice(&bytes);
+                state.queue_key(key, &bytes);
                 if key.code != KeyCode::Enter {
-                    *escape = EscapeState::Normal;
+                    state.escape = EscapeState::Normal;
                 }
             }
         }
         EscapeState::AfterTilde => {
-            *escape = EscapeState::Normal;
+            state.escape = EscapeState::Normal;
             match key.code {
                 KeyCode::Char('.') => return Some(InputAction::Disconnect),
                 KeyCode::Char('d') => return Some(InputAction::Detach),
-                KeyCode::Char('~') => pending.push(b'~'),
+                KeyCode::Char('~') => {
+                    state.queue_key(&KeyEvent::new(KeyCode::Char('~'), KeyModifiers::NONE), b"~");
+                }
                 KeyCode::Char('?') => {
                     let mut stdout = std::io::stdout();
                     let _ = stdout.write_all(
@@ -149,8 +192,8 @@ fn process_key(key: &KeyEvent, state: &mut KeyboardState) -> Option<InputAction>
                     let _ = stdout.flush();
                 }
                 _ => {
-                    pending.push(b'~');
-                    pending.extend_from_slice(&bytes);
+                    state.queue_key(&KeyEvent::new(KeyCode::Char('~'), KeyModifiers::NONE), b"~");
+                    state.queue_key(key, &bytes);
                 }
             }
         }
@@ -386,6 +429,91 @@ mod tests {
             Some(InputAction::Detach)
         );
         assert_eq!(std::fs::read(file.path()).unwrap(), b"\r\r~\r~x\r");
+        connection.close().await;
+    }
+
+    #[tokio::test]
+    async fn unknown_modes_keep_local_disconnect_available() {
+        let (send, receive) = tokio::sync::mpsc::channel(4);
+        let keyboard = KeyboardInput::new(receive);
+        for code in [
+            KeyCode::Up,
+            KeyCode::Enter,
+            KeyCode::Char('~'),
+            KeyCode::Char('.'),
+        ] {
+            send.send(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+                .await
+                .unwrap();
+        }
+        for _ in 0..3 {
+            assert_eq!(keyboard.next().await.unwrap(), None);
+        }
+        assert_eq!(
+            keyboard.next().await.unwrap(),
+            Some(InputAction::Disconnect)
+        );
+        assert_eq!(keyboard.state.lock().unwrap().deferred_bytes, 4);
+    }
+
+    #[tokio::test]
+    async fn unknown_modes_bound_lookahead_and_preserve_literal_escapes() {
+        let (send, receive) = tokio::sync::mpsc::channel(256);
+        let keyboard = KeyboardInput::new(receive);
+        for code in [
+            KeyCode::Up,
+            KeyCode::Enter,
+            KeyCode::Char('~'),
+            KeyCode::Char('x'),
+        ]
+        .into_iter()
+        .chain(std::iter::repeat_n(KeyCode::Char('a'), 128))
+        .chain([KeyCode::Enter, KeyCode::Char('~'), KeyCode::Char('d')])
+        {
+            send.send(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+                .await
+                .unwrap();
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), async {
+                loop {
+                    assert_eq!(keyboard.next().await.unwrap(), None);
+                }
+            })
+            .await
+            .is_err()
+        );
+        assert!(!keyboard.events.lock().await.is_empty());
+        {
+            let state = keyboard.state.lock().unwrap();
+            assert!(state.pending.is_empty());
+            assert!(state.deferred_bytes <= MAX_KEY_LOOKAHEAD);
+        }
+        let resumed = keyboard.clone();
+        let detaching = tokio::spawn(async move {
+            loop {
+                if let Some(action) = resumed.next().await.unwrap() {
+                    break action;
+                }
+            }
+        });
+        keyboard.set_input_modes(InputModes::default());
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let input =
+            crate::input::ServerInput::new(Arc::new(Mutex::new(Box::new(file.reopen().unwrap()))));
+        let connection =
+            crate::testutil::InputConnection::new(input, keyboard.buffer.clone()).await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), detaching)
+                .await
+                .unwrap()
+                .unwrap(),
+            InputAction::Detach
+        );
+        assert_eq!(
+            std::fs::read(file.path()).unwrap(),
+            [&b"\x1b[A\r~x"[..], &[b'a'; 128], b"\r"].concat()
+        );
         connection.close().await;
     }
 
