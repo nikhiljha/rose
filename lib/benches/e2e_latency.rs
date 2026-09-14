@@ -17,7 +17,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use rose::config::generate_self_signed_cert;
 use rose::protocol::{ClientSession, ServerSession};
 use rose::pty::PtySession;
-use rose::scrollback::ScrollbackSender;
+use rose::scrollback::{ScrollbackLine, ScrollbackReceiver, ScrollbackSender};
 use rose::ssp::{
     DATAGRAM_KEYSTROKE, DATAGRAM_SSP_ACK, ScreenState, SspFrame, SspReceiver, SspSender,
     render_diff_ansi,
@@ -323,12 +323,35 @@ fn scrollback_collection(c: &mut Criterion) {
     group.finish();
 }
 
+fn scrollback_retention(c: &mut Criterion) {
+    let mut receiver = ScrollbackReceiver::new();
+    let mut stable_row = 0;
+    for _ in 0..3500 {
+        receiver.add_line(ScrollbackLine {
+            stable_row,
+            text: "x".repeat(80),
+        });
+        stable_row += 1;
+    }
+    c.bench_function("scrollback_retention/full_history", |b| {
+        b.iter(|| {
+            receiver.add_line(ScrollbackLine {
+                stable_row,
+                text: "x".repeat(80),
+            });
+            stable_row += 1;
+            std::hint::black_box(receiver.lines());
+        });
+    });
+}
+
 criterion_group!(
     benches,
     keystroke_roundtrip,
     terminal_pipeline,
     ssp_pipeline,
     cached_snapshots,
-    scrollback_collection
+    scrollback_collection,
+    scrollback_retention
 );
 criterion_main!(benches);

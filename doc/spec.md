@@ -104,6 +104,36 @@ The reliable input protocol requires handshake version 2 on both ends. The
 low-level `ClientSession::send_input` datagram API remains available without
 ordering or replay guarantees; the CLI uses the reliable stream.
 
+### Resource bounds
+
+The server terminal retains at most 3,500 history rows. The client retains at most
+3,500 rows and 8 MiB of UTF-8 history text, including ANSI sequences, evicting the
+oldest rows first. Duplicate and out-of-order rows are ignored. Redraw bookkeeping
+uses the retained stable-row range so that eviction still triggers a redraw when
+the retained row count stays constant.
+
+History collection targets 256 KiB of text per batch. One larger row may occupy a
+batch by itself; rows exceeding 8 MiB are skipped. An SSP stream payload is limited
+to 16 MiB. Clients validate declared lengths before reading payloads and stop
+malformed streams. At most eight incoming stream readers run per connection, and
+connection cleanup cancels them.
+
+Before retaining a screen snapshot, the server checks its row count, each row's
+encoded text length, and the worst-case frame size including empty-row headers.
+Screens outside the wire limits become a bounded display notice in SSP state;
+the authoritative terminal and connection continue running. Resizing or clearing
+the terminal restores normal display when the next snapshot fits. This also
+applies to final screens and avoids treating an oversized frame as a disconnected
+peer. SSP's current row count and row text length fields are 16-bit.
+
+The screen sender has one reliable transfer in progress and one latest frame
+waiting. New oversized frames replace the waiting frame while allowing the
+current transfer to finish, so continuous output cannot repeatedly interrupt all
+progress. Acknowledgment of the latest state, a newer datagram-sized update, or
+connection cleanup cancels outstanding stream work. Lost application
+acknowledgments can still trigger another completed-frame transmission. History
+and screen streams share QUIC congestion control with interactive datagrams.
+
 ## Connection Modes
 
 ### Native Mode

@@ -4,7 +4,16 @@
 //! QUIC uni stream. The server tracks which lines have been sent and
 //! incrementally sends new ones as they appear.
 
-use crate::ssp::SspError;
+use crate::ssp::{SspError, Viewport, scrollback_before_viewport};
+
+/// Maximum retained history rows on either endpoint.
+pub const MAX_SCROLLBACK_LINES: usize = 3500;
+/// Maximum retained client history text bytes, and maximum encoded line text.
+pub const MAX_SCROLLBACK_BYTES: usize = 8 * 1024 * 1024;
+
+const MAX_BATCH_BYTES: usize = 256 * 1024;
+
+pub(crate) type ScrollbackRange = Option<(isize, isize)>;
 
 /// A single scrollback line with its stable row index and text.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,23 +91,27 @@ impl ScrollbackSender {
         }
     }
 
-    /// Returns new scrollback lines from the terminal that haven't been sent yet.
+    /// Collects unsent history, targeting at most 256 KiB of text per batch.
+    ///
+    /// A larger single row may fill a batch, up to [`MAX_SCROLLBACK_BYTES`].
+    /// Rows exceeding that limit are skipped.
     pub fn collect_new_lines(
         &mut self,
         terminal: &crate::terminal::RoseTerminal,
     ) -> Vec<ScrollbackLine> {
-        let lines = terminal.scrollback_lines_since(self.last_sent_stable_row);
-        let new_lines: Vec<ScrollbackLine> = lines
+        let (last, lines) = terminal.scrollback_batch_since(
+            self.last_sent_stable_row,
+            MAX_BATCH_BYTES,
+            MAX_SCROLLBACK_BYTES,
+        );
+        self.last_sent_stable_row = last;
+        lines
             .into_iter()
             .map(|(stable, text)| ScrollbackLine {
                 stable_row: stable,
                 text,
             })
-            .collect();
-        if let Some(last) = new_lines.last() {
-            self.last_sent_stable_row = last.stable_row;
-        }
-        new_lines
+            .collect()
     }
 }
 
@@ -110,39 +123,72 @@ impl Default for ScrollbackSender {
 
 /// Client-side scrollback storage.
 ///
-/// Accumulates scrollback lines received from the server.
+/// Retains the newest history within row and text-byte limits.
 pub struct ScrollbackReceiver {
     lines: Vec<ScrollbackLine>,
+    start: usize,
+    bytes: usize,
 }
 
 impl ScrollbackReceiver {
     /// Creates an empty receiver.
     #[must_use]
     pub const fn new() -> Self {
-        Self { lines: Vec::new() }
+        Self {
+            lines: Vec::new(),
+            start: 0,
+            bytes: 0,
+        }
     }
 
-    /// Adds a scrollback line.
+    /// Adds a new row, evicting older rows to stay within retention limits.
+    ///
+    /// Duplicate, out-of-order, and individually oversized rows are ignored.
     pub fn add_line(&mut self, line: ScrollbackLine) {
+        if line.text.len() > MAX_SCROLLBACK_BYTES
+            || self
+                .lines()
+                .last()
+                .is_some_and(|last| line.stable_row <= last.stable_row)
+        {
+            return;
+        }
+        while self.len() >= MAX_SCROLLBACK_LINES
+            || self.bytes + line.text.len() > MAX_SCROLLBACK_BYTES
+        {
+            self.bytes -= self.lines[self.start].text.len();
+            self.lines[self.start].text = String::new();
+            self.start += 1;
+        }
+        if self.start > 0 && self.lines.len() == self.lines.capacity() {
+            self.lines.drain(..self.start);
+            self.start = 0;
+        }
+        self.bytes += line.text.len();
         self.lines.push(line);
     }
 
-    /// Returns all received scrollback lines.
+    /// Returns retained scrollback lines in ascending stable-row order.
     #[must_use]
     pub fn lines(&self) -> &[ScrollbackLine] {
-        &self.lines
+        &self.lines[self.start..]
+    }
+
+    pub(crate) fn range_before_viewport(&self, viewport: Option<Viewport>) -> ScrollbackRange {
+        let lines = scrollback_before_viewport(self.lines(), viewport);
+        Some((lines.first()?.stable_row, lines.last()?.stable_row))
     }
 
     /// Returns the number of received scrollback lines.
     #[must_use]
     pub const fn len(&self) -> usize {
-        self.lines.len()
+        self.lines.len() - self.start
     }
 
     /// Returns `true` if no scrollback lines have been received.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.lines.is_empty()
+        self.len() == 0
     }
 }
 
@@ -156,6 +202,127 @@ impl Default for ScrollbackReceiver {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sender_batches_history_without_losing_rows() {
+        let mut terminal = crate::terminal::RoseTerminal::new(24, 100);
+        terminal.advance(format!("{}\r\n", "x".repeat(99)).repeat(4000).as_bytes());
+        let mut sender = ScrollbackSender::new();
+        let mut collected = sender.collect_new_lines(&terminal);
+        assert!(collected.iter().map(|line| line.text.len()).sum::<usize>() <= 256 * 1024);
+        let remaining = sender.collect_new_lines(&terminal);
+        assert!(!remaining.is_empty());
+        collected.extend(remaining);
+        assert_eq!(
+            collected
+                .into_iter()
+                .map(|line| (line.stable_row, line.text))
+                .collect::<Vec<_>>(),
+            terminal.scrollback_lines(),
+        );
+        assert!(sender.collect_new_lines(&terminal).is_empty());
+    }
+
+    #[test]
+    fn rendered_history_range_tracks_eviction_and_viewport_overlap() {
+        let mut receiver = ScrollbackReceiver::new();
+        assert_eq!(receiver.range_before_viewport(None), None);
+        for stable_row in 0..3500 {
+            receiver.add_line(ScrollbackLine {
+                stable_row,
+                text: "row".to_owned(),
+            });
+        }
+        let viewport = Some(Viewport {
+            first_row: 3499,
+            alternate_screen: false,
+        });
+        assert_eq!(receiver.range_before_viewport(viewport), Some((0, 3498)));
+        receiver.add_line(ScrollbackLine {
+            stable_row: 3500,
+            text: "new".to_owned(),
+        });
+        assert_eq!(receiver.len(), 3500);
+        assert_eq!(receiver.range_before_viewport(viewport), Some((1, 3498)));
+        assert_eq!(receiver.range_before_viewport(None), Some((1, 3500)));
+        assert_eq!(
+            receiver.range_before_viewport(Some(Viewport {
+                first_row: 1,
+                alternate_screen: false
+            })),
+            None
+        );
+        assert_eq!(
+            receiver
+                .lines
+                .iter()
+                .map(|line| line.text.len())
+                .sum::<usize>(),
+            receiver.bytes
+        );
+    }
+
+    #[test]
+    fn history_batches_advance_past_oversized_rows_and_allow_one_large_row() {
+        let mut terminal = crate::terminal::RoseTerminal::new(2, 240);
+        terminal.advance(format!("{}\r\nsmall\r\nvisible\r\nend", "x".repeat(200)).as_bytes());
+        let expected = terminal.scrollback_lines();
+        assert_eq!(expected.len(), 2);
+        let (last, batch) = terminal.scrollback_batch_since(-1, 64, 256);
+        assert_eq!(batch, expected[..1]);
+        assert_eq!(last, expected[0].0);
+        let (last, batch) = terminal.scrollback_batch_since(-1, 64, 128);
+        assert_eq!(batch, expected[1..]);
+        assert_eq!(last, expected[1].0);
+        let (last, batch) = terminal.scrollback_batch_since(-1, 64, 0);
+        assert!(batch.is_empty());
+        assert_eq!(last, expected[1].0);
+    }
+
+    #[test]
+    fn receiver_evicts_oldest_rows_after_retention_limit() {
+        let mut receiver = ScrollbackReceiver::new();
+        for stable_row in 0..8000 {
+            receiver.add_line(ScrollbackLine {
+                stable_row,
+                text: format!("line {stable_row}"),
+            });
+        }
+        assert_eq!(receiver.len(), 3500);
+        assert_eq!(receiver.lines().first().unwrap().stable_row, 4500);
+        assert_eq!(receiver.lines().last().unwrap().stable_row, 7999);
+    }
+
+    #[test]
+    fn receiver_bounds_text_bytes_independently_of_row_count() {
+        let mut receiver = ScrollbackReceiver::new();
+        for stable_row in 0..3 {
+            receiver.add_line(ScrollbackLine {
+                stable_row,
+                text: "x".repeat(3 * 1024 * 1024),
+            });
+        }
+        assert_eq!(receiver.len(), 2);
+        assert_eq!(receiver.lines()[0].stable_row, 1);
+        receiver.add_line(ScrollbackLine {
+            stable_row: 3,
+            text: "x".repeat(8 * 1024 * 1024 + 1),
+        });
+        assert_eq!(receiver.len(), 2);
+    }
+
+    #[test]
+    fn receiver_ignores_duplicate_and_out_of_order_history() {
+        let mut receiver = ScrollbackReceiver::new();
+        for stable_row in [2, 1, 2] {
+            receiver.add_line(ScrollbackLine {
+                stable_row,
+                text: "retained".to_owned(),
+            });
+        }
+        assert_eq!(receiver.len(), 1);
+        assert_eq!(receiver.lines()[0].stable_row, 2);
+    }
 
     #[test]
     fn scrollback_line_encode_decode() {

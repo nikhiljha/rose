@@ -14,6 +14,7 @@ use wezterm_term::{
 /// Monotonically increasing sequence number used by wezterm for dirty tracking.
 type SequenceNo = usize;
 
+use crate::scrollback::MAX_SCROLLBACK_LINES;
 use crate::ssp::{ScreenState, Viewport};
 
 /// Configuration for the wezterm terminal emulator.
@@ -21,6 +22,10 @@ use crate::ssp::{ScreenState, Viewport};
 struct RoseTerminalConfig;
 
 impl TerminalConfiguration for RoseTerminalConfig {
+    fn scrollback_size(&self) -> usize {
+        MAX_SCROLLBACK_LINES
+    }
+
     fn color_palette(&self) -> wezterm_term::color::ColorPalette {
         wezterm_term::color::ColorPalette::default()
     }
@@ -298,6 +303,16 @@ impl RoseTerminal {
     /// `last_stable_row`, with ANSI colors and attributes preserved.
     #[must_use]
     pub fn scrollback_lines_since(&self, last_stable_row: isize) -> Vec<(isize, String)> {
+        self.scrollback_batch_since(last_stable_row, usize::MAX, usize::MAX)
+            .1
+    }
+
+    pub(crate) fn scrollback_batch_since(
+        &self,
+        last_stable_row: isize,
+        max_batch_bytes: usize,
+        max_line_bytes: usize,
+    ) -> (isize, Vec<(isize, String)>) {
         let screen = self.inner.screen();
         let total = screen.scrollback_rows();
         let visible = self.inner.get_size().rows;
@@ -308,17 +323,30 @@ impl RoseTerminal {
             .saturating_sub(first_stable)
             .max(0) as usize;
         if start >= scrollback_count {
-            return vec![];
+            return (last_stable_row, vec![]);
         }
         let lines = screen.lines_in_phys_range(start..scrollback_count);
-        lines
-            .iter()
-            .enumerate()
-            .map(|(i, line)| {
-                let stable = screen.phys_to_stable_row_index(start + i);
-                (stable, format_line_cells(line))
-            })
-            .collect()
+        let mut result = Vec::new();
+        let mut last = last_stable_row;
+        let mut bytes = 0;
+        for (i, line) in lines.iter().enumerate() {
+            let stable = screen.phys_to_stable_row_index(start + i);
+            let text = format_line_cells(line);
+            if text.len() > max_line_bytes {
+                last = stable;
+                continue;
+            }
+            if !result.is_empty() && text.len() > max_batch_bytes.saturating_sub(bytes) {
+                break;
+            }
+            bytes += text.len();
+            result.push((stable, text));
+            last = stable;
+            if bytes >= max_batch_bytes {
+                break;
+            }
+        }
+        (last, result)
     }
 
     /// Returns a single visible row with ANSI SGR escape sequences preserving
