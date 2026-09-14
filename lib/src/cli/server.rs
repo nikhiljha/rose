@@ -6,8 +6,8 @@ use std::time::Duration;
 use portable_pty::CommandBuilder;
 
 use super::util::{
-    SspFrameSender, extract_peer_cert, hex_decode, hex_encode, parse_stun_line, rand_session_id,
-    rand_u16, write_private_key,
+    FrameSendResult, SspFrameSender, extract_peer_cert, hex_decode, hex_encode, parse_stun_line,
+    rand_session_id, rand_u16, write_private_key,
 };
 use crate::config::{self, CertKeyPair, RosePaths};
 use crate::protocol::{self, ControlMessage, ServerSession};
@@ -674,15 +674,20 @@ async fn forward_pty_output(
             .lock()
             .expect("sender lock poisoned")
             .generate_frame();
-        if !frame_sender.send(frame.as_ref()) {
-            return false;
+        match frame_sender.send(frame.as_ref()) {
+            FrameSendResult::Sent => {}
+            FrameSendResult::TooLarge => {
+                tracing::warn!("dropping unrepresentable screen update");
+            }
+            FrameSendResult::Disconnected => return false,
         }
     }
     drop(frame_sender);
     let state = terminal_out
         .lock()
         .expect("terminal lock poisoned")
-        .snapshot();
+        .snapshot()
+        .bounded_for_transport();
     let diff = state.diff_from_empty();
     let new_num = {
         let mut sender = sender_out.lock().expect("sender lock poisoned");
@@ -958,6 +963,42 @@ mod tests {
         .await
         .expect("final authoritative screen was not delivered");
         assert!(exited);
+    }
+
+    #[tokio::test]
+    async fn unrepresentable_screen_does_not_end_a_healthy_connection() {
+        let (client_conn, server_conn, _fixture, _client) = crate::testutil::connected_pair().await;
+        let (_tx, rx) = tokio::sync::broadcast::channel(1);
+        let mut protocol = SspSender::new();
+        protocol.push_state(crate::ssp::ScreenState {
+            viewport: None,
+            rows: vec!["x".repeat(60_000); 300],
+            cursor_x: 0,
+            cursor_y: 0,
+        });
+        let output = forward_pty_output(
+            rx,
+            std::future::pending(),
+            Arc::new(Mutex::new(RoseTerminal::new(300, 300))),
+            Arc::new(Mutex::new(protocol)),
+            server_conn,
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        tokio::pin!(output);
+        let frame = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::select! {
+                result = &mut output => panic!("healthy output forwarder ended: {result}"),
+                data = client_conn.read_datagram() => SspFrame::decode(&data.unwrap()).unwrap(),
+            }
+        })
+        .await
+        .expect("oversized screen was not replaced with a display notice");
+        assert!(frame.encode().len() <= crate::ssp::MAX_STREAM_FRAME_BYTES);
+        assert!(
+            poll_fn(|cx| Poll::Ready(output.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
     }
 
     #[tokio::test]

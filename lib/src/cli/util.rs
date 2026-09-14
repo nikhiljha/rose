@@ -20,6 +20,13 @@ struct EncodedFrame {
     data: Bytes,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FrameSendResult {
+    Sent,
+    TooLarge,
+    Disconnected,
+}
+
 impl SspFrameSender {
     pub(super) fn new(connection: quinn::Connection) -> Self {
         let (pending, receive) = tokio::sync::watch::channel(None);
@@ -31,32 +38,48 @@ impl SspFrameSender {
         }
     }
 
-    pub(super) fn send(&self, frame: Option<&SspFrame>) -> bool {
+    pub(super) fn send(&self, frame: Option<&SspFrame>) -> FrameSendResult {
         if self.connection.close_reason().is_some() {
-            return false;
+            return FrameSendResult::Disconnected;
         }
         let Some(frame) = frame else {
-            return self.pending.send(None).is_ok();
+            return if self.pending.send(None).is_ok() {
+                FrameSendResult::Sent
+            } else {
+                FrameSendResult::Disconnected
+            };
         };
         let data = frame.encode();
         if data.len() > MAX_STREAM_FRAME_BYTES {
             tracing::warn!("screen exceeds reliable frame limit");
-            return false;
+            return FrameSendResult::TooLarge;
         }
         if self
             .connection
             .max_datagram_size()
             .is_some_and(|max| data.len() <= max)
         {
-            return self.pending.send(None).is_ok()
-                && self.connection.send_datagram(Bytes::from(data)).is_ok();
+            if self.pending.send(None).is_err() {
+                return FrameSendResult::Disconnected;
+            }
+            return if self.connection.send_datagram(Bytes::from(data)).is_ok() {
+                FrameSendResult::Sent
+            } else {
+                FrameSendResult::Disconnected
+            };
         }
-        self.pending
+        if self
+            .pending
             .send(Some(EncodedFrame {
                 key: (frame.old_num, frame.new_num),
                 data: Bytes::from(data),
             }))
             .is_ok()
+        {
+            FrameSendResult::Sent
+        } else {
+            FrameSendResult::Disconnected
+        }
     }
 }
 
@@ -379,7 +402,7 @@ mod tests {
         frame: &SspFrame,
     ) -> (SspFrameSender, quinn::RecvStream) {
         let sender = SspFrameSender::new(server.clone());
-        assert!(sender.send(Some(frame)));
+        assert_eq!(sender.send(Some(frame)), FrameSendResult::Sent);
         let mut stream = client.accept_uni().await.unwrap();
         let mut prefix = [0];
         stream.read_exact(&mut prefix).await.unwrap();
@@ -394,7 +417,7 @@ mod tests {
         let (sender, mut first) = start_transfer(&client, &server, &frame).await;
         for num in [2, 3] {
             frame.new_num = num;
-            assert!(sender.send(Some(&frame)));
+            assert_eq!(sender.send(Some(&frame)), FrameSendResult::Sent);
         }
         let initial = first
             .read_to_end(MAX_STREAM_FRAME_BYTES)
@@ -415,23 +438,26 @@ mod tests {
     async fn datagrams_cancel_pending_streams_and_closed_connections_fail() {
         let (client, server, _fixture, _endpoint) = crate::testutil::connected_pair().await;
         let (sender, mut stream) = start_transfer(&client, &server, &large_frame()).await;
-        assert!(sender.send(Some(&SspFrame::ack_only(7))));
+        assert_eq!(
+            sender.send(Some(&SspFrame::ack_only(7))),
+            FrameSendResult::Sent
+        );
         let data = client.read_datagram().await.unwrap();
         assert_eq!(SspFrame::decode(&data).unwrap().ack_num, 7);
         assert!(stream.read_to_end(MAX_STREAM_FRAME_BYTES).await.is_err());
         server.close(0u32.into(), b"finished");
-        assert!(!sender.send(None));
+        assert_eq!(sender.send(None), FrameSendResult::Disconnected);
     }
 
     #[tokio::test]
     async fn oversized_screens_are_rejected_before_queueing() {
         let (client, server, _fixture, _endpoint) = crate::testutil::connected_pair().await;
         let sender = SspFrameSender::new(server);
-        let mut state = ScreenState::empty(300);
-        state.rows.fill("x".repeat(60_000));
-        let mut protocol = SspSender::new();
-        protocol.push_state(state);
-        assert!(!sender.send(protocol.generate_frame().as_ref()));
+        let mut frame = large_frame();
+        frame.diff.as_mut().unwrap().changed_rows =
+            (0..300).map(|row| (row, "x".repeat(60_000))).collect();
+        frame.diff.as_mut().unwrap().total_rows = 300;
+        assert_eq!(sender.send(Some(&frame)), FrameSendResult::TooLarge);
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(100), client.accept_uni(),)
                 .await
@@ -444,7 +470,7 @@ mod tests {
         let (client, server, _fixture, _endpoint) = crate::testutil::connected_pair().await;
         let sender = SspFrameSender::new(server);
         let frame = large_frame();
-        assert!(sender.send(Some(&frame)));
+        assert_eq!(sender.send(Some(&frame)), FrameSendResult::Sent);
         let mut first = client.accept_uni().await.unwrap();
         first.read_to_end(MAX_STREAM_FRAME_BYTES).await.unwrap();
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(20));
@@ -452,7 +478,9 @@ mod tests {
             loop {
                 tokio::select! {
                     stream = client.accept_uni() => break stream.unwrap(),
-                    _ = interval.tick() => assert!(sender.send(Some(&frame))),
+                    _ = interval.tick() => {
+                        assert_eq!(sender.send(Some(&frame)), FrameSendResult::Sent);
+                    }
                 }
             }
         })
@@ -463,7 +491,7 @@ mod tests {
             SspFrame::decode_from_stream(&data[1..]).unwrap().new_num,
             frame.new_num
         );
-        assert!(sender.send(None));
+        assert_eq!(sender.send(None), FrameSendResult::Sent);
     }
 
     #[tokio::test]
@@ -488,7 +516,7 @@ mod tests {
         let frame = large_frame();
         let (sender, mut receive) = start_transfer(&client, &server, &frame).await;
         for _ in 0..3 {
-            assert!(sender.send(Some(&frame)));
+            assert_eq!(sender.send(Some(&frame)), FrameSendResult::Sent);
         }
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(100), client.accept_uni(),)
@@ -496,7 +524,7 @@ mod tests {
                 .is_err(),
             "retransmission queued another oversized screen"
         );
-        assert!(sender.send(None));
+        assert_eq!(sender.send(None), FrameSendResult::Sent);
         assert!(receive.read_to_end(8 * 1024 * 1024).await.is_err());
     }
 

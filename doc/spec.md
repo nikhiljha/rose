@@ -99,6 +99,14 @@ to 16 MiB. Clients validate declared lengths before reading payloads and stop
 malformed streams. At most eight incoming stream readers run per connection, and
 connection cleanup cancels them.
 
+Before retaining a screen snapshot, the server checks its row count, each row's
+encoded text length, and the worst-case frame size including empty-row headers.
+Screens outside the wire limits become a bounded display notice in SSP state;
+the authoritative terminal and connection continue running. Resizing or clearing
+the terminal restores normal display when the next snapshot fits. This also
+applies to final screens and avoids treating an oversized frame as a disconnected
+peer. SSP's current row count and row text length fields are 16-bit.
+
 The screen sender has one reliable transfer in progress and one latest frame
 waiting. New oversized frames replace the waiting frame while allowing the
 current transfer to finish, so continuous output cannot repeatedly interrupt all

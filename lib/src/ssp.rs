@@ -54,6 +54,21 @@ impl ScreenState {
         }
     }
 
+    /// Replaces states outside SSP wire limits with a bounded display notice.
+    pub(crate) fn bounded_for_transport(mut self) -> Self {
+        if state_is_representable(&self) {
+            return self;
+        }
+        self.rows.truncate(usize::from(u16::MAX));
+        self.rows.fill(String::new());
+        if let Some(first) = self.rows.first_mut() {
+            *first = SCREEN_TOO_LARGE_NOTICE.to_owned();
+        }
+        self.cursor_x = 0;
+        self.cursor_y = 0;
+        self
+    }
+
     /// Computes a diff from `old` to `self`.
     #[must_use]
     #[tracing::instrument(level = "trace", skip_all)]
@@ -366,6 +381,9 @@ const MAX_QUEUE_SIZE: usize = 32;
 /// Maximum encoded SSP payload accepted on a reliable stream.
 pub const MAX_STREAM_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
+const SCREEN_TOO_LARGE_NOTICE: &str =
+    "RoSE: screen too large to display; resize the terminal or clear the screen";
+
 /// Server-side SSP sender. Manages a queue of screen state snapshots
 /// and generates diffs for the client.
 pub struct SspSender {
@@ -389,6 +407,7 @@ impl SspSender {
     /// Returns the assigned sequence number.
     #[tracing::instrument(level = "trace", skip_all)]
     pub fn push_state(&mut self, state: ScreenState) -> u64 {
+        let state = state.bounded_for_transport();
         let num = self.next_num;
         self.next_num += 1;
         self.states.push_back((num, state));
@@ -497,6 +516,24 @@ impl SspSender {
             }
         }
     }
+}
+
+fn state_is_representable(state: &ScreenState) -> bool {
+    if state.rows.len() > usize::from(u16::MAX) {
+        return false;
+    }
+    let mut encoded_size =
+        25 + 8 + usize::from(state.viewport.is_some()) * 9 + 4 * state.rows.len();
+    for row in state.rows.iter().filter(|row| !row.is_empty()) {
+        if row.len() > usize::from(u16::MAX) {
+            return false;
+        }
+        encoded_size += row.len();
+        if encoded_size > MAX_STREAM_FRAME_BYTES {
+            return false;
+        }
+    }
+    true
 }
 
 impl Default for SspSender {
@@ -1605,5 +1642,55 @@ mod tests {
         // Queue should be pruned, but state 1 should still be there
         let frame = sender.generate_frame();
         assert!(frame.is_some());
+    }
+
+    #[test]
+    fn sender_replaces_unrepresentable_screen_with_bounded_notice() {
+        let mut sender = SspSender::new();
+        sender.push_state(ScreenState {
+            viewport: None,
+            rows: vec!["x".repeat(60_000); 300],
+            cursor_x: 0,
+            cursor_y: 0,
+        });
+        let encoded = sender.generate_frame().unwrap().encode();
+        assert!(encoded.len() <= MAX_STREAM_FRAME_BYTES);
+        let frame = SspFrame::decode(&encoded).unwrap();
+        let mut receiver = SspReceiver::new(300);
+        receiver.process_frame(&frame).unwrap();
+        assert!(receiver.state().rows[0].contains("too large"));
+
+        sender.process_ack(receiver.ack_num());
+        let mut recovered = ScreenState::empty(5);
+        recovered.rows[0] = "recovered".to_owned();
+        sender.push_state(recovered.clone());
+        let update = sender.generate_frame().unwrap();
+        receiver.process_frame(&update).unwrap();
+        assert_eq!(*receiver.state(), recovered);
+    }
+
+    #[test]
+    fn sender_bounds_row_lengths_and_row_count() {
+        for (rows, columns) in [(1, 65_536), (65_536, 1)] {
+            let mut sender = SspSender::new();
+            sender.push_state(ScreenState {
+                viewport: Some(Viewport {
+                    first_row: 100,
+                    alternate_screen: true,
+                }),
+                rows: vec!["x".repeat(columns); rows],
+                cursor_x: 1,
+                cursor_y: 1,
+            });
+            let frame = sender.generate_frame().unwrap();
+            let decoded = SspFrame::decode(&frame.encode()).unwrap();
+            let mut receiver = SspReceiver::new(1);
+            receiver.process_frame(&decoded).unwrap();
+            assert_eq!(receiver.state().rows[0], SCREEN_TOO_LARGE_NOTICE);
+            assert_eq!(receiver.state().rows.len(), rows.min(65_535));
+            assert_eq!(receiver.state().cursor_x, 0);
+            assert_eq!(receiver.state().cursor_y, 0);
+            assert!(receiver.state().viewport.unwrap().alternate_screen);
+        }
     }
 }
