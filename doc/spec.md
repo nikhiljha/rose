@@ -84,7 +84,10 @@ QUIC streams are used for data that must not be lost:
 - **Scrollback stream (uni, server→client):** Scrollback history synchronization. The server opens a long-lived uni stream prefixed with a `0x02` type byte and incrementally sends scrollback lines as they appear. This avoids head-of-line blocking on the interactive datagram channel.
 - **Oversized SSP frames (uni, server→client):** When an SSP frame exceeds the QUIC datagram MTU, it is sent via a one-shot uni stream prefixed with a `0x01` type byte, followed by the length-prefixed frame data.
 
-Input that reaches the 64 KiB retention bound backpressures the keyboard reader.
+Input that reaches the 64 KiB transport retention bound uses a bounded 128-byte
+keyboard lookahead, allowing immediate local escape sequences to be recognized.
+Once that lookahead fills, further keyboard events are backpressured; an escape
+behind a larger queued paste must wait for that input to drain.
 An explicit detach waits until earlier input is acknowledged. An explicit
 disconnect may abandon unacknowledged input. An acknowledgment means the bytes
 were written to the PTY, not that the application executed them. A newly attached

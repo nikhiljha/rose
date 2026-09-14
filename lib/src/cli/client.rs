@@ -941,6 +941,90 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn backoff_honors_local_disconnect_and_keyboard_eof() {
+        for explicit in [true, false] {
+            let (send, receive) = tokio::sync::mpsc::channel(8);
+            let keyboard = KeyboardInput::new(receive);
+            if explicit {
+                for code in [
+                    KeyCode::Enter,
+                    KeyCode::Char('x'),
+                    KeyCode::Enter,
+                    KeyCode::Enter,
+                    KeyCode::Char('~'),
+                    KeyCode::Char('.'),
+                ] {
+                    send.send(Event::Key(crossterm::event::KeyEvent::new(
+                        code,
+                        crossterm::event::KeyModifiers::NONE,
+                    )))
+                    .await
+                    .unwrap();
+                }
+            } else {
+                drop(send);
+            }
+            assert!(
+                !wait_or_disconnect(&keyboard, Duration::ZERO, None, "")
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(100),
+                    wait_or_disconnect(&keyboard, Duration::from_secs(5), None, ""),
+                )
+                .await
+                .expect("local disconnect waited for the reconnect backoff")
+                .unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn backoff_detach_resumes_after_prior_input_is_acknowledged() {
+        for session_id in [None, Some([3; 16])] {
+            let (send, receive) = tokio::sync::mpsc::channel(8);
+            let keyboard = KeyboardInput::new(receive);
+            for event in [
+                Event::Resize(80, 24),
+                Event::Key(crossterm::event::KeyEvent::new(
+                    KeyCode::Enter,
+                    crossterm::event::KeyModifiers::NONE,
+                )),
+                Event::Key(crossterm::event::KeyEvent::new(
+                    KeyCode::Char('~'),
+                    crossterm::event::KeyModifiers::NONE,
+                )),
+                Event::Key(crossterm::event::KeyEvent::new(
+                    KeyCode::Char('d'),
+                    crossterm::event::KeyModifiers::NONE,
+                )),
+            ] {
+                send.send(event).await.unwrap();
+            }
+            assert!(
+                !wait_or_disconnect(&keyboard, Duration::from_millis(20), session_id, "rose")
+                    .await
+                    .unwrap()
+            );
+            let file = tempfile::NamedTempFile::new().unwrap();
+            let input = crate::input::ServerInput::new(Arc::new(Mutex::new(Box::new(
+                file.reopen().unwrap(),
+            ))));
+            let connection =
+                crate::testutil::InputConnection::new(input, keyboard.buffer.clone()).await;
+            assert!(
+                wait_or_disconnect(&keyboard, Duration::from_secs(2), session_id, "rose")
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(std::fs::read(file.path()).unwrap(), b"\r");
+            connection.close().await;
+        }
+    }
+
+    #[tokio::test]
     async fn backoff_preserves_typed_input_for_the_next_connection() {
         let (send, receive) = tokio::sync::mpsc::channel(8);
         let keyboard = KeyboardInput::new(receive);

@@ -5,6 +5,9 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
 use crate::input::{InputBuffer, InputError};
 
+const MAX_KEY_LOOKAHEAD: usize = 128;
+const MAX_KEY_BYTES: usize = 32;
+
 pub(super) fn read_keyboard_events(sender: tokio::sync::mpsc::Sender<Event>) {
     while let Ok(event) = crossterm::event::read() {
         if sender.blocking_send(event).is_err() {
@@ -29,6 +32,7 @@ pub(super) struct KeyboardInput {
 struct KeyboardState {
     escape: EscapeState,
     action: Option<InputAction>,
+    pending: Vec<u8>,
 }
 
 impl KeyboardInput {
@@ -39,47 +43,70 @@ impl KeyboardInput {
             state: Arc::new(Mutex::new(KeyboardState {
                 escape: EscapeState::Normal,
                 action: None,
+                pending: Vec::new(),
             })),
         }
     }
 
     pub(super) async fn next(&self) -> Result<Option<InputAction>, InputError> {
         let mut events = self.events.lock().await;
-        let pending = self.state.lock().expect("keyboard lock poisoned").action;
-        let action = if pending.is_some() {
-            pending
-        } else {
-            self.buffer.wait_for_capacity(32).await;
-            let event = events.recv().await;
+        let mut consumed = false;
+        loop {
+            let (pending, action) = {
+                let mut state = self.state.lock().expect("keyboard lock poisoned");
+                if !state.pending.is_empty() {
+                    match self.buffer.push(&state.pending) {
+                        Ok(()) => state.pending.clear(),
+                        Err(InputError::Full) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                (state.pending.len(), state.action)
+            };
+            if let Some(action) = action {
+                if action == InputAction::Detach {
+                    if pending > 0 {
+                        self.buffer.wait_for_capacity(pending).await;
+                        continue;
+                    }
+                    self.buffer
+                        .wait_for_capacity(crate::input::MAX_PENDING_INPUT)
+                        .await;
+                }
+                return Ok(Some(action));
+            }
+            if consumed {
+                return Ok(None);
+            }
+            if pending > MAX_KEY_LOOKAHEAD - MAX_KEY_BYTES {
+                self.buffer.wait_for_capacity(pending).await;
+                continue;
+            }
+            let event = tokio::select! {
+                event = events.recv() => event,
+                () = self.buffer.wait_for_capacity(pending), if pending > 0 => continue,
+            };
             let mut state = self.state.lock().expect("keyboard lock poisoned");
             state.action = match event {
-                Some(Event::Key(key)) => process_key(&key, &mut state.escape, &self.buffer)?,
+                Some(Event::Key(key)) => process_key(&key, &mut state),
                 None => Some(InputAction::Disconnect),
                 Some(_) => None,
             };
-            state.action
-        };
-        if action == Some(InputAction::Detach) {
-            self.buffer
-                .wait_for_capacity(crate::input::MAX_PENDING_INPUT)
-                .await;
+            consumed = true;
         }
-        Ok(action)
     }
 }
 
-fn process_key(
-    key: &KeyEvent,
-    escape: &mut EscapeState,
-    buffer: &InputBuffer,
-) -> Result<Option<InputAction>, InputError> {
+fn process_key(key: &KeyEvent, state: &mut KeyboardState) -> Option<InputAction> {
     let bytes = key_event_to_bytes(key);
     if bytes.is_empty() {
-        return Ok(None);
+        return None;
     }
+    let escape = &mut state.escape;
+    let pending = &mut state.pending;
     match escape {
         EscapeState::Normal => {
-            buffer.push(&bytes)?;
+            pending.extend_from_slice(&bytes);
             if key.code == KeyCode::Enter {
                 *escape = EscapeState::AfterEnter;
             }
@@ -88,7 +115,7 @@ fn process_key(
             if key.code == KeyCode::Char('~') {
                 *escape = EscapeState::AfterTilde;
             } else {
-                buffer.push(&bytes)?;
+                pending.extend_from_slice(&bytes);
                 if key.code != KeyCode::Enter {
                     *escape = EscapeState::Normal;
                 }
@@ -97,9 +124,9 @@ fn process_key(
         EscapeState::AfterTilde => {
             *escape = EscapeState::Normal;
             match key.code {
-                KeyCode::Char('.') => return Ok(Some(InputAction::Disconnect)),
-                KeyCode::Char('d') => return Ok(Some(InputAction::Detach)),
-                KeyCode::Char('~') => buffer.push(b"~")?,
+                KeyCode::Char('.') => return Some(InputAction::Disconnect),
+                KeyCode::Char('d') => return Some(InputAction::Detach),
+                KeyCode::Char('~') => pending.push(b'~'),
                 KeyCode::Char('?') => {
                     let mut stdout = std::io::stdout();
                     let _ = stdout.write_all(
@@ -111,11 +138,14 @@ fn process_key(
                     );
                     let _ = stdout.flush();
                 }
-                _ => buffer.push(&[b"~", bytes.as_slice()].concat())?,
+                _ => {
+                    pending.push(b'~');
+                    pending.extend_from_slice(&bytes);
+                }
             }
         }
     }
-    Ok(None)
+    None
 }
 
 /// SSH-style escape sequence state machine.
@@ -432,6 +462,94 @@ mod tests {
         }
         assert!(status.success());
         assert_eq!(std::fs::read(capture).unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn full_input_still_accepts_local_disconnect() {
+        for free in [31, 0] {
+            let (send, receive) = tokio::sync::mpsc::channel(8);
+            let keyboard = KeyboardInput::new(receive);
+            keyboard
+                .buffer
+                .push(&vec![b'a'; crate::input::MAX_PENDING_INPUT - free])
+                .unwrap();
+            for code in [
+                KeyCode::Char('x'),
+                KeyCode::Enter,
+                KeyCode::Char('~'),
+                KeyCode::Char('.'),
+            ] {
+                send.send(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                tokio::time::timeout(Duration::from_millis(100), async {
+                    loop {
+                        if let Some(action) = keyboard.next().await.unwrap() {
+                            break action;
+                        }
+                    }
+                })
+                .await
+                .expect("retained input blocked the local disconnect"),
+                InputAction::Disconnect
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn backpressured_keys_survive_cancellation_and_flush_before_detach() {
+        let (send, receive) = tokio::sync::mpsc::channel(256);
+        let keyboard = KeyboardInput::new(receive);
+        let prefix = vec![b'a'; crate::input::MAX_PENDING_INPUT];
+        keyboard.buffer.push(&prefix).unwrap();
+        for code in std::iter::repeat_n(KeyCode::Char('x'), 128).chain([
+            KeyCode::Enter,
+            KeyCode::Char('~'),
+            KeyCode::Char('~'),
+            KeyCode::Enter,
+            KeyCode::Char('~'),
+            KeyCode::Char('d'),
+        ]) {
+            send.send(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+                .await
+                .unwrap();
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), async {
+                loop {
+                    assert_eq!(keyboard.next().await.unwrap(), None);
+                }
+            })
+            .await
+            .is_err()
+        );
+        let queued = keyboard.events.lock().await.len();
+        assert!(queued > 0 && queued < 134, "lookahead must be bounded");
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let input =
+            crate::input::ServerInput::new(Arc::new(Mutex::new(Box::new(file.reopen().unwrap()))));
+        let connection =
+            crate::testutil::InputConnection::new(input, keyboard.buffer.clone()).await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Some(action) = keyboard.next().await.unwrap() {
+                        break action;
+                    }
+                }
+            })
+            .await
+            .unwrap(),
+            InputAction::Detach
+        );
+        assert_eq!(
+            std::fs::read(file.path()).unwrap(),
+            [prefix.as_slice(), &[b'x'; 128], b"\r~\r"].concat()
+        );
+        connection.close().await;
     }
 
     #[test]
