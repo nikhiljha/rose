@@ -259,6 +259,11 @@ commands. Encoding uses the latest accepted state; stale or rejected frames
 cannot change it. Bytes already queued for reliable delivery retain their
 original encoding and input offsets across reconnects.
 
+Before a fresh client receives its first checkpoint, mode-dependent navigation
+and subsequent remote keys are retained as events in bounded lookahead. The first
+accepted mode encodes them in order. Local escape commands remain available;
+detach waits for those keys and their input acknowledgments.
+
 ### Session Persistence
 
 Sessions survive network changes (WiFi to cellular, IP address changes, NAT

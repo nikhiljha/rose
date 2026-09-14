@@ -1544,6 +1544,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn early_navigation_waits_for_initial_state_before_detaching() {
+        let (client, _server, _fixture, _endpoint) = crate::testutil::connected_pair().await;
+        let receiver = Arc::new(Mutex::new(SspReceiver::new(4)));
+        let screen = Arc::new(Mutex::new(ScreenState::empty(4)));
+        let history = Arc::new(Mutex::new(ScrollbackReceiver::new()));
+        let rendered = Arc::new(Mutex::new(None));
+        let (send, receive) = tokio::sync::mpsc::channel(8);
+        let keyboard = KeyboardInput::new(receive);
+        for code in [
+            KeyCode::Up,
+            KeyCode::Char('x'),
+            KeyCode::Enter,
+            KeyCode::Char('~'),
+            KeyCode::Char('d'),
+        ] {
+            send.send(Event::Key(crossterm::event::KeyEvent::new(
+                code,
+                crossterm::event::KeyModifiers::NONE,
+            )))
+            .await
+            .unwrap();
+        }
+        for _ in 0..4 {
+            assert_eq!(keyboard.next().await.unwrap(), None);
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), keyboard.next())
+                .await
+                .is_err()
+        );
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            keyboard
+                .buffer
+                .wait_for_capacity(crate::input::MAX_PENDING_INPUT),
+        )
+        .await
+        .expect("unknown-mode navigation must not enter the reliable byte buffer");
+        let resumed = keyboard.clone();
+        let detaching = tokio::spawn(async move { resumed.next().await });
+        let mut terminal = crate::terminal::RoseTerminal::new(4, 80);
+        terminal.advance(b"\x1b[?1h");
+        let mut sender = crate::ssp::SspSender::new();
+        sender.push_state(terminal.snapshot());
+        let frame = SspFrame::decode(&sender.generate_frame().unwrap().encode()).unwrap();
+        process_ssp_frame(
+            &frame, &receiver, &screen, &client, &history, &rendered, &keyboard,
+        );
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let input =
+            crate::input::ServerInput::new(Arc::new(Mutex::new(Box::new(file.reopen().unwrap()))));
+        let connection =
+            crate::testutil::InputConnection::new(input, keyboard.buffer.clone()).await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), detaching)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            Some(InputAction::Detach)
+        );
+        assert_eq!(std::fs::read(file.path()).unwrap(), b"\x1bOAx\r");
+        connection.close().await;
+    }
+
+    #[tokio::test]
     async fn empty_datagram_drain_is_immediately_ready() {
         let (client, _server, _fixture, _endpoint) = crate::testutil::connected_pair().await;
         let data = SspFrame::ack_only(1).encode();
