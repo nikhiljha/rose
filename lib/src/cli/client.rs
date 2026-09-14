@@ -918,6 +918,7 @@ fn process_ssp_frame(
     rendered_sb_range: &Arc<Mutex<ScrollbackRange>>,
 ) {
     let mut recv = receiver.lock().expect("receiver lock poisoned");
+    let first_frame = recv.ack_num() == 0;
     match recv.process_frame(frame) {
         Ok(Some(_)) => {
             let new_state = recv.state().clone();
@@ -928,7 +929,8 @@ fn process_ssp_frame(
                 let count = rendered_sb_range
                     .lock()
                     .expect("rendered range lock poisoned");
-                sb.range_before_viewport(new_state.viewport) != *count
+                first_frame
+                    || sb.range_before_viewport(new_state.viewport) != *count
                     || new_state.rows.len() != screen.rows.len()
             };
 
