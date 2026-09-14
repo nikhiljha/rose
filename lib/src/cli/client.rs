@@ -431,7 +431,6 @@ async fn client_session_loop_inner(
         let mut _live_client: Option<QuicClient> = None;
 
         let conn = if let Some(conn) = initial_conn.take() {
-            backoff = Duration::from_millis(100);
             conn
         } else if let Some(ref ctx) = stun_ctx {
             match stun_reconnect(ctx.stun_servers.clone()).await {
@@ -442,7 +441,6 @@ async fn client_session_loop_inner(
                     .await;
                     match conn_result {
                         Ok(Ok(c)) => {
-                            backoff = Duration::from_millis(100);
                             _live_client = Some(client);
                             c
                         }
@@ -497,7 +495,6 @@ async fn client_session_loop_inner(
             .await;
             match conn_result {
                 Ok(Ok(c)) => {
-                    backoff = Duration::from_millis(100);
                     _live_client = Some(client);
                     c
                 }
@@ -563,6 +560,7 @@ async fn client_session_loop_inner(
         } else {
             tracing::info!("connected");
         }
+        backoff = Duration::from_millis(100);
 
         // Only clear the screen on first connect. On reconnect, preserve
         // the last known content so the user doesn't see a blank screen.

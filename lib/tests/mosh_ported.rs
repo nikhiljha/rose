@@ -1286,6 +1286,105 @@ async fn native_initial_screen_establishes_default_cursor() {
 }
 
 #[tokio::test]
+async fn native_reconnect_backoff_resets_only_after_session_info() {
+    let fixture = MtlsFixture::new();
+    let home = ssh_bootstrap_helpers::isolated_home_dir();
+    let config_dir = home.join(".config/rose");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    for (name, bytes) in [
+        ("client.crt.der", fixture.client_cert.cert_der.as_ref()),
+        ("client.key.der", fixture.client_cert.key_der.as_slice()),
+        ("server.crt", fixture.server.server_cert_der().as_ref()),
+    ] {
+        std::fs::write(config_dir.join(name), bytes).unwrap();
+    }
+    let mut cmd = CommandBuilder::new(ssh_bootstrap_helpers::build_rose_binary());
+    cmd.env("HOME", &home);
+    cmd.env("RUST_LOG", "rose::cli::client=debug");
+    cmd.args([
+        "connect",
+        "127.0.0.1",
+        "--port",
+        &fixture.addr().port().to_string(),
+        "--session",
+        "12121212121212121212121212121212",
+        "--cert",
+    ]);
+    cmd.arg(config_dir.join("server.crt"));
+    let mut pty = ssh_bootstrap_helpers::spawn_in_pty(cmd);
+    let mut previous_failure: Option<(std::time::Instant, u64)> = None;
+    for attempt in 0..6 {
+        let conn =
+            tokio::time::timeout(std::time::Duration::from_secs(30), fixture.server.accept())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        let (mut session, hello) = ServerSession::accept_any(conn.clone()).await.unwrap();
+        assert!(matches!(
+            hello,
+            ControlMessage::Reconnect { session_id, .. } if session_id == [0x12; 16]
+        ));
+        if let Some((failed_at, minimum_ms)) = previous_failure.take() {
+            assert!(
+                failed_at.elapsed() >= std::time::Duration::from_millis(minimum_ms),
+                "attempt {attempt} retried too soon: {:?}, expected at least {minimum_ms}ms",
+                failed_at.elapsed(),
+            );
+        }
+        match attempt {
+            3 => {
+                session
+                    .send_control(&ControlMessage::SessionInfo {
+                        version: PROTOCOL_VERSION,
+                        session_id: [0x12; 16],
+                    })
+                    .await
+                    .unwrap();
+                let mut terminal = rose::terminal::RoseTerminal::new(24, 80);
+                terminal.advance(b"BACKOFF_READY");
+                let mut sender = SspSender::new();
+                sender.push_state(terminal.snapshot());
+                conn.send_datagram(Bytes::from(sender.generate_frame().unwrap().encode()))
+                    .unwrap();
+                assert!(
+                    ssh_bootstrap_helpers::wait_for_output_contains(&pty, "BACKOFF_READY", 5).await
+                );
+                conn.close(1u32.into(), b"interrupt established session");
+            }
+            5 => {
+                session
+                    .send_control(&ControlMessage::Goodbye)
+                    .await
+                    .unwrap();
+                let status = ssh_bootstrap_helpers::wait_for_exit(&mut pty.child, 5)
+                    .await
+                    .unwrap();
+                assert_eq!(status.exit_code(), 0);
+            }
+            _ => {
+                let minimum_ms = match attempt {
+                    1 => 200,
+                    2 => 400,
+                    _ => 100,
+                };
+                previous_failure = Some((std::time::Instant::now(), minimum_ms));
+                conn.close(1u32.into(), b"session metadata temporarily unavailable");
+            }
+        }
+    }
+    let captured = pty.finish();
+    let retries: Vec<_> = captured
+        .lines()
+        .filter(|line| line.contains("handshake timed out"))
+        .collect();
+    assert_eq!(retries.len(), 4, "{captured}");
+    for (retry, expected) in retries.iter().zip(["100ms", "200ms", "400ms", "100ms"]) {
+        assert!(retry.contains(expected), "{retry} did not use {expected}");
+    }
+}
+
+#[tokio::test]
 async fn native_reconnect_preserves_first_keystroke() {
     let fixture = MtlsFixture::new();
     let home = ssh_bootstrap_helpers::isolated_home_dir();
