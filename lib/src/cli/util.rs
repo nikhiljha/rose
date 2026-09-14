@@ -6,32 +6,127 @@ use crossterm::terminal;
 
 use crate::config::{self, CertKeyPair, RosePaths};
 use crate::scrollback;
-use crate::ssp::SspFrame;
+use crate::ssp::{MAX_STREAM_FRAME_BYTES, SspFrame};
 
-/// Sends an SSP frame as a QUIC datagram, falling back to a uni stream for
-/// oversized frames. Returns `false` if the datagram send failed (connection
-/// likely dead).
-///
-/// COVERAGE: CLI helper tested via integration/e2e tests.
-#[cfg_attr(coverage_nightly, coverage(off))]
-pub(super) fn send_ssp_frame(frame: &SspFrame, conn: &quinn::Connection) -> bool {
-    let data = frame.encode();
-    let max_dgram = conn.max_datagram_size().unwrap_or(1200);
-    if data.len() <= max_dgram {
-        conn.send_datagram(Bytes::from(data)).is_ok()
-    } else {
-        let stream_data = frame.encode_for_stream();
-        let conn = conn.clone();
-        tokio::spawn(async move {
-            if let Ok(mut stream) = conn.open_uni().await {
-                let _ = stream
-                    .write_all(&[scrollback::stream_type::SSP_FRAME])
-                    .await;
-                let _ = stream.write_all(&stream_data).await;
-                let _ = stream.finish();
+pub(super) struct SspFrameSender {
+    connection: quinn::Connection,
+    pending: tokio::sync::watch::Sender<Option<EncodedFrame>>,
+    worker: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Clone)]
+struct EncodedFrame {
+    key: (u64, u64),
+    data: Bytes,
+}
+
+impl SspFrameSender {
+    pub(super) fn new(connection: quinn::Connection) -> Self {
+        let (pending, receive) = tokio::sync::watch::channel(None);
+        let worker = tokio::spawn(forward_screen_frames(connection.clone(), receive));
+        Self {
+            connection,
+            pending,
+            worker,
+        }
+    }
+
+    pub(super) fn send(&self, frame: Option<&SspFrame>) -> bool {
+        if self.connection.close_reason().is_some() {
+            return false;
+        }
+        let Some(frame) = frame else {
+            return self.pending.send(None).is_ok();
+        };
+        let data = frame.encode();
+        if data.len() > MAX_STREAM_FRAME_BYTES {
+            tracing::warn!("screen exceeds reliable frame limit");
+            return false;
+        }
+        if self
+            .connection
+            .max_datagram_size()
+            .is_some_and(|max| data.len() <= max)
+        {
+            return self.pending.send(None).is_ok()
+                && self.connection.send_datagram(Bytes::from(data)).is_ok();
+        }
+        self.pending
+            .send(Some(EncodedFrame {
+                key: (frame.old_num, frame.new_num),
+                data: Bytes::from(data),
+            }))
+            .is_ok()
+    }
+}
+
+impl Drop for SspFrameSender {
+    fn drop(&mut self) {
+        self.worker.abort();
+    }
+}
+
+struct ResetOnDrop(quinn::SendStream);
+
+impl Drop for ResetOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.reset(0u32.into());
+    }
+}
+
+async fn forward_screen_frames(
+    connection: quinn::Connection,
+    mut pending: tokio::sync::watch::Receiver<Option<EncodedFrame>>,
+) {
+    'updates: loop {
+        let frame = pending.borrow_and_update().clone();
+        let Some(frame) = frame else {
+            if pending.changed().await.is_err() {
+                return;
             }
-        });
-        true
+            continue;
+        };
+        let transfer = async {
+            let mut stream = ResetOnDrop(connection.open_uni().await?);
+            stream
+                .0
+                .write_all(&[scrollback::stream_type::SSP_FRAME])
+                .await?;
+            stream
+                .0
+                .write_all(&(frame.data.len() as u32).to_be_bytes())
+                .await?;
+            stream.0.write_all(&frame.data).await?;
+            stream.0.finish()?;
+            let _ = stream.0.stopped().await?;
+            Ok::<_, anyhow::Error>(())
+        };
+        tokio::pin!(transfer);
+        loop {
+            tokio::select! {
+                result = &mut transfer => {
+                    if let Err(error) = result {
+                        tracing::debug!(%error, "screen transfer ended");
+                    }
+                    break;
+                }
+                changed = pending.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    if pending.borrow_and_update().is_none() {
+                        continue 'updates;
+                    }
+                }
+                _ = connection.closed() => return,
+            }
+        }
+        if pending.borrow().as_ref().map(|next| next.key) != Some(frame.key) {
+            continue;
+        }
+        if pending.changed().await.is_err() {
+            return;
+        }
     }
 }
 
@@ -268,6 +363,142 @@ fn enable_kitty_keyboard() -> bool {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+    use crate::ssp::{ScreenState, SspSender};
+
+    fn large_frame() -> SspFrame {
+        let mut state = ScreenState::empty(64);
+        state.rows.fill("x".repeat(60_000));
+        let mut sender = SspSender::new();
+        sender.push_state(state);
+        sender.generate_frame().unwrap()
+    }
+
+    async fn start_transfer(
+        client: &quinn::Connection,
+        server: &quinn::Connection,
+        frame: &SspFrame,
+    ) -> (SspFrameSender, quinn::RecvStream) {
+        let sender = SspFrameSender::new(server.clone());
+        assert!(sender.send(Some(frame)));
+        let mut stream = client.accept_uni().await.unwrap();
+        let mut prefix = [0];
+        stream.read_exact(&mut prefix).await.unwrap();
+        assert_eq!(prefix, [scrollback::stream_type::SSP_FRAME]);
+        (sender, stream)
+    }
+
+    #[tokio::test]
+    async fn newer_large_screens_replace_backlog_without_interrupting_progress() {
+        let (client, server, _fixture, _endpoint) = crate::testutil::connected_pair().await;
+        let mut frame = large_frame();
+        let (sender, mut first) = start_transfer(&client, &server, &frame).await;
+        for num in [2, 3] {
+            frame.new_num = num;
+            assert!(sender.send(Some(&frame)));
+        }
+        let initial = first
+            .read_to_end(MAX_STREAM_FRAME_BYTES)
+            .await
+            .expect("continuous output starved the in-flight screen");
+        assert_eq!(SspFrame::decode_from_stream(&initial).unwrap().new_num, 1);
+        let mut latest =
+            tokio::time::timeout(std::time::Duration::from_secs(2), client.accept_uni())
+                .await
+                .unwrap()
+                .unwrap();
+        let data = latest.read_to_end(MAX_STREAM_FRAME_BYTES).await.unwrap();
+        assert_eq!(data[0], scrollback::stream_type::SSP_FRAME);
+        assert_eq!(SspFrame::decode_from_stream(&data[1..]).unwrap().new_num, 3);
+    }
+
+    #[tokio::test]
+    async fn datagrams_cancel_pending_streams_and_closed_connections_fail() {
+        let (client, server, _fixture, _endpoint) = crate::testutil::connected_pair().await;
+        let (sender, mut stream) = start_transfer(&client, &server, &large_frame()).await;
+        assert!(sender.send(Some(&SspFrame::ack_only(7))));
+        let data = client.read_datagram().await.unwrap();
+        assert_eq!(SspFrame::decode(&data).unwrap().ack_num, 7);
+        assert!(stream.read_to_end(MAX_STREAM_FRAME_BYTES).await.is_err());
+        server.close(0u32.into(), b"finished");
+        assert!(!sender.send(None));
+    }
+
+    #[tokio::test]
+    async fn oversized_screens_are_rejected_before_queueing() {
+        let (client, server, _fixture, _endpoint) = crate::testutil::connected_pair().await;
+        let sender = SspFrameSender::new(server);
+        let mut state = ScreenState::empty(300);
+        state.rows.fill("x".repeat(60_000));
+        let mut protocol = SspSender::new();
+        protocol.push_state(state);
+        assert!(!sender.send(protocol.generate_frame().as_ref()));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), client.accept_uni(),)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_stream_can_retry_after_lost_application_ack() {
+        let (client, server, _fixture, _endpoint) = crate::testutil::connected_pair().await;
+        let sender = SspFrameSender::new(server);
+        let frame = large_frame();
+        assert!(sender.send(Some(&frame)));
+        let mut first = client.accept_uni().await.unwrap();
+        first.read_to_end(MAX_STREAM_FRAME_BYTES).await.unwrap();
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(20));
+        let mut retry = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                tokio::select! {
+                    stream = client.accept_uni() => break stream.unwrap(),
+                    _ = interval.tick() => assert!(sender.send(Some(&frame))),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let data = retry.read_to_end(MAX_STREAM_FRAME_BYTES).await.unwrap();
+        assert_eq!(
+            SspFrame::decode_from_stream(&data[1..]).unwrap().new_num,
+            frame.new_num
+        );
+        assert!(sender.send(None));
+    }
+
+    #[tokio::test]
+    async fn dropping_sender_resets_inflight_screen_transfer() {
+        let (client, server, _fixture, _endpoint) = crate::testutil::connected_pair().await;
+        let (sender, mut receive) = start_transfer(&client, &server, &large_frame()).await;
+        drop(sender);
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                receive.read_to_end(8 * 1024 * 1024),
+            )
+            .await
+            .unwrap()
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_screen_frames_share_one_pending_transfer() {
+        let (client, server, _fixture, _endpoint) = crate::testutil::connected_pair().await;
+        let frame = large_frame();
+        let (sender, mut receive) = start_transfer(&client, &server, &frame).await;
+        for _ in 0..3 {
+            assert!(sender.send(Some(&frame)));
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), client.accept_uni(),)
+                .await
+                .is_err(),
+            "retransmission queued another oversized screen"
+        );
+        assert!(sender.send(None));
+        assert!(receive.read_to_end(8 * 1024 * 1024).await.is_err());
+    }
 
     #[test]
     fn connect_command_preserves_quoted_certificate_paths() {

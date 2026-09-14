@@ -6,8 +6,8 @@ use std::time::Duration;
 use portable_pty::CommandBuilder;
 
 use super::util::{
-    extract_peer_cert, hex_decode, hex_encode, parse_stun_line, rand_session_id, rand_u16,
-    send_ssp_frame, write_private_key,
+    SspFrameSender, extract_peer_cert, hex_decode, hex_encode, parse_stun_line, rand_session_id,
+    rand_u16, write_private_key,
 };
 use crate::config::{self, CertKeyPair, RosePaths};
 use crate::protocol::{self, ControlMessage, ServerSession};
@@ -628,6 +628,7 @@ async fn forward_pty_output(
     session_conn: quinn::Connection,
     resize_out: Arc<tokio::sync::Notify>,
 ) -> bool {
+    let frame_sender = SspFrameSender::new(session_conn.clone());
     let mut dirty = false;
     let mut last_send = tokio::time::Instant::now();
     let min_frame_interval = Duration::from_millis(5);
@@ -673,12 +674,11 @@ async fn forward_pty_output(
             .lock()
             .expect("sender lock poisoned")
             .generate_frame();
-        if let Some(ref f) = frame
-            && !send_ssp_frame(f, &session_conn)
-        {
+        if !frame_sender.send(frame.as_ref()) {
             return false;
         }
     }
+    drop(frame_sender);
     let state = terminal_out
         .lock()
         .expect("terminal lock poisoned")

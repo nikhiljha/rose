@@ -16,10 +16,12 @@ use super::util::{
 };
 use crate::config::{self, CertKeyPair, RosePaths};
 use crate::protocol::{ClientSession, ControlMessage};
-use crate::scrollback::{self, ScrollbackLine, ScrollbackReceiver};
+use crate::scrollback::{
+    self, MAX_SCROLLBACK_BYTES, ScrollbackLine, ScrollbackRange, ScrollbackReceiver,
+};
 use crate::ssp::{
-    DATAGRAM_KEYSTROKE, DATAGRAM_SSP_ACK, ScreenState, SspFrame, SspReceiver, render_diff_ansi,
-    render_full_redraw, scrollback_before_viewport,
+    DATAGRAM_KEYSTROKE, DATAGRAM_SSP_ACK, MAX_STREAM_FRAME_BYTES, ScreenState, SspFrame,
+    SspReceiver, render_diff_ansi, render_full_redraw,
 };
 use crate::transport::QuicClient;
 
@@ -42,6 +44,75 @@ async fn drain_ssp_frames(conn: &quinn::Connection, data: &[u8]) -> Option<SspFr
         Poll::Ready(best)
     })
     .await
+}
+
+async fn receive_ssp_frame(stream: &mut quinn::RecvStream) -> anyhow::Result<SspFrame> {
+    let mut length = [0; 4];
+    stream.read_exact(&mut length).await?;
+    let length = u32::from_be_bytes(length) as usize;
+    anyhow::ensure!(length <= MAX_STREAM_FRAME_BYTES, "oversized SSP frame");
+    let data = stream.read_to_end(length).await?;
+    anyhow::ensure!(data.len() == length, "truncated SSP frame");
+    Ok(SspFrame::decode(&data)?)
+}
+
+async fn receive_history(
+    mut stream: quinn::RecvStream,
+    receiver: Arc<Mutex<ScrollbackReceiver>>,
+) -> anyhow::Result<()> {
+    loop {
+        let mut header = [0; 12];
+        match stream.read_exact(&mut header).await {
+            Ok(()) => {}
+            Err(quinn::ReadExactError::FinishedEarly(0)) => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+        let length = u32::from_be_bytes(header[8..].try_into()?) as usize;
+        anyhow::ensure!(length <= MAX_SCROLLBACK_BYTES, "oversized history row");
+        let mut data = header.to_vec();
+        data.resize(12 + length, 0);
+        stream.read_exact(&mut data[12..]).await?;
+        let (line, _) = ScrollbackLine::decode(&data)?;
+        receiver
+            .lock()
+            .expect("scrollback lock poisoned")
+            .add_line(line);
+    }
+}
+
+async fn receive_uni_streams(
+    connection: quinn::Connection,
+    history: Arc<Mutex<ScrollbackReceiver>>,
+    on_frame: impl Fn(&SspFrame) + Send + Sync + 'static,
+) {
+    let on_frame = Arc::new(on_frame);
+    let mut workers = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            incoming = connection.accept_uni(), if workers.len() < 8 => {
+                let Ok(mut stream) = incoming else { return; };
+                let on_frame = Arc::clone(&on_frame);
+                let history = Arc::clone(&history);
+                workers.spawn(async move {
+                    let mut prefix = [0];
+                    stream.read_exact(&mut prefix).await?;
+                    match prefix[0] {
+                        scrollback::stream_type::SSP_FRAME => on_frame(&receive_ssp_frame(&mut stream).await?),
+                        scrollback::stream_type::SCROLLBACK => receive_history(stream, history).await?,
+                        _ => anyhow::bail!("unknown uni stream type {}", prefix[0]),
+                    }
+                    Ok::<_, anyhow::Error>(())
+                });
+            }
+            result = workers.join_next(), if !workers.is_empty() => {
+                match result {
+                    Some(Ok(Err(error))) => tracing::debug!(%error, "invalid incoming stream"),
+                    Some(Err(error)) => tracing::warn!(%error, "stream reader task failed"),
+                    _ => {}
+                }
+            }
+        }
+    }
 }
 
 /// Marker that STUN was used for the initial connection.
@@ -516,13 +587,13 @@ async fn client_session_loop_inner(
         ));
 
         let scrollback_rx = Arc::new(Mutex::new(ScrollbackReceiver::new()));
-        let rendered_sb_count = Arc::new(Mutex::new(0usize));
+        let rendered_sb_range = Arc::new(Mutex::new(None));
 
         let output_conn = session.connection().clone();
         let recv_dgram = Arc::clone(&receiver);
         let client_dgram = Arc::clone(&client_screen);
         let sb_rx_dgram = Arc::clone(&scrollback_rx);
-        let sb_count_dgram = Arc::clone(&rendered_sb_count);
+        let sb_range_dgram = Arc::clone(&rendered_sb_range);
         let output_task = tokio::spawn(async move {
             let mut sb_check = tokio::time::interval(Duration::from_millis(200));
             loop {
@@ -538,7 +609,7 @@ async fn client_session_loop_inner(
                                         &client_dgram,
                                         &output_conn,
                                         &sb_rx_dgram,
-                                        &sb_count_dgram,
+                                        &sb_range_dgram,
                                     );
                                 }
                             }
@@ -550,7 +621,7 @@ async fn client_session_loop_inner(
                             &recv_dgram,
                             &client_dgram,
                             &sb_rx_dgram,
-                            &sb_count_dgram,
+                            &sb_range_dgram,
                         );
                     }
                 }
@@ -561,69 +632,21 @@ async fn client_session_loop_inner(
         let recv_stream = Arc::clone(&receiver);
         let client_stream = Arc::clone(&client_screen);
         let sb_rx_stream = Arc::clone(&scrollback_rx);
-        let sb_count_stream = Arc::clone(&rendered_sb_count);
-        let stream_task = tokio::spawn(async move {
-            while let Ok(mut uni) = stream_conn.accept_uni().await {
-                let mut type_buf = [0u8; 1];
-                if uni.read_exact(&mut type_buf).await.is_err() {
-                    continue;
-                }
-                match type_buf[0] {
-                    scrollback::stream_type::SSP_FRAME => {
-                        let mut len_buf = [0u8; 4];
-                        if uni.read_exact(&mut len_buf).await.is_err() {
-                            continue;
-                        }
-                        let len = u32::from_be_bytes(len_buf) as usize;
-                        match uni.read_to_end(len).await {
-                            Ok(data) => {
-                                if let Ok(frame) = SspFrame::decode(&data) {
-                                    process_ssp_frame(
-                                        &frame,
-                                        &recv_stream,
-                                        &client_stream,
-                                        &stream_conn,
-                                        &sb_rx_stream,
-                                        &sb_count_stream,
-                                    );
-                                }
-                            }
-                            Err(_) => continue,
-                        }
-                    }
-                    scrollback::stream_type::SCROLLBACK => {
-                        let sb_rx = Arc::clone(&scrollback_rx);
-                        tokio::spawn(async move {
-                            let mut buf = Vec::new();
-                            loop {
-                                let mut chunk = vec![0u8; 4096];
-                                match uni.read(&mut chunk).await {
-                                    Ok(Some(n)) => {
-                                        buf.extend_from_slice(&chunk[..n]);
-                                        while buf.len() >= 12 {
-                                            match ScrollbackLine::decode(&buf) {
-                                                Ok((line, consumed)) => {
-                                                    sb_rx
-                                                        .lock()
-                                                        .expect("scrollback lock poisoned")
-                                                        .add_line(line);
-                                                    buf.drain(..consumed);
-                                                }
-                                                Err(_) => break,
-                                            }
-                                        }
-                                    }
-                                    _ => break,
-                                }
-                            }
-                        });
-                    }
-                    _ => {
-                        tracing::warn!(type_byte = type_buf[0], "unknown uni stream type");
-                    }
-                }
-            }
-        });
+        let sb_range_stream = Arc::clone(&rendered_sb_range);
+        let stream_task = tokio::spawn(receive_uni_streams(
+            stream_conn.clone(),
+            Arc::clone(&scrollback_rx),
+            move |frame| {
+                process_ssp_frame(
+                    frame,
+                    &recv_stream,
+                    &client_stream,
+                    &stream_conn,
+                    &sb_rx_stream,
+                    &sb_range_stream,
+                );
+            },
+        ));
 
         let input_conn = session.connection().clone();
         let input_key_rx = Arc::clone(&key_rx);
@@ -920,17 +943,17 @@ async fn wait_or_disconnect(
 #[cfg_attr(coverage_nightly, coverage(off))]
 fn do_full_redraw(
     scrollback_rx: &Mutex<ScrollbackReceiver>,
-    rendered_sb_count: &Mutex<usize>,
+    rendered_sb_range: &Mutex<ScrollbackRange>,
     new_state: &ScreenState,
     screen: &mut ScreenState,
 ) {
     let sb = scrollback_rx.lock().expect("scrollback lock poisoned");
-    let mut count = rendered_sb_count
+    let mut count = rendered_sb_range
         .lock()
-        .expect("rendered count lock poisoned");
+        .expect("rendered range lock poisoned");
 
     let ansi = render_full_redraw(sb.lines(), new_state);
-    *count = scrollback_before_viewport(sb.lines(), new_state.viewport).len();
+    *count = sb.range_before_viewport(new_state.viewport);
     drop(sb);
     drop(count);
 
@@ -953,15 +976,15 @@ fn maybe_render_scrollback(
     receiver: &Arc<Mutex<SspReceiver>>,
     client_screen: &Arc<Mutex<ScreenState>>,
     scrollback_rx: &Arc<Mutex<ScrollbackReceiver>>,
-    rendered_sb_count: &Arc<Mutex<usize>>,
+    rendered_sb_range: &Arc<Mutex<ScrollbackRange>>,
 ) {
     let recv = receiver.lock().expect("receiver lock poisoned");
     let needs_redraw = {
         let sb = scrollback_rx.lock().expect("scrollback lock poisoned");
-        let count = rendered_sb_count
+        let count = rendered_sb_range
             .lock()
-            .expect("rendered count lock poisoned");
-        scrollback_before_viewport(sb.lines(), recv.state().viewport).len() != *count
+            .expect("rendered range lock poisoned");
+        sb.range_before_viewport(recv.state().viewport) != *count
     };
     if !needs_redraw {
         return;
@@ -971,7 +994,7 @@ fn maybe_render_scrollback(
     drop(recv);
 
     let mut screen = client_screen.lock().expect("client screen lock poisoned");
-    do_full_redraw(scrollback_rx, rendered_sb_count, &state, &mut screen);
+    do_full_redraw(scrollback_rx, rendered_sb_range, &state, &mut screen);
 }
 
 /// Processes an SSP frame: applies diff, renders to stdout, sends ACK.
@@ -990,7 +1013,7 @@ fn process_ssp_frame(
     client_screen: &Arc<Mutex<ScreenState>>,
     conn: &quinn::Connection,
     scrollback_rx: &Arc<Mutex<ScrollbackReceiver>>,
-    rendered_sb_count: &Arc<Mutex<usize>>,
+    rendered_sb_range: &Arc<Mutex<ScrollbackRange>>,
 ) {
     let mut recv = receiver.lock().expect("receiver lock poisoned");
     match recv.process_frame(frame) {
@@ -1000,15 +1023,15 @@ fn process_ssp_frame(
 
             let needs_full_redraw = {
                 let sb = scrollback_rx.lock().expect("scrollback lock poisoned");
-                let count = rendered_sb_count
+                let count = rendered_sb_range
                     .lock()
-                    .expect("rendered count lock poisoned");
-                scrollback_before_viewport(sb.lines(), new_state.viewport).len() != *count
+                    .expect("rendered range lock poisoned");
+                sb.range_before_viewport(new_state.viewport) != *count
                     || new_state.rows.len() != screen.rows.len()
             };
 
             if needs_full_redraw {
-                do_full_redraw(scrollback_rx, rendered_sb_count, &new_state, &mut screen);
+                do_full_redraw(scrollback_rx, rendered_sb_range, &new_state, &mut screen);
             } else {
                 let ansi = render_diff_ansi(&screen, &new_state);
                 let mut out = std::io::BufWriter::new(std::io::stdout());
@@ -1036,13 +1059,242 @@ fn process_ssp_frame(
 mod tests {
     use super::*;
 
+    fn observe_stream_frames(
+        connection: quinn::Connection,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        tokio::sync::mpsc::UnboundedReceiver<SspFrame>,
+    ) {
+        let (frames, received) = tokio::sync::mpsc::unbounded_channel();
+        let reader = tokio::spawn(receive_uni_streams(
+            connection,
+            Arc::new(Mutex::new(ScrollbackReceiver::new())),
+            move |frame| {
+                frames.send(frame.clone()).unwrap();
+            },
+        ));
+        (reader, received)
+    }
+
+    #[tokio::test]
+    async fn cancelling_stream_receiver_stops_its_history_reader() {
+        let (client, server, _fixture, _endpoint) = crate::testutil::connected_pair().await;
+        let history = Arc::new(Mutex::new(ScrollbackReceiver::new()));
+        let reader = tokio::spawn(receive_uni_streams(
+            client.clone(),
+            Arc::clone(&history),
+            |_| {},
+        ));
+        let mut send = server.open_uni().await.unwrap();
+        send.write_all(&[scrollback::stream_type::SCROLLBACK])
+            .await
+            .unwrap();
+        send.write_all(
+            &ScrollbackLine {
+                stable_row: 0,
+                text: "ready".to_owned(),
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while history.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        reader.abort();
+        let _ = reader.await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), send.stopped())
+                .await
+                .expect("history reader outlived its connection task")
+                .unwrap()
+                .is_some()
+        );
+        assert!(client.close_reason().is_none());
+    }
+
+    #[tokio::test]
+    async fn incoming_stream_workers_are_bounded_and_slots_are_reused() {
+        let (client, server, _fixture, _endpoint) = crate::testutil::connected_pair().await;
+        let (reader, mut received) = observe_stream_frames(client.clone());
+        let mut histories = Vec::new();
+        for _ in 0..8 {
+            let mut stream = server.open_uni().await.unwrap();
+            stream
+                .write_all(&[scrollback::stream_type::SCROLLBACK])
+                .await
+                .unwrap();
+            histories.push(stream);
+        }
+        let mut frame = server.open_uni().await.unwrap();
+        frame
+            .write_all(&[scrollback::stream_type::SSP_FRAME])
+            .await
+            .unwrap();
+        frame
+            .write_all(&SspFrame::ack_only(0).encode_for_stream())
+            .await
+            .unwrap();
+        frame.finish().unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), received.recv())
+                .await
+                .is_err(),
+            "receiver exceeded its stream worker bound"
+        );
+        histories[0].finish().unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), received.recv())
+                .await
+                .unwrap()
+                .map(|frame| frame.new_num),
+            Some(0)
+        );
+        reader.abort();
+        let _ = reader.await;
+        for stream in &mut histories[1..] {
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), stream.stopped())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert!(client.close_reason().is_none());
+    }
+
+    #[tokio::test]
+    async fn invalid_streams_do_not_block_a_later_valid_screen() {
+        let (client, server, _fixture, _endpoint) = crate::testutil::connected_pair().await;
+        let (reader, mut received) = observe_stream_frames(client.clone());
+        let frame = SspFrame::ack_only(7).encode();
+        let mut malformed = vec![vec![], vec![255], vec![1, 0, 0], vec![1, 0, 0, 0, 0]];
+        for length in [frame.len() - 1, frame.len() + 1] {
+            let mut data = vec![scrollback::stream_type::SSP_FRAME];
+            data.extend_from_slice(&(length as u32).to_be_bytes());
+            data.extend_from_slice(&frame);
+            malformed.push(data);
+        }
+        for data in malformed {
+            let mut stream = server.open_uni().await.unwrap();
+            stream.write_all(&data).await.unwrap();
+            stream.finish().unwrap();
+        }
+        let mut stream = server.open_uni().await.unwrap();
+        stream
+            .write_all(&[scrollback::stream_type::SSP_FRAME])
+            .await
+            .unwrap();
+        for chunk in SspFrame::ack_only(7).encode_for_stream().chunks(3) {
+            stream.write_all(chunk).await.unwrap();
+        }
+        stream.finish().unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), received.recv())
+                .await
+                .unwrap()
+                .map(|frame| frame.ack_num),
+            Some(7)
+        );
+        client.close(0u32.into(), b"finished");
+        tokio::time::timeout(Duration::from_secs(1), reader)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn fragmented_history_preserves_unicode_and_multiple_records() {
+        let (client, server, _fixture, _endpoint) = crate::testutil::connected_pair().await;
+        let lines = [
+            ScrollbackLine {
+                stable_row: 7,
+                text: "\x1b[31m界é\x1b[0m".repeat(500),
+            },
+            ScrollbackLine {
+                stable_row: 8,
+                text: String::new(),
+            },
+        ];
+        let mut stream = server.open_uni().await.unwrap();
+        for line in &lines {
+            for chunk in line.encode().chunks(997) {
+                stream.write_all(chunk).await.unwrap();
+            }
+        }
+        stream.finish().unwrap();
+        let history = Arc::new(Mutex::new(ScrollbackReceiver::new()));
+        receive_history(client.accept_uni().await.unwrap(), Arc::clone(&history))
+            .await
+            .unwrap();
+        assert_eq!(history.lock().unwrap().lines(), lines);
+    }
+
+    #[tokio::test]
+    async fn oversized_screen_length_is_rejected_without_waiting_for_payload() {
+        let (client, server, _fixture, _endpoint) = crate::testutil::connected_pair().await;
+        let mut send = server.open_uni().await.unwrap();
+        send.write_all(&u32::MAX.to_be_bytes()).await.unwrap();
+        let mut receive = client.accept_uni().await.unwrap();
+        let result =
+            tokio::time::timeout(Duration::from_millis(100), receive_ssp_frame(&mut receive))
+                .await
+                .expect("oversized screen header was not rejected");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn oversized_history_length_is_rejected_without_waiting_for_payload() {
+        let (client, server, _fixture, _endpoint) = crate::testutil::connected_pair().await;
+        let mut send = server.open_uni().await.unwrap();
+        let mut header = [0; 12];
+        header[8..].copy_from_slice(&u32::MAX.to_be_bytes());
+        send.write_all(&header).await.unwrap();
+        let receive = client.accept_uni().await.unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            receive_history(receive, Arc::new(Mutex::new(ScrollbackReceiver::new()))),
+        )
+        .await
+        .expect("oversized history header was not rejected");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn truncated_and_invalid_history_is_rejected_at_eof() {
+        let (client, server, _fixture, _endpoint) = crate::testutil::connected_pair().await;
+        let encoded = ScrollbackLine {
+            stable_row: 0,
+            text: "ab".to_owned(),
+        }
+        .encode();
+        let mut invalid = encoded.clone();
+        invalid[12] = 255;
+        for bytes in [encoded[..8].to_vec(), encoded[..13].to_vec(), invalid] {
+            let mut send = server.open_uni().await.unwrap();
+            send.write_all(&bytes).await.unwrap();
+            send.finish().unwrap();
+            let receive = client.accept_uni().await.unwrap();
+            assert!(
+                receive_history(receive, Arc::new(Mutex::new(ScrollbackReceiver::new())))
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
     #[tokio::test]
     async fn duplicate_and_unknown_base_frames_acknowledge_current_state() {
         let (client, server, _fixture, _endpoint) = crate::testutil::connected_pair().await;
         let receiver = Arc::new(Mutex::new(SspReceiver::new(4)));
         let screen = Arc::new(Mutex::new(ScreenState::empty(4)));
         let history = Arc::new(Mutex::new(ScrollbackReceiver::new()));
-        let rendered = Arc::new(Mutex::new(0));
+        let rendered = Arc::new(Mutex::new(None));
         let initial = SspFrame {
             old_num: 0,
             new_num: 2,

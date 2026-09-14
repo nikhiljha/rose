@@ -363,6 +363,9 @@ pub const DATAGRAM_SSP_ACK: u8 = 0x02;
 /// Maximum number of screen states retained in the sender queue.
 const MAX_QUEUE_SIZE: usize = 32;
 
+/// Maximum encoded SSP payload accepted on a reliable stream.
+pub const MAX_STREAM_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
 /// Server-side SSP sender. Manages a queue of screen state snapshots
 /// and generates diffs for the client.
 pub struct SspSender {
