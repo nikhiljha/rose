@@ -49,6 +49,18 @@ Resize operations hold the same terminal lock while resizing the PTY and emulato
 The low-level `PtySession` constructors without an attached terminal expose a
 lossy broadcast stream for callers that need raw output.
 
+The server monitors both the direct child and PTY EOF. If the child exits while
+a descendant retains the slave PTY, output continues draining until EOF or for
+one additional second, whichever comes first. Child polling does not cancel
+partially received control messages.
+
+At PTY EOF or the drain deadline, the server snapshots the final authoritative
+state regardless of pending output notifications or frame throttling. It sends a full SSP frame on a
+reliable stream and waits for the client's SSP acknowledgment before closing the
+connection. Missing application acknowledgments trigger another reliable copy.
+Final delivery is bounded to two seconds; connection failure or timeout can
+still prevent delivery.
+
 ## Transport Layer
 
 ### QUIC
@@ -157,6 +169,11 @@ After an explicit detach, `rose connect <host> --port <port> --session <id>`
 sends `Reconnect` on the first connection. The printed reattach command includes
 the session ID and any explicit certificate paths. The server checks the
 connecting client's certificate against the session owner.
+
+If resizing or sending session metadata fails during reattachment, the server
+returns the session to the detached store so a later connection can retry.
+Successful resizes remain reflected in both the PTY and emulator even if sending
+the metadata subsequently fails.
 
 Detached sessions are retained in server memory until the shell exits, the
 configured idle timeout expires, or the server stops. The default idle timeout is

@@ -6,7 +6,7 @@
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
-use portable_pty::{Child, ChildKiller, CommandBuilder, ExitStatus, MasterPty, PtySize};
+use portable_pty::{Child, CommandBuilder, ExitStatus, MasterPty, PtySize};
 use tokio::sync::{Notify, broadcast};
 
 use crate::terminal::RoseTerminal;
@@ -46,8 +46,7 @@ pub enum PtyError {
 pub struct PtySession {
     writer: Arc<Mutex<Box<dyn std::io::Write + Send>>>,
     master: Box<dyn MasterPty + Send>,
-    child: Box<dyn Child + Send + Sync>,
-    killer: Box<dyn ChildKiller + Send + Sync>,
+    child: Option<Box<dyn Child + Send + Sync>>,
     output_tx: broadcast::Sender<Bytes>,
     /// The initial broadcast receiver, created before the reader thread
     /// starts.  Handed to the first caller of [`subscribe_output`] so it
@@ -163,7 +162,6 @@ impl PtySession {
             .slave
             .spawn_command(cmd)
             .map_err(|e| PtyError::Spawn(e.to_string()))?;
-        let killer = child.clone_killer();
         let writer = pair
             .master
             .take_writer()
@@ -222,8 +220,7 @@ impl PtySession {
         Ok(Self {
             writer,
             master: pair.master,
-            child,
-            killer,
+            child: Some(child),
             output_tx,
             initial_rx: Mutex::new(Some(initial_rx)),
             pty_closed,
@@ -305,8 +302,16 @@ impl PtySession {
     /// # Errors
     ///
     /// Returns `PtyError::Io` if the wait fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if child ownership was already transferred during destruction.
     pub fn try_wait(&mut self) -> Result<Option<ExitStatus>, PtyError> {
-        self.child.try_wait().map_err(PtyError::Io)
+        self.child
+            .as_mut()
+            .expect("child present until drop")
+            .try_wait()
+            .map_err(PtyError::Io)
     }
 
     /// Blocks until the child process exits.
@@ -314,14 +319,29 @@ impl PtySession {
     /// # Errors
     ///
     /// Returns `PtyError::Io` if the wait fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if child ownership was already transferred during destruction.
     pub fn wait(&mut self) -> Result<ExitStatus, PtyError> {
-        self.child.wait().map_err(PtyError::Io)
+        self.child
+            .as_mut()
+            .expect("child present until drop")
+            .wait()
+            .map_err(PtyError::Io)
     }
 }
 
 impl Drop for PtySession {
     fn drop(&mut self) {
-        let _ = self.killer.kill();
+        if let Some(mut child) = self.child.take()
+            && !matches!(child.try_wait(), Ok(Some(_)))
+        {
+            std::thread::spawn(move || {
+                let _ = child.kill();
+                let _ = child.wait();
+            });
+        }
     }
 }
 
@@ -331,6 +351,80 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn dropping_a_session_reaps_its_exited_child() {
+        let pty = PtySession::open_command(5, 20, "sh", &["-c", "exit"]).unwrap();
+        let pid = pty.child.as_ref().unwrap().process_id().unwrap();
+        let process = std::path::PathBuf::from(format!("/proc/{pid}"));
+        tokio::time::timeout(Duration::from_secs(5), pty.closed().notified())
+            .await
+            .unwrap();
+        drop(pty);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while process.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("exited PTY child was not reaped");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn dropping_a_session_reaps_a_child_that_ignores_hangup() {
+        let pty = PtySession::open_command(
+            5,
+            20,
+            "sh",
+            &["-c", "trap '' HUP; printf READY; while :; do sleep 1; done"],
+        )
+        .unwrap();
+        let process = std::path::PathBuf::from(format!(
+            "/proc/{}",
+            pty.child.as_ref().unwrap().process_id().unwrap()
+        ));
+        assert!(poll_output_until(&mut pty.subscribe_output(), "READY").contains("READY"));
+        drop(pty);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while process.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("running PTY child was not killed and reaped");
+    }
+
+    #[tokio::test]
+    async fn unread_terminal_replies_do_not_block_output_or_resize() {
+        let mut command = CommandBuilder::new("sh");
+        command.args([
+            "-c",
+            "stty raw -echo; i=0; while [ \"$i\" -lt 20000 ]; do \
+             printf '\\033[6n'; i=$((i+1)); done; printf OUTPUT_COMPLETE; \
+             while :; do sleep 1; done",
+        ]);
+        let pty = PtySession::open_terminal(5, 20, command).unwrap();
+        let mut observer = pty.subscribe_output();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut output = String::new();
+            while !output.contains("OUTPUT_COMPLETE") {
+                match observer.recv().await {
+                    Ok(chunk) => output.push_str(&String::from_utf8_lossy(&chunk)),
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => panic!("PTY closed"),
+                }
+            }
+        })
+        .await
+        .expect("PTY output stopped while the child was not reading replies");
+        let mut terminal = pty.terminal().unwrap().try_lock().unwrap();
+        assert_eq!(terminal.snapshot().rows[0], "OUTPUT_COMPLETE");
+        pty.resize(8, 40).unwrap();
+        terminal.resize(8, 40);
+        assert_eq!(terminal.snapshot().rows.len(), 8);
+    }
 
     #[tokio::test]
     async fn terminal_state_survives_a_lagging_output_observer() {
