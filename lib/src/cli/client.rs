@@ -362,6 +362,25 @@ async fn stun_reconnect(stun_servers: Option<Vec<String>>) -> anyhow::Result<Qui
     QuicClient::from_socket(socket).map_err(Into::into)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum SessionHandshake {
+    Ready([u8; 16]),
+    Unavailable,
+    Retry,
+}
+
+async fn receive_session_id(session: &mut ClientSession) -> anyhow::Result<SessionHandshake> {
+    match tokio::time::timeout(Duration::from_secs(5), session.recv_control()).await {
+        Ok(Ok(Some(ControlMessage::SessionInfo {
+            version: _,
+            session_id,
+        }))) => Ok(SessionHandshake::Ready(session_id)),
+        Ok(Ok(Some(ControlMessage::Goodbye))) => Ok(SessionHandshake::Unavailable),
+        Ok(Ok(Some(other))) => anyhow::bail!("expected SessionInfo, got {other:?}"),
+        Ok(Ok(None) | Err(_)) | Err(_) => Ok(SessionHandshake::Retry),
+    }
+}
+
 /// Core reconnection loop. If `first_conn` is provided, skips the connect
 /// phase for the first iteration. If `stun_ctx` is provided, uses STUN
 /// hole-punching for reconnection instead of direct connect.
@@ -522,17 +541,13 @@ async fn client_session_loop_inner(
             ClientSession::connect(conn, rows, cols, env).await?
         };
 
-        match tokio::time::timeout(Duration::from_secs(5), session.recv_control()).await {
-            Ok(Ok(Some(ControlMessage::SessionInfo {
-                version: _,
-                session_id: sid,
-            }))) => {
-                session_id = Some(sid);
+        match receive_session_id(&mut session).await? {
+            SessionHandshake::Ready(sid) => session_id = Some(sid),
+            SessionHandshake::Unavailable => {
+                eprintln!("[RoSE: remote session no longer exists]");
+                break Ok(());
             }
-            Ok(Ok(Some(other))) => {
-                anyhow::bail!("expected SessionInfo, got {other:?}");
-            }
-            Ok(Ok(None) | Err(_)) | Err(_) => {
+            SessionHandshake::Retry => {
                 tracing::debug!(?backoff, "handshake timed out");
                 if wait_or_disconnect(&keyboard, backoff, session_id, &reattach_command).await? {
                     break Ok(());
@@ -986,6 +1001,31 @@ mod tests {
             },
         ));
         (reader, received)
+    }
+
+    #[tokio::test]
+    async fn missing_session_goodbye_ends_reconnect_handshake() {
+        let (client, server, _fixture, _endpoint) = crate::testutil::connected_pair().await;
+        let (release, released) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut session, _) = crate::protocol::ServerSession::accept_any(server)
+                .await
+                .unwrap();
+            session
+                .send_control(&ControlMessage::Goodbye)
+                .await
+                .unwrap();
+            let _ = released.await;
+        });
+        let mut session = ClientSession::reconnect(client, 24, 80, [0x44; 16], vec![])
+            .await
+            .unwrap();
+        assert_eq!(
+            receive_session_id(&mut session).await.unwrap(),
+            SessionHandshake::Unavailable
+        );
+        let _ = release.send(());
+        server.await.unwrap();
     }
 
     #[tokio::test]

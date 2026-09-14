@@ -245,6 +245,12 @@ Detached sessions are retained in server memory until the shell exits, the
 configured idle timeout expires, or the server stops. The default idle timeout is
 seven days. They do not survive a server process restart.
 
+The server remembers the most recent 1,024 ended or pruned session IDs. A
+reconnect to one receives `Goodbye` instead of `SessionInfo`; the client stops
+retrying and restores its local terminal. IDs absent from both stores remain
+retryable because the previous connection may still be handing off a live
+session. This completion history retains IDs only, not the final screen.
+
 ## Platforms
 
 - **Server:** Linux, macOS
